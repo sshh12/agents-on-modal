@@ -123,6 +123,68 @@
         "--tool-call-parser=glm47",
         "--reasoning-parser=glm45"
       ]
+    },
+    {
+      "name": "deepseek-v4-flash-vision-uncensored",
+      "description": "DeepSeek-V4-Flash-Vision-Uncensored (orcarouter) - the multimodal (image+text) sibling of the deepseek-v4-flash-abliterated entry - via SGLang on H200:2. REQUIRES the preview image lmsysorg/sglang:dev-dsv4-flash-vision (SGLang PR #37253): this adds the ViT + aligner (deepseek_v4_vit.py) and the mm image processor, and has NOT shipped in a stock release. The v0.5.19-cu130 image the non-vision entry uses CANNOT load this checkpoint - its text-only DeepseekV4ForCausalLM class dies with KeyError 'aligner.gate_up_proj.weight' in load_weights (then SIGKILL -9), because the HF architecture string is still DeepseekV4ForCausalLM yet the weights include the vision aligner/tower. config.json: model_type deepseek_v4, block-FP8 e4m3 weight_block_size [128,128] with ue8m0 scales (the card's prose claiming 'FP4 experts' is wrong; quant_method is plain fp8, no expert_dtype). ~156.3 GiB across 48 shards, so H200:2 (282 GiB) holds it with ~126 GiB spare - the OOM-shaped -9 in logs was the aligner KeyError killing the TP group, NOT a memory shortfall, so mem-fraction-static 0.85 is fine. The model is hybrid-SWA (sliding_window 128) with a DSA indexer, so the KV pool is small. Keeps the proven Hopper recipe otherwise (marlin MoE runner, swa-full-tokens-ratio 0.1, deepseek-v4/deepseekv4 parser pair, trust-remote-code). Each image uses at most 1024 tokens after auto-resize. DSpark speculative decoding is available (--speculative-algorithm DSPARK) but left off for a known-good bring-up. GATED repo (base DeepSeek-V4-Flash-Vision-Exp); HF_TOKEN must have access - verified it does. No base_volume reuse: all 156 GiB download fresh. Do NOT carry marlin to a Blackwell GPU - SGLang's B200/B300 cells for this checkpoint use flashinfer_mxfp4 instead.",
+      "source_repo": "orcarouter/DeepSeek-V4-Flash-Vision-Uncensored",
+      "endpoint_name": "dsv4-vision-unc-h200",
+      "gpu": "H200:2",
+      "region": "us-west",
+      "hf_token_env": "HF_TOKEN",
+      "context_window": 262144,
+      "reasoning_effort": "high",
+      "reasoning_levels": [
+        "low",
+        "high",
+        "max"
+      ],
+      "scaledown_window": 900,
+      "startup_timeout": 7200,
+      "target_inputs": 4,
+      "keep_endpoint": true,
+      "sglang_image": "lmsysorg/sglang:dev-dsv4-flash-vision",
+      "sglang_args": [
+        "--chunked-prefill-size=4096",
+        "--context-length=262144",
+        "--cuda-graph-max-bs-decode=16",
+        "--mem-fraction-static=0.85",
+        "--moe-runner-backend=marlin",
+        "--reasoning-parser=deepseek-v4",
+        "--swa-full-tokens-ratio=0.1",
+        "--tool-call-parser=deepseekv4",
+        "--trust-remote-code"
+      ]
+    },
+    {
+      "name": "deepseek-v4.1-flash-uncensored-fp8",
+      "description": "DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8 (dealignai, 763B total/multimodal) via SGLang on B300:4. REQUIRES the preview image lmsysorg/sglang:dev-dsv41: config.json is DeepseekV41ForCausalLM / model_type deepseek_v41, a NEW architecture that has not shipped in any stock SGLang release (support lives only on the dsv4.1 branch / this dev image), so the v0.5.19-cu130 image the other entries use cannot load it. Quant is DeepSeek-native FP8 e4m3 with ue8m0 block scales at [32,32] PLUS expert_dtype fp4 (not ModelOpt NVFP4). SIZING - the key lesson: at ~475.3 GiB the weights alone are too big for 4xH200. On H200:4 tp4 that is ~118.8 GiB/GPU = 85% of the 139 GiB usable, and SGLang hard-fails at boot with 'Loaded weights leave no GPU memory for the KV cache under --mem-fraction-static=0.8 ... minimum viable 0.870'; pushing mem-fraction above 0.87 then starves the ~10% non-static pool and cuda-graph capture OOMs (exit -9), the same failure the GLM NVFP4 entry hit at 0.92. The model card's 0.80/4xH200 recipe was for a smaller base artifact, not this 475 GiB uncensored build. B300:2 tp2 is worse (~237.6 GiB/GPU = 89%). B300:4 tp4 is the right fit: ~118.8 GiB/GPU of B300's ~267.7 GiB usable = 44%, so at mem-fraction-static 0.85 the KV pool is ~100+ GiB/GPU with ~40 GiB/GPU left for cuda-graph capture - comfortable, and it keeps the card-verified tp4 parallelism while running the FP4 experts on Blackwell natively. Parsers are --reasoning-parser auto / --tool-call-parser auto per SGLang's V4.1 cookbook (the dev image resolves deepseek-v41 from the model config). ep-size 4 matches tp. Backends (attention/moe-runner/fp8-gemm) are deliberately NOT pinned - the cookbook warns manual overrides fall back to slow Triton; confirm the resolved backends in the startup log. Context capped at 262144 (the checkpoint supports 1M via yarn factor 16 from 65536, but every catalog entry caps at 256k). DSpark speculative decoding (--speculative-algorithm DSPARK --speculative-dspark-block-size 5) is available but left OFF for a known-good bring-up; add it only with a re-verified run.",
+      "source_repo": "dealignai/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8",
+      "endpoint_name": "dsv41-flash-unc-h200",
+      "gpu": "B300:4",
+      "region": "us-west",
+      "hf_token_env": "HF_TOKEN",
+      "context_window": 262144,
+      "reasoning_effort": "high",
+      "reasoning_levels": [
+        "low",
+        "high",
+        "max"
+      ],
+      "scaledown_window": 900,
+      "startup_timeout": 7200,
+      "target_inputs": 4,
+      "keep_endpoint": true,
+      "sglang_image": "lmsysorg/sglang:dev-dsv41",
+      "sglang_args": [
+        "--context-length=262144",
+        "--mem-fraction-static=0.85",
+        "--ep-size=4",
+        "--max-running-requests=20",
+        "--reasoning-parser=auto",
+        "--tool-call-parser=auto",
+        "--trust-remote-code"
+      ]
     }
   ]
 }
