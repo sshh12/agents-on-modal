@@ -77,13 +77,15 @@ GPU memory must still match the checkpoint.
 
 ### Catalog deploys
 
-Repeatable self-managed deploys live in `self-managed-catalog.json` (a `models`
-array of full deploy specs). Bring one up by index or name; the served endpoint
-URL is printed and the app is left warm (subject to scale-to-zero):
+Repeatable self-managed deploys live in `catalog.json` under its `self_managed`
+section (a `models` array of full deploy specs; the `modal_managed` section
+holds the managed-endpoint presets used by `--modal-list`). Bring one up by
+index or name; the served endpoint URL is printed and the app is left warm
+(subject to scale-to-zero):
 
 ```sh
-./modal-deploy.sh self-managed-catalog.json glm-5.3-flash-uncensored
-./modal-deploy.sh self-managed-catalog.json 0 --gpu H200:4 --dry-run
+./modal-deploy.sh glm-5.3-flash-uncensored
+./modal-deploy.sh 0 --gpu H200:4 --dry-run
 ```
 
 Adding a model is one catalog entry, not new code. Afterwards, attach by the

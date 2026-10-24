@@ -104,6 +104,112 @@ class CustomDeploymentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             custom_app_base_url("workspace", "x" * 63, "us-west")
 
+    def test_default_runtime_is_sglang(self) -> None:
+        options = parse_arguments(
+            [
+                "--modal-self-managed",
+                "--modal-model",
+                "org/model",
+                "--modal-model-revision",
+                "main",
+                "--modal-gpu",
+                "H100",
+            ]
+        )
+        deployment = build_custom_deployment(
+            options, resolve_model(options, load_presets()), "codex-sglang-default"
+        )
+        self.assertEqual(deployment.runtime, "sglang")
+        self.assertIsNone(deployment.download_subdir)
+        self.assertIn("sglang", deployment.sglang_image)
+
+    def test_llamacpp_runtime_uses_cuda_base_and_subdir(self) -> None:
+        options = parse_arguments(
+            [
+                "--modal-self-managed",
+                "--modal-model",
+                "org/model-GGUF",
+                "--modal-model-revision",
+                "main",
+                "--modal-gpu",
+                "H200:2",
+                "--modal-runtime",
+                "llamacpp",
+                "--modal-download-subdir",
+                "Mix-256G",
+                "--modal-sglang-arg",
+                "--ctx-size=32768",
+                "--modal-sglang-arg",
+                "--no-reasoning-preserve",
+            ]
+        )
+        deployment = build_custom_deployment(
+            options, resolve_model(options, load_presets()), "codex-gguf-test"
+        )
+        self.assertEqual(deployment.runtime, "llamacpp")
+        self.assertEqual(deployment.download_subdir, "Mix-256G")
+        self.assertEqual(deployment.sglang_image, "nvidia/cuda:12.8.0-devel-ubuntu22.04")
+        self.assertEqual(deployment.server_args["--ctx-size"], "32768")
+        self.assertEqual(deployment.server_args["--no-reasoning-preserve"], "")
+
+    def test_llamacpp_requires_download_subdir(self) -> None:
+        options = parse_arguments(
+            [
+                "--modal-self-managed",
+                "--modal-model",
+                "org/model-GGUF",
+                "--modal-model-revision",
+                "main",
+                "--modal-gpu",
+                "H200:2",
+                "--modal-runtime",
+                "llamacpp",
+            ]
+        )
+        with self.assertRaises((ValueError, RuntimeError)):
+            build_custom_deployment(
+                options, resolve_model(options, load_presets()), "codex-gguf-nosubdir"
+            )
+
+    def test_llamacpp_reserved_args_are_rejected(self) -> None:
+        options = parse_arguments(
+            [
+                "--modal-self-managed",
+                "--modal-model",
+                "org/model-GGUF",
+                "--modal-model-revision",
+                "main",
+                "--modal-gpu",
+                "H200:2",
+                "--modal-runtime",
+                "llamacpp",
+                "--modal-download-subdir",
+                "Mix-256G",
+                "--modal-sglang-arg",
+                "--n-gpu-layers=80",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            build_custom_deployment(
+                options, resolve_model(options, load_presets()), "codex-gguf-reserved"
+            )
+
+    def test_unknown_runtime_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_arguments(
+                [
+                    "--modal-self-managed",
+                    "--modal-model",
+                    "org/model",
+                    "--modal-model-revision",
+                    "main",
+                    "--modal-gpu",
+                    "H100",
+                    "--modal-runtime",
+                    "tensorrt",
+                ]
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

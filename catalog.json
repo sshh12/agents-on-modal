@@ -1,0 +1,236 @@
+{
+  "_comment": "Unified catalog for codex-modal. 'modal_managed' holds Modal managed-endpoint presets (--modal-list / --modal-preset). 'self_managed' holds full self-managed SGLang/llama.cpp deploy specs for `modal-deploy.sh <index|name>`.",
+  "modal_managed": {
+    "default": "deepseek-v4-flash-0731",
+    "presets": {
+      "deepseek-v4-flash-0731": {
+        "description": "DeepSeek V4 Flash 0731 on Modal",
+        "base_model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "context_window": 1000000,
+        "reasoning_effort": "max",
+        "reasoning_levels": [
+          "low",
+          "high",
+          "max"
+        ]
+      }
+    }
+  },
+  "self_managed": {
+    "_comment": "Self-managed model deployments for `modal-deploy.sh <catalog.json> <index|name>`. Each entry is a full SGLang-on-Modal deploy spec. After deploying, point a client at the endpoint by its `endpoint_name`, e.g. blue-green-red's `--model red=modal:glm-53-flash-unc`.",
+    "models": [
+      {
+        "name": "deepseek-v4-flash-abliterated",
+        "description": "DeepSeek-V4-Flash-0731 abliterated (uncensored) via SGLang on H200:2; reuses the existing base volume.",
+        "source_repo": "cebeuq/DeepSeek-V4-Flash-0731-abliterated",
+        "custom_hf_revision": "21bd923c2574d9edcd7b914885024ce72fd5c076",
+        "base_model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "base_model_revision": "9e165c30e2704aec5d9d593cce3eebd58bbef1cb",
+        "base_volume": "cm-codex-deepseek-v4-flash-0731-abliterated-e9a201-458e3e607a",
+        "base_volume_path": "/model",
+        "endpoint_name": "codex-dsv4-abliterated-h200-15m",
+        "gpu": "H200:2",
+        "region": "us-west",
+        "hf_token_env": "HF_TOKEN",
+        "context_window": 262144,
+        "reasoning_effort": "high",
+        "reasoning_levels": [
+          "low",
+          "high",
+          "max"
+        ],
+        "scaledown_window": 900,
+        "startup_timeout": 7200,
+        "target_inputs": 4,
+        "keep_endpoint": true,
+        "sglang_image": "lmsysorg/sglang:v0.5.19-cu130",
+        "sglang_args": [
+          "--chunked-prefill-size=4096",
+          "--context-length=262144",
+          "--cuda-graph-max-bs-decode=16",
+          "--mem-fraction-static=0.85",
+          "--moe-runner-backend=marlin",
+          "--reasoning-parser=deepseek-v4",
+          "--swa-full-tokens-ratio=0.1",
+          "--tool-call-parser=deepseekv4",
+          "--trust-remote-code"
+        ]
+      },
+      {
+        "name": "glm-5.3-flash-uncensored",
+        "description": "GLM-5.3-Flash-Uncensored-FP8 (320B/18B MoE, block-FP8, ~306 GiB) via SGLang on B300:2 ($14.20/hr vs $31.60/hr for H100:8; H100:4 does not fit at 76.4 GiB/GPU of 80). mem-fraction-static is 0.78, NOT the 0.92 that suited H100:8: a B300 is 267.69 GiB usable and weights take 152.9 GiB of it at tp2, so 0.92 sized a ~93 GiB KV pool and left only 21 GiB - less than the 46 GiB deep_gemm wants for warmup - and cuda-graph capture OOM'd with exit -9. No transformers pin: 5.16.0 lacks glm5_next (5.16.1 adds it) and 5.13+ ships a native qwen3_asr that collides with SGLang's own registration; the glm-5.3-flash image is self-sufficient.",
+        "source_repo": "orcarouter/GLM-5.3-Flash-Uncensored-FP8",
+        "endpoint_name": "glm-53-flash-unc",
+        "gpu": "B300:2",
+        "region": "us-west",
+        "hf_token_env": "HF_TOKEN",
+        "context_window": 262144,
+        "reasoning_effort": "high",
+        "reasoning_levels": [
+          "low",
+          "high",
+          "max"
+        ],
+        "scaledown_window": 900,
+        "startup_timeout": 7200,
+        "keep_endpoint": true,
+        "sglang_args": [
+          "--context-length=262144",
+          "--cuda-graph-max-bs-decode=32",
+          "--ep-size=2",
+          "--kv-cache-dtype=fp8_e4m3",
+          "--mem-fraction-static=0.78",
+          "--moe-runner-backend=deep_gemm",
+          "--tool-call-parser=glm47",
+          "--reasoning-parser=glm45"
+        ],
+        "sglang_image": "lmsysorg/sglang:glm-5.3-flash"
+      },
+      {
+        "name": "glm-5.3-abliterated-nvfp4",
+        "description": "GLM-5.3 abliterated, NVFP4 (ModelOpt experts-only W4A4, ~433 GiB) via SGLang on B300:2. NVFP4 needs Blackwell; B300 (288 GiB/GPU) is the cheapest fit since TP must be a power of 2 and B200 (180 GiB) would need 4. No transformers pin: the v0.5.19 image ships 5.12.1, which already has glm_moe_dsa - forcing 5.16.0 makes SGLang's qwen3_asr config registration collide with the now-native one and the server exits 1 before the health check.",
+        "source_repo": "dealignai/GLM-5.3-ABLITERATED-NVFP4",
+        "custom_hf_revision": "1b96da2dc461c7148d87181fa3a0cffcde3a1862",
+        "endpoint_name": "glm-53-abliterated-nvfp4",
+        "gpu": "B300:2",
+        "region": "us-west",
+        "context_window": 262144,
+        "reasoning_effort": "high",
+        "reasoning_levels": [
+          "low",
+          "high",
+          "max"
+        ],
+        "scaledown_window": 900,
+        "startup_timeout": 7200,
+        "keep_endpoint": true,
+        "sglang_image": "lmsysorg/sglang:v0.5.19-cu130",
+        "sglang_args": [
+          "--quantization=modelopt_fp4",
+          "--context-length=262144",
+          "--chunked-prefill-size=8192",
+          "--mem-fraction-static=0.9",
+          "--tool-call-parser=glm47",
+          "--reasoning-parser=glm45"
+        ]
+      },
+      {
+        "name": "glm-5.3-uncensored-nvfp4",
+        "description": "GLM-5.3 uncensored (dealignai), NVFP4 (ModelOpt experts-only W4A4, ~433 GiB) via SGLang on B300:2. NVFP4 needs Blackwell; B300 (288 GiB/GPU) is the cheapest fit since TP must be a power of 2 and B200 (180 GiB) would need 4. No transformers pin: the v0.5.19 image ships 5.12.1, which already has glm_moe_dsa - forcing 5.16.0 makes SGLang's qwen3_asr config registration collide with the now-native one and the server exits 1 before the health check.",
+        "source_repo": "dealignai/GLM-5.3-UNCENSORED-NVFP4",
+        "custom_hf_revision": "409ddf484d16cb7b13d390e8b30942890164d5af",
+        "endpoint_name": "glm-53-uncensored-nvfp4",
+        "gpu": "B300:2",
+        "region": "us-west",
+        "context_window": 262144,
+        "reasoning_effort": "high",
+        "reasoning_levels": [
+          "low",
+          "high",
+          "max"
+        ],
+        "scaledown_window": 900,
+        "startup_timeout": 7200,
+        "keep_endpoint": true,
+        "sglang_image": "lmsysorg/sglang:v0.5.19-cu130",
+        "sglang_args": [
+          "--quantization=modelopt_fp4",
+          "--context-length=262144",
+          "--chunked-prefill-size=8192",
+          "--mem-fraction-static=0.9",
+          "--tool-call-parser=glm47",
+          "--reasoning-parser=glm45"
+        ]
+      },
+      {
+        "name": "deepseek-v4-flash-vision-uncensored",
+        "description": "DeepSeek-V4-Flash-Vision-Uncensored (orcarouter) - the multimodal (image+text) sibling of the deepseek-v4-flash-abliterated entry - via SGLang on H200:2. REQUIRES the preview image lmsysorg/sglang:dev-dsv4-flash-vision (SGLang PR #37253): this adds the ViT + aligner (deepseek_v4_vit.py) and the mm image processor, and has NOT shipped in a stock release. The v0.5.19-cu130 image the non-vision entry uses CANNOT load this checkpoint - its text-only DeepseekV4ForCausalLM class dies with KeyError 'aligner.gate_up_proj.weight' in load_weights (then SIGKILL -9), because the HF architecture string is still DeepseekV4ForCausalLM yet the weights include the vision aligner/tower. config.json: model_type deepseek_v4, block-FP8 e4m3 weight_block_size [128,128] with ue8m0 scales (the card's prose claiming 'FP4 experts' is wrong; quant_method is plain fp8, no expert_dtype). ~156.3 GiB across 48 shards, so H200:2 (282 GiB) holds it with ~126 GiB spare - the OOM-shaped -9 in logs was the aligner KeyError killing the TP group, NOT a memory shortfall, so mem-fraction-static 0.85 is fine. The model is hybrid-SWA (sliding_window 128) with a DSA indexer, so the KV pool is small. Keeps the proven Hopper recipe otherwise (marlin MoE runner, swa-full-tokens-ratio 0.1, deepseek-v4/deepseekv4 parser pair, trust-remote-code). Each image uses at most 1024 tokens after auto-resize. DSpark speculative decoding is available (--speculative-algorithm DSPARK) but left off for a known-good bring-up. GATED repo (base DeepSeek-V4-Flash-Vision-Exp); HF_TOKEN must have access - verified it does. No base_volume reuse: all 156 GiB download fresh. Do NOT carry marlin to a Blackwell GPU - SGLang's B200/B300 cells for this checkpoint use flashinfer_mxfp4 instead.",
+        "source_repo": "orcarouter/DeepSeek-V4-Flash-Vision-Uncensored",
+        "endpoint_name": "dsv4-vision-unc-h200",
+        "gpu": "H200:2",
+        "region": "us-west",
+        "hf_token_env": "HF_TOKEN",
+        "context_window": 262144,
+        "reasoning_effort": "high",
+        "reasoning_levels": [
+          "low",
+          "high",
+          "max"
+        ],
+        "scaledown_window": 900,
+        "startup_timeout": 7200,
+        "target_inputs": 4,
+        "keep_endpoint": true,
+        "sglang_image": "lmsysorg/sglang:dev-dsv4-flash-vision",
+        "sglang_args": [
+          "--chunked-prefill-size=4096",
+          "--context-length=262144",
+          "--cuda-graph-max-bs-decode=16",
+          "--mem-fraction-static=0.85",
+          "--moe-runner-backend=marlin",
+          "--reasoning-parser=deepseek-v4",
+          "--swa-full-tokens-ratio=0.1",
+          "--tool-call-parser=deepseekv4",
+          "--trust-remote-code"
+        ]
+      },
+      {
+        "name": "deepseek-v4.1-flash-uncensored-fp8",
+        "description": "DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8 (dealignai, 763B total/multimodal) via SGLang on B300:4. REQUIRES the preview image lmsysorg/sglang:dev-dsv41: config.json is DeepseekV41ForCausalLM / model_type deepseek_v41, a NEW architecture that has not shipped in any stock SGLang release (support lives only on the dsv4.1 branch / this dev image), so the v0.5.19-cu130 image the other entries use cannot load it. Quant is DeepSeek-native FP8 e4m3 with ue8m0 block scales at [32,32] PLUS expert_dtype fp4 (not ModelOpt NVFP4). SIZING - the key lesson: at ~475.3 GiB the weights alone are too big for 4xH200. On H200:4 tp4 that is ~118.8 GiB/GPU = 85% of the 139 GiB usable, and SGLang hard-fails at boot with 'Loaded weights leave no GPU memory for the KV cache under --mem-fraction-static=0.8 ... minimum viable 0.870'; pushing mem-fraction above 0.87 then starves the ~10% non-static pool and cuda-graph capture OOMs (exit -9), the same failure the GLM NVFP4 entry hit at 0.92. The model card's 0.80/4xH200 recipe was for a smaller base artifact, not this 475 GiB uncensored build. B300:2 tp2 is worse (~237.6 GiB/GPU = 89%). B300:4 tp4 is the right fit: ~118.8 GiB/GPU of B300's ~267.7 GiB usable = 44%, so at mem-fraction-static 0.85 the KV pool is ~100+ GiB/GPU with ~40 GiB/GPU left for cuda-graph capture - comfortable, and it keeps the card-verified tp4 parallelism while running the FP4 experts on Blackwell natively. Parsers are --reasoning-parser auto / --tool-call-parser auto per SGLang's V4.1 cookbook (the dev image resolves deepseek-v41 from the model config). ep-size 4 matches tp. Backends (attention/moe-runner/fp8-gemm) are deliberately NOT pinned - the cookbook warns manual overrides fall back to slow Triton; confirm the resolved backends in the startup log. Context capped at 262144 (the checkpoint supports 1M via yarn factor 16 from 65536, but every catalog entry caps at 256k). DSpark speculative decoding (--speculative-algorithm DSPARK --speculative-dspark-block-size 5) is available but left OFF for a known-good bring-up; add it only with a re-verified run.",
+        "source_repo": "dealignai/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8",
+        "endpoint_name": "dsv41-flash-unc-h200",
+        "gpu": "B300:4",
+        "region": "us-west",
+        "hf_token_env": "HF_TOKEN",
+        "context_window": 262144,
+        "reasoning_effort": "high",
+        "reasoning_levels": [
+          "low",
+          "high",
+          "max"
+        ],
+        "scaledown_window": 900,
+        "startup_timeout": 7200,
+        "target_inputs": 4,
+        "keep_endpoint": true,
+        "sglang_image": "lmsysorg/sglang:dev-dsv41",
+        "sglang_args": [
+          "--context-length=262144",
+          "--mem-fraction-static=0.85",
+          "--ep-size=4",
+          "--max-running-requests=20",
+          "--reasoning-parser=auto",
+          "--tool-call-parser=auto",
+          "--trust-remote-code"
+        ]
+      },
+      {
+        "name": "deepseek-v4.1-flash-abliterated-gguf",
+        "description": "DeepSeek-V4.1-Flash-1017-abliterated (orcarouter), GGUF quant served by llama.cpp on H200:2 - the catalog's first non-SGLang runtime (runtime: llamacpp). GGUF is a llama.cpp container, not safetensors, so SGLang cannot load it; the llamacpp runtime builds llama-server from source instead of pulling an SGLang image. These GGUFs further require an UNMERGED build - llama.cpp PR #30817 at commit b72050d03 (pinned in codex_modal/runtimes.py) - because DeepSeek-V4.1's architecture is in no tagged release; stock llama.cpp, Ollama and LM Studio refuse to load them. serving_image is omitted so the runtime uses its CUDA devel base (nvidia/cuda:12.8.0-devel) and compiles with CMAKE_CUDA_ARCHITECTURES derived from the GPU (90 for H200/Hopper). download_subdir=Mix-256G fetches only the production quant (235.8 GiB in-memory, 346 GiB download, 3.36 bpw, ~93.7% token-agreement with the original) - not the testing-only Mix-128G or the imatrix. Sized to H200:2 per the model card's '2 GPUs with ~250GB total VRAM' (282 GiB total holds the 235.8 GiB weights with headroom); the runtime globs the first shard (…-00001-of-…) and llama.cpp auto-loads the rest with -ngl 99 splitting layers across both GPUs. server_args mirror the card's known-good command (-c 32768 -np 1 --no-reasoning-preserve); context_window is pinned to 32768 to match the server's KV so Codex never overflows it. NOTE: this GGUF ships no mmproj projector, so it is TEXT-ONLY here (llama.cpp vision needs a separate mmproj) - unlike the safetensors V4.1 entry, which is multimodal. target_inputs=1 matches --parallel 1; raise both together for concurrency once KV headroom is confirmed.",
+        "source_repo": "orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF",
+        "endpoint_name": "dsv41-flash-ablit-gguf",
+        "runtime": "llamacpp",
+        "download_subdir": "Mix-256G",
+        "gpu": "H200:2",
+        "region": "us-west",
+        "hf_token_env": "HF_TOKEN",
+        "context_window": 32768,
+        "reasoning_effort": "high",
+        "reasoning_levels": [
+          "low",
+          "high",
+          "max"
+        ],
+        "scaledown_window": 900,
+        "startup_timeout": 7200,
+        "target_inputs": 1,
+        "keep_endpoint": true,
+        "server_args": [
+          "--ctx-size=32768",
+          "--parallel=1",
+          "--no-reasoning-preserve"
+        ]
+      }
+    ]
+  }
+}

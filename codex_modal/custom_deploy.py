@@ -9,6 +9,7 @@ import re
 from dataclasses import asdict, dataclass
 from pathlib import PurePosixPath
 
+from . import runtimes
 from .options import ResolvedModel, WrapperOptions
 
 
@@ -50,10 +51,18 @@ class CustomDeployment:
     base_volume_path: str | None
     gpu: str
     tensor_parallel_size: int
+    # The serving engine ("sglang" | "llamacpp") and its base registry image.
+    # ``sglang_image`` keeps its historical name for config/catalog
+    # compatibility but is really the serving base image for whichever runtime
+    # is selected (for llama.cpp this is a CUDA devel base that then compiles
+    # the engine from source).
+    runtime: str
     sglang_image: str
     autoinference_utils_version: str
     server_args: dict[str, str]
     serving_pip: tuple[str, ...]
+    # Restrict the repo download to one subdirectory (e.g. a single GGUF quant).
+    download_subdir: str | None
     cpu: int
     memory: int
     scaledown_window: int
@@ -152,24 +161,36 @@ def gpu_count(value: str) -> int:
     return int(match.group(2) or "1")
 
 
-def parse_sglang_args(values: list[str]) -> dict[str, str]:
+def parse_server_args(
+    values: list[str], reserved: frozenset[str] | set[str]
+) -> dict[str, str]:
+    """Parse repeated ``--flag`` / ``--flag=value`` serving-engine arguments.
+
+    Runtime-agnostic: the caller supplies the set of flags that engine (or the
+    wrapper) owns and therefore may not be overridden from the catalog.
+    """
     parsed: dict[str, str] = {}
     for raw in values:
         if any(ord(character) < 32 for character in raw):
-            raise ValueError("--modal-sglang-arg cannot contain control characters.")
+            raise ValueError("A serving-engine argument cannot contain control characters.")
         key, separator, value = raw.partition("=")
         if not SGLANG_KEY_PATTERN.fullmatch(key):
             raise ValueError(
                 "Each --modal-sglang-arg must be --flag or --flag=value."
             )
-        if key in RESERVED_SGLANG_ARGS:
+        if key in reserved:
             raise ValueError(
-                f"SGLang argument {key!r} is owned by codex-modal and cannot be overridden."
+                f"Serving argument {key!r} is owned by codex-modal and cannot be overridden."
             )
         if key in parsed:
-            raise ValueError(f"Duplicate SGLang argument {key!r}.")
+            raise ValueError(f"Duplicate serving argument {key!r}.")
         parsed[key] = value if separator else ""
     return parsed
+
+
+def parse_sglang_args(values: list[str]) -> dict[str, str]:
+    """Back-compatible SGLang arg parser (uses SGLang's reserved flag set)."""
+    return parse_server_args(values, RESERVED_SGLANG_ARGS)
 
 
 def build_custom_deployment(
@@ -202,9 +223,14 @@ def build_custom_deployment(
     hf_token_env = options.hf_token_env
     if hf_token_env and not os.environ.get(hf_token_env):
         raise RuntimeError(f"Environment variable {hf_token_env!r} is empty or missing.")
-    image = options.sglang_image or DEFAULT_SGLANG_IMAGE
+
+    runtime = runtimes.runtime_for(options.runtime)
+    image = options.sglang_image or runtime.default_image()
     if not image or any(character.isspace() or ord(character) < 32 for character in image):
         raise ValueError("--modal-sglang-image is empty or invalid.")
+    server_args = parse_server_args(options.sglang_args, runtime.reserved_server_args())
+    # Surface a bad download_subdir early (llama.cpp requires one).
+    runtime.download_spec({"download_subdir": options.download_subdir})
 
     return CustomDeployment(
         app_name=app_name,
@@ -218,10 +244,12 @@ def build_custom_deployment(
         base_volume_path=base_path,
         gpu=options.gpu,
         tensor_parallel_size=gpu_count(options.gpu),
+        runtime=runtime.name,
         sglang_image=image,
         autoinference_utils_version=DEFAULT_AUTOINFERENCE_UTILS,
-        server_args=parse_sglang_args(options.sglang_args),
+        server_args=server_args,
         serving_pip=tuple(options.serving_pip),
+        download_subdir=options.download_subdir or None,
         cpu=options.cpu or DEFAULT_CPU,
         memory=options.memory or DEFAULT_MEMORY,
         scaledown_window=(

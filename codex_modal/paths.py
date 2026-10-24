@@ -20,8 +20,7 @@ def _state_root() -> Path:
 STATE_ROOT = _state_root()
 CODEX_HOME = STATE_ROOT / "codex-home"
 RUNTIME_ROOT = STATE_ROOT / "runtime"
-PRESETS_PATH = PROJECT_ROOT / "modal-models.json"
-SELF_MANAGED_CATALOG_PATH = PROJECT_ROOT / "self-managed-catalog.json"
+CATALOG_PATH = PROJECT_ROOT / "catalog.json"
 REQUIREMENTS_PATH = PROJECT_ROOT / "requirements.txt"
 CREDENTIALS_PATH = STATE_ROOT / "credentials.json"
 

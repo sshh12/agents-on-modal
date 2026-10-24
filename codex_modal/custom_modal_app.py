@@ -13,6 +13,7 @@ from typing import Any
 
 import modal
 
+from . import runtimes
 from .custom_deploy import CUSTOM_APP_CONFIG_ENV
 
 
@@ -22,6 +23,7 @@ if not raw_config:
         f"{CUSTOM_APP_CONFIG_ENV} is required; deploy this module through codex-modal."
     )
 config: dict[str, Any] = json.loads(raw_config)
+runtime = runtimes.runtime_for(config.get("runtime"))
 
 MODEL_MOUNT = "/codex-model-store"
 MODEL_PATH = f"{MODEL_MOUNT}/model"
@@ -71,19 +73,16 @@ prepare_image = (
     .uv_pip_install("huggingface_hub[hf_xet]>=0.35,<2")
     .env(REMOTE_CONFIG_ENV)
 )
-serving_image = (
-    modal.Image.from_registry(str(config["sglang_image"]))
-    .uv_pip_install(
-        f"autoinference-utils=={config['autoinference_utils_version']}"
-    )
-    .env(REMOTE_CONFIG_ENV)
-)
+# The selected runtime owns image construction (SGLang image vs. a CUDA base
+# that compiles llama.cpp). The env + extra wheels are layered on generically.
+serving_image = runtime.build_serving_image(str(config["sglang_image"]), config)
 # Extra wheels layered onto the serving image, installed last so an explicit
-# pin wins over whatever the base image or autoinference-utils resolved - e.g.
-# a Transformers version new enough to recognize a very new model architecture.
+# pin wins over whatever the base image or the runtime resolved - e.g. a
+# Transformers version new enough to recognize a very new model architecture.
 _serving_pip = tuple(str(package) for package in (config.get("serving_pip") or ()))
 if _serving_pip:
     serving_image = serving_image.uv_pip_install(*_serving_pip)
+serving_image = serving_image.env(REMOTE_CONFIG_ENV)
 
 
 def _safe_relative_path(filename: str) -> PurePosixPath:
@@ -127,9 +126,22 @@ def prepare_model() -> dict[str, Any]:
         files_metadata=True,
     )
     source_revision = str(source_info.sha)
+    spec = runtime.download_spec(config)
     source_files = {
         str(sibling.rfilename): sibling for sibling in source_info.siblings
     }
+    if spec.subdir:
+        prefix = spec.subdir.strip("/") + "/"
+        source_files = {
+            name: sibling
+            for name, sibling in source_files.items()
+            if name.startswith(prefix)
+        }
+        if not source_files:
+            raise RuntimeError(
+                f"Repo subdirectory {spec.subdir!r} matched no files in "
+                f"{config['source_repo']}@{source_revision}."
+            )
 
     base_files: dict[str, Any] = {}
     base_root: Path | None = None
@@ -239,10 +251,18 @@ def prepare_model() -> dict[str, Any]:
             f"Prepared repository is incomplete: {len(incomplete)} file(s) missing or "
             f"wrong-sized ({preview}{suffix})."
         )
-    if not (target / "config.json").is_file():
-        raise RuntimeError(
-            f"Prepared repository {config['source_repo']} has no root config.json."
-        )
+    if spec.needs_config_json:
+        if not (target / "config.json").is_file():
+            raise RuntimeError(
+                f"Prepared repository {config['source_repo']} has no root config.json."
+            )
+    else:
+        search_root = target / spec.subdir if spec.subdir else target
+        if not any(search_root.rglob("*.gguf")):
+            raise RuntimeError(
+                f"Prepared repository {config['source_repo']} has no .gguf files under "
+                f"{search_root}."
+            )
     manifest = {
         "source_repo": config["source_repo"],
         "source_revision": source_revision,
@@ -265,17 +285,6 @@ elif config["compute_regions"]:
 else:
     compute_region = None
 
-server_args = {"--served-model-name": str(config["served_model"])} | {
-    str(key): str(value) for key, value in config["server_args"].items()
-}
-warmup_payload = {
-    "model": str(config["served_model"]),
-    "messages": [{"role": "user", "content": "Reply with exactly OK."}],
-    "max_tokens": 8,
-    "temperature": 0,
-}
-
-
 @app.server(
     image=serving_image,
     gpu=str(config["gpu"]),
@@ -296,29 +305,10 @@ warmup_payload = {
 class Server:
     @modal.enter()
     def startup(self) -> None:
-        from autoinference_utils.endpoint import SGLangEndpoint, warmup_chat_completions
-
-        self.endpoint = SGLangEndpoint(
-            model_path=MODEL_PATH,
-            worker_port=int(config["port"]),
-            tp=int(config["tensor_parallel_size"]),
-            extra_server_args=server_args,
-            health_timeout=int(config["startup_timeout"]),
-            health_poll_interval=5.0,
-        )
-        self.endpoint.start()
-        warmup_chat_completions(
-            port=int(config["port"]),
-            payload=warmup_payload,
-            successful_requests=2,
-            request_timeout=60.0,
-        )
-        print(
-            f"{config['served_model']} ({config['gpu']}) SGLang deployment is ready.",
-            flush=True,
-        )
+        self.handle = runtime.start(config, MODEL_PATH, int(config["port"]))
+        print(runtime.ready_message(config), flush=True)
 
     @modal.exit()
     def stop(self) -> None:
-        if hasattr(self, "endpoint"):
-            self.endpoint.stop()
+        if hasattr(self, "handle"):
+            self.handle.stop()

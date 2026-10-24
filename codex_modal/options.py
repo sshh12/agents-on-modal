@@ -8,7 +8,7 @@ import secrets
 from dataclasses import dataclass, field
 from typing import Any
 
-from .paths import PRESETS_PATH
+from .paths import CATALOG_PATH
 
 
 VALID_REASONING = {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
@@ -32,6 +32,8 @@ class WrapperOptions:
     base_volume: str | None = None
     base_volume_path: str | None = None
     gpu: str | None = None
+    runtime: str | None = None
+    download_subdir: str | None = None
     sglang_image: str | None = None
     sglang_args: list[str] = field(default_factory=list)
     serving_pip: list[str] = field(default_factory=list)
@@ -102,6 +104,8 @@ VALUE_OPTIONS = {
     "--modal-base-volume": "base_volume",
     "--modal-base-volume-path": "base_volume_path",
     "--modal-gpu": "gpu",
+    "--modal-runtime": "runtime",
+    "--modal-download-subdir": "download_subdir",
     "--modal-sglang-image": "sglang_image",
     "--modal-cpu": "cpu",
     "--modal-memory": "memory",
@@ -367,6 +371,8 @@ def validate_wrapper_options(options: WrapperOptions) -> None:
         "--modal-base-volume": options.base_volume,
         "--modal-base-volume-path": options.base_volume_path,
         "--modal-gpu": options.gpu,
+        "--modal-runtime": options.runtime,
+        "--modal-download-subdir": options.download_subdir,
         "--modal-sglang-image": options.sglang_image,
         "--modal-sglang-arg": options.sglang_args,
         "--modal-serving-pip": options.serving_pip,
@@ -388,6 +394,13 @@ def validate_wrapper_options(options: WrapperOptions) -> None:
         )
     if not options.gpu:
         raise ValueError("--modal-self-managed requires an explicit --modal-gpu.")
+    if options.runtime is not None:
+        from .runtimes import KNOWN_RUNTIMES
+
+        if options.runtime not in KNOWN_RUNTIMES:
+            raise ValueError(
+                f"--modal-runtime must be one of: {', '.join(KNOWN_RUNTIMES)}."
+            )
     if bool(options.base_volume) != bool(options.base_volume_path):
         raise ValueError(
             "--modal-base-volume and --modal-base-volume-path must be provided together."
@@ -413,12 +426,17 @@ def validate_wrapper_options(options: WrapperOptions) -> None:
 
 
 def load_presets() -> dict[str, Any]:
+    """Return the Modal managed-endpoint presets (the ``modal_managed`` section
+    of the unified catalog) in the ``{"default", "presets"}`` shape."""
     try:
-        document = json.loads(PRESETS_PATH.read_text(encoding="utf-8"))
+        catalog = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"Could not load model presets from {PRESETS_PATH}: {error}") from error
+        raise RuntimeError(f"Could not load the catalog from {CATALOG_PATH}: {error}") from error
+    document = catalog.get("modal_managed") if isinstance(catalog, dict) else None
     if not isinstance(document, dict) or not isinstance(document.get("presets"), dict):
-        raise RuntimeError(f"Invalid preset document: {PRESETS_PATH}")
+        raise RuntimeError(
+            f"Invalid catalog: {CATALOG_PATH} has no 'modal_managed' section with presets."
+        )
     return document
 
 

@@ -1,16 +1,20 @@
-"""Deploy a self-managed model straight from a JSON catalog.
+"""Deploy a self-managed model straight from the JSON catalog.
 
-    python -m codex_modal.catalog_deploy self-managed-catalog.json 0
-    python -m codex_modal.catalog_deploy self-managed-catalog.json glm-5.3-flash-uncensored
-    python -m codex_modal.catalog_deploy self-managed-catalog.json 0 --gpu H200:4 --dry-run
+    python -m codex_modal.catalog_deploy 0
+    python -m codex_modal.catalog_deploy glm-5.3-flash-uncensored
+    python -m codex_modal.catalog_deploy 0 --gpu H200:4 --dry-run
+    python -m codex_modal.catalog_deploy custom-catalog.json my-model   # explicit file
 
 The catalog is the single source of truth for how a model is brought up; this
 module turns one entry into the equivalent ``codex-modal --modal-self-managed``
 invocation and runs it, then prints the served endpoint URL. Adding a model is a
 catalog entry, not code.
 
-Catalog shape - a JSON object with a ``models`` array (a bare array also works).
-Each entry:
+Catalog shape - the unified ``catalog.json`` has a ``self_managed`` section that
+holds the ``models`` array (its managed-endpoint presets live under
+``modal_managed``). An explicit path argument may instead point at a bare
+``models`` array or a ``{"models": [...]}`` object, so custom catalogs still
+work. Each entry:
 
     name              label for selection by name                (required)
     source_repo       Hugging Face repo to serve                 (required)
@@ -23,10 +27,23 @@ Each entry:
     reasoning_levels  advertised effort ladder      (default low/high/max)
     scaledown_window  idle seconds before scale-to-zero  (default 900)
     keep_endpoint     leave the endpoint up after deploy  (default true)
-    sglang_args       list of extra "--flag=value" SGLang args
+    runtime           serving engine "sglang" (default) or "llamacpp"
+    download_subdir   restrict the repo download to this subdir (e.g. a single
+                      GGUF quant folder like "Mix-256G")
+    server_args       list of extra "--flag[=value]" args for the serving engine
+                      (SGLang flags, or llama-server flags when runtime=llamacpp);
+                      legacy alias: ``sglang_args``
+    serving_image     base registry image for the runtime; for sglang this is the
+                      SGLang image, for llamacpp a CUDA base is used by default.
+                      legacy alias: ``sglang_image``
     serving_pip       list of extra pip packages for the serving image
                       (e.g. ["transformers==5.16.0"] for a new architecture)
-    cpu, memory, target_inputs, sglang_image   optional overrides
+    cpu, memory, target_inputs                 optional overrides
+
+Runtimes differ only in image, download/readiness, and launch; see
+``codex_modal/runtimes.py``. llama.cpp entries omit ``serving_image`` (the
+runtime compiles llama-server from source) and name the GGUF quant folder via
+``download_subdir``.
 """
 
 from __future__ import annotations
@@ -40,7 +57,7 @@ from typing import Any
 
 from .custom_deploy import custom_app_base_url, custom_app_name
 from .modal_cli import current_workspace_slug
-from .paths import PROJECT_ROOT, SELF_MANAGED_CATALOG_PATH
+from .paths import CATALOG_PATH, PROJECT_ROOT
 
 
 def _load_models(path: Path) -> list[dict[str, Any]]:
@@ -48,12 +65,18 @@ def _load_models(path: Path) -> list[dict[str, Any]]:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise SystemExit(f"error: cannot read catalog {path}: {error}")
+    # Unified catalog: the self-managed specs live under 'self_managed'.
+    if isinstance(document, dict) and isinstance(document.get("self_managed"), dict):
+        document = document["self_managed"]
     if isinstance(document, list):
         models = document
     elif isinstance(document, dict) and isinstance(document.get("models"), list):
         models = document["models"]
     else:
-        raise SystemExit(f"error: {path} must be a JSON array or an object with a 'models' array.")
+        raise SystemExit(
+            f"error: {path} must be the unified catalog (a 'self_managed.models' array), "
+            "a JSON array, or an object with a 'models' array."
+        )
     if not all(isinstance(entry, dict) for entry in models):
         raise SystemExit(f"error: every entry in {path} must be a JSON object.")
     return models
@@ -101,15 +124,22 @@ def _codex_modal_argv(entry: dict[str, Any], gpu: str) -> list[str]:
         argv += ["--modal-base-volume-path", str(entry["base_volume_path"])]
     if entry.get("hf_token_env"):
         argv += ["--modal-hf-token-env", str(entry["hf_token_env"])]
-    if entry.get("sglang_image"):
-        argv += ["--modal-sglang-image", str(entry["sglang_image"])]
+    if entry.get("runtime"):
+        argv += ["--modal-runtime", str(entry["runtime"])]
+    if entry.get("download_subdir"):
+        argv += ["--modal-download-subdir", str(entry["download_subdir"])]
+    # Serving base image: generic `serving_image`, or legacy `sglang_image`.
+    serving_image = entry.get("serving_image") or entry.get("sglang_image")
+    if serving_image:
+        argv += ["--modal-sglang-image", str(serving_image)]
     for optional, flag in (("cpu", "--modal-cpu"), ("memory", "--modal-memory"),
                            ("target_inputs", "--modal-target-inputs"),
                            ("startup_timeout", "--modal-startup-timeout")):
         if entry.get(optional) is not None:
             argv += [flag, str(entry[optional])]
-    for sglang_arg in entry.get("sglang_args", []):
-        argv += ["--modal-sglang-arg", str(sglang_arg)]
+    # Serving-engine args: generic `server_args`, or legacy `sglang_args`.
+    for server_arg in entry.get("server_args") or entry.get("sglang_args", []):
+        argv += ["--modal-sglang-arg", str(server_arg)]
     for package in entry.get("serving_pip", []):
         argv += ["--modal-serving-pip", str(package)]
     argv += ["--", "exec", "--skip-git-repo-check", "Reply with exactly OK."]
@@ -131,8 +161,8 @@ def main(argv: list[str] | None = None) -> int:
         prog="modal-deploy", description="Deploy a self-managed model from a JSON catalog."
     )
     parser.add_argument(
-        "catalog", nargs="?", default=str(SELF_MANAGED_CATALOG_PATH),
-        help=f"path to the catalog JSON (default: {SELF_MANAGED_CATALOG_PATH.name})",
+        "catalog", nargs="?", default=str(CATALOG_PATH),
+        help=f"path to the catalog JSON (default: {CATALOG_PATH.name})",
     )
     parser.add_argument("selector", help="entry index (e.g. 0) or name")
     parser.add_argument("--gpu", help="override the entry's gpu, e.g. H100:8")
