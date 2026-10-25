@@ -160,6 +160,12 @@ ENV CHROME_BIN=/usr/bin/chromium \
 # `python3 -m agents_on_modal.*` resolve either way.
 ENV PYTHONPATH=/opt/aom
 
+# `aom-swarm` shim: the dynamic-swarm orchestrator drives subagents with this. It only touches the
+# shared control volume (no Modal creds), so it is safe in every sandbox.
+RUN printf '%s\n' '#!/bin/sh' 'exec python3 -m agents_on_modal.swarmctl "$@"' \
+        > /usr/local/bin/aom-swarm; \
+    chmod 0755 /usr/local/bin/aom-swarm
+
 # --- Non-root agent user (uid 10001, passwordless sudo).
 # uid/gid 10001 avoids colliding with the base image's `node` user. The agent
 # may install arbitrary system packages; the container is the boundary, so

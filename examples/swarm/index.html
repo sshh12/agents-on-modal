@@ -19,36 +19,61 @@
   header .meta { color: var(--muted); font-family: var(--mono); font-size: 12px; }
   main { padding: 16px; }
   form { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-    padding: 14px; margin-bottom: 18px; display: grid; gap: 10px;
+    padding: 14px; margin-bottom: 14px; display: grid; gap: 10px;
     grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); align-items: end; }
   form .wide { grid-column: 1 / -1; }
   label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
   input, select, textarea, button { font: inherit; color: var(--text); background: #0d0f14;
     border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; width: 100%; }
-  textarea { font-family: var(--mono); min-height: 60px; resize: vertical; }
+  textarea { font-family: var(--mono); min-height: 64px; resize: vertical; }
   .check { display: flex; align-items: center; gap: 8px; }
   .check input { width: auto; }
-  button { background: var(--accent); color: #0b1020; border: none; font-weight: 650;
-    cursor: pointer; }
+  button { background: var(--accent); color: #0b1020; border: none; font-weight: 650; cursor: pointer; }
+  button.ghost { background: #0d0f14; color: var(--text); border: 1px solid var(--border); font-weight: 500; }
   button:disabled { opacity: .5; cursor: default; }
-  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }
+  details.injected { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 12px; margin-bottom: 14px; }
+  details.injected summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  details.injected pre { font-family: var(--mono); font-size: 11px; white-space: pre-wrap;
+    max-height: 300px; overflow-y: auto; color: var(--text); margin: 10px 0 0; }
+  .layout { display: flex; gap: 14px; align-items: flex-start; }
+  .agents { flex: 3; min-width: 0; }
+  .files { flex: 1; min-width: 260px; position: sticky; top: 16px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .files h2, .wf > h2 { font-size: 12px; margin: 0; padding: 10px 12px; border-bottom: 1px solid var(--border);
+    font-family: var(--mono); display: flex; justify-content: space-between; }
+  .ftree { max-height: 320px; overflow-y: auto; padding: 6px 0; font-family: var(--mono); font-size: 12px; }
+  .ftree .f { padding: 2px 12px; cursor: pointer; white-space: pre; color: var(--text); }
+  .ftree .f:hover { background: #0d0f14; }
+  .ftree .f.dir { color: var(--muted); cursor: default; }
+  .fview { border-top: 1px solid var(--border); }
+  .fview .path { padding: 6px 12px; color: var(--accent); font-family: var(--mono); font-size: 11px; }
+  .fview pre { margin: 0; padding: 0 12px 12px; font-family: var(--mono); font-size: 11px;
+    white-space: pre-wrap; max-height: 300px; overflow-y: auto; }
+  .wf { margin-bottom: 16px; }
+  .wf > h2 { border: 1px solid var(--border); border-radius: 8px 8px 0 0; background: var(--panel); }
+  .stage { padding: 6px 0 2px; color: var(--muted); font-size: 11px; font-family: var(--mono);
+    text-transform: uppercase; letter-spacing: .04em; }
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
     display: flex; flex-direction: column; overflow: hidden; }
-  .card h2 { font-size: 12px; margin: 0; padding: 10px 12px; border-bottom: 1px solid var(--border);
+  .card.orch { border-color: var(--accent); }
+  .card h3 { font-size: 12px; margin: 0; padding: 10px 12px; border-bottom: 1px solid var(--border);
     display: flex; justify-content: space-between; align-items: center; font-family: var(--mono); }
   .state { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
-  .state.running, .state.starting { color: var(--warn); }
-  .state.done { color: var(--ok); }
+  .state.running, .state.starting, .state.pending { color: var(--warn); }
+  .state.done { color: var(--ok); } .state.paused { color: var(--muted); }
   .state.failed, .state.timeout, .state.cancelled { color: var(--err); }
   .trace { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word;
-    padding: 10px 12px; max-height: 420px; overflow-y: auto; margin: 0; }
+    padding: 10px 12px; max-height: 360px; overflow-y: auto; margin: 0; }
   .ev { padding: 1px 0; }
-  .ev.text {} .ev.thinking { color: var(--muted); } .ev.tool_call { color: var(--accent); }
+  .ev.thinking { color: var(--muted); } .ev.tool_call { color: var(--accent); }
   .ev.tool_result { color: #a0d8c0; } .ev.error { color: var(--err); }
   .ev.status, .ev.usage, .ev.compaction, .ev.session { color: var(--muted); }
   .ev.goal { color: var(--warn); }
   #error { color: var(--err); font-family: var(--mono); font-size: 12px; min-height: 16px; }
   .empty { color: var(--muted); padding: 20px; }
+  @media (max-width: 860px) { .layout { flex-direction: column; } .files { position: static; width: 100%; } }
 </style>
 </head>
 <body>
@@ -59,28 +84,55 @@
 </header>
 <main>
   <form id="spawn">
+    <div><label for="mode">mode</label>
+      <select id="mode"><option value="naive">naive (N identical)</option>
+        <option value="dynamic">dynamic (orchestrator)</option></select></div>
     <div><label for="harness">harness</label>
       <select id="harness"><option>claude</option><option>codex</option></select></div>
-    <div><label for="model">model</label>
-      <input id="model" value="qwen3.8-27b" /></div>
-    <div><label for="count">count</label>
+    <div><label for="model">model</label><input id="model" value="qwen3.8-27b" /></div>
+    <div id="countWrap"><label for="count">count</label>
       <input id="count" type="number" min="1" value="4" /></div>
-    <div><label for="timeout">timeout (s)</label>
+    <div><label for="timeout" id="timeoutLabel">timeout (s)</label>
       <input id="timeout" type="number" min="0" placeholder="none" /></div>
-    <div class="check"><input id="goal" type="checkbox" /><label for="goal" style="margin:0">use /goal</label></div>
+    <div><label for="effort">effort</label>
+      <select id="effort"><option value="">default</option><option>low</option>
+        <option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></div>
+    <div class="check" id="goalWrap"><input id="goal" type="checkbox" />
+      <label for="goal" style="margin:0">use /goal</label></div>
     <div class="wide"><label for="prompt">prompt</label>
-      <textarea id="prompt" placeholder="what should every agent do?"></textarea></div>
-    <div class="wide"><button type="submit" id="spawnBtn">spawn swarm</button></div>
+      <textarea id="prompt" placeholder="what should the swarm do?"></textarea></div>
+    <div class="wide" style="display:flex; gap:10px;">
+      <button type="submit" id="spawnBtn" style="flex:1">spawn swarm</button>
+      <button type="button" id="presetBtn" class="ghost" style="flex:0 0 auto">load OSINT preset</button>
+    </div>
   </form>
-  <div class="grid" id="grid"><div class="empty">No agents yet. Spawn a swarm above, or start one with
-    <code>aom swarm</code> and reload with <code>?swarm=&lt;id&gt;</code>.</div></div>
+
+  <details class="injected" id="injectedPanel" style="display:none">
+    <summary>injected orchestrator context (shown exactly as the orchestrator receives it)</summary>
+    <pre id="injectedText">loading…</pre>
+  </details>
+
+  <div class="layout">
+    <div class="agents" id="agents"><div class="empty">No agents yet. Spawn a swarm above, or
+      start one with <code>aom swarm</code> and reload with <code>?swarm=&lt;id&gt;</code>.</div></div>
+    <div class="files" id="filesPanel" style="display:none">
+      <h2><span id="filesTitle">/shared</span><span class="meta" id="filesCount"></span></h2>
+      <div class="ftree" id="ftree"></div>
+      <div class="fview" id="fview" style="display:none">
+        <div class="path" id="fpath"></div><pre id="fbody"></pre>
+      </div>
+    </div>
+  </div>
 </main>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
 const qs = new URLSearchParams(location.search);
 let swarmId = qs.get("swarm") || "";
-const cards = new Map();   // agentId -> {el, trace, offset, done}
+let mode = "naive";
+let openFile = null;
+const cards = new Map();    // agentId -> {el, trace, state, offset, done, runId}
+const groups = new Map();   // groupKey -> container element
 
 function setError(msg) { $("error").textContent = msg || ""; }
 
@@ -90,12 +142,15 @@ async function getJSON(url, opts) {
   if (!res.ok || data.error) throw new Error(data.error || ("HTTP " + res.status));
   return data;
 }
+function short(v) {
+  const s = typeof v === "string" ? v : JSON.stringify(v);
+  return s && s.length > 300 ? s.slice(0, 299) + "…" : (s || "");
+}
 
 function renderEvent(ev) {
   const div = document.createElement("div");
   div.className = "ev " + ev.kind;
   const d = ev.data || {};
-  const who = ev.agent ? (ev.agent + ": ") : "";
   let text = "";
   switch (ev.kind) {
     case "text": text = d.text || ""; break;
@@ -113,48 +168,62 @@ function renderEvent(ev) {
     default: text = d.text || JSON.stringify(d);
   }
   if (!text) return null;
-  div.textContent = who + text;
+  div.textContent = text;
   return div;
 }
-function short(v) {
-  const s = typeof v === "string" ? v : JSON.stringify(v);
-  return s && s.length > 300 ? s.slice(0, 299) + "…" : (s || "");
+
+function ensureGroup(key, title) {
+  if (groups.has(key)) return groups.get(key);
+  const wrap = document.createElement("div");
+  wrap.className = "wf";
+  wrap.innerHTML = '<h2><span>' + title + '</span></h2><div class="grid"></div>';
+  $("agents").appendChild(wrap);
+  const grid = wrap.querySelector(".grid");
+  groups.set(key, grid);
+  return grid;
 }
 
 function ensureCard(a) {
-  if (cards.has(a.id)) return cards.get(a.id);
-  const empty = $("grid").querySelector(".empty");
-  if (empty) empty.remove();
-  const el = document.createElement("div");
-  el.className = "card";
-  const title = (a.idx !== null && a.idx !== undefined) ? ("agent " + a.idx) : a.id;
-  el.innerHTML = '<h2><span>' + title + '</span><span class="state"></span></h2>'
-    + '<pre class="trace"></pre>';
-  $("grid").appendChild(el);
-  const entry = { el, trace: el.querySelector(".trace"), state: el.querySelector(".state"),
-                  offset: 0, done: false, runId: a.run_id };
-  cards.set(a.id, entry);
+  let entry = cards.get(a.id);
+  if (!entry) {
+    const el = document.createElement("div");
+    el.className = "card" + (a.role === "orchestrator" ? " orch" : "");
+    const title = a.role === "orchestrator" ? "orchestrator"
+      : (a.idx !== null && a.idx !== undefined ? ("agent " + a.idx) : a.id.slice(0, 18));
+    el.innerHTML = '<h3><span>' + title + '</span><span class="state"></span></h3><pre class="trace"></pre>';
+    entry = { el, trace: el.querySelector(".trace"), state: el.querySelector(".state"),
+              offset: 0, done: false, runId: a.run_id };
+    cards.set(a.id, entry);
+  }
+  entry.runId = entry.runId || a.run_id;
   return entry;
+}
+
+function placeCard(entry, groupKey, title) {
+  const grid = ensureGroup(groupKey, title);
+  if (entry.el.parentElement !== grid) grid.appendChild(entry.el);
 }
 
 async function pollEvents(agentId, entry) {
   if (!entry.runId) return;
   try {
-    const data = await getJSON("/api/events?swarm=" + encodeURIComponent(swarmId)
-      + "&agent=" + encodeURIComponent(agentId)
-      + "&run=" + encodeURIComponent(entry.runId)
-      + "&offset=" + entry.offset);
-    entry.offset = data.offset;
-    entry.done = data.done;
+    const data = await getJSON("/api/events?agent=" + encodeURIComponent(agentId)
+      + "&run=" + encodeURIComponent(entry.runId) + "&offset=" + entry.offset);
+    entry.offset = data.offset; entry.done = data.done;
     const atBottom = entry.trace.scrollTop + entry.trace.clientHeight >= entry.trace.scrollHeight - 8;
-    for (const ev of (data.events || [])) {
-      const node = renderEvent(ev);
-      if (node) entry.trace.appendChild(node);
-    }
+    for (const ev of (data.events || [])) { const n = renderEvent(ev); if (n) entry.trace.appendChild(n); }
     if (atBottom) entry.trace.scrollTop = entry.trace.scrollHeight;
-    entry.state.textContent = data.state;
-    entry.state.className = "state " + data.state;
-  } catch (e) { /* transient; keep going */ }
+    entry.state.textContent = data.state; entry.state.className = "state " + data.state;
+  } catch (e) { /* transient */ }
+}
+
+function groupKeyFor(a) {
+  if (a.role === "orchestrator") return { key: "_orch", title: "orchestrator" };
+  if (mode === "dynamic") {
+    const wf = a.workflow || "(ungrouped)", st = a.stage || "";
+    return { key: "wf:" + wf + "/" + st, title: wf + (st ? " · " + st : "") };
+  }
+  return { key: "_agents", title: "agents" };
 }
 
 async function refresh() {
@@ -162,46 +231,114 @@ async function refresh() {
   try {
     const data = await getJSON("/api/agents?swarm=" + encodeURIComponent(swarmId));
     setError("");
-    $("swarmMeta").textContent = data.swarm + " · " + (data.model || "?")
+    mode = data.mode || "naive";
+    $("swarmMeta").textContent = data.swarm + " · " + (data.model || "?") + " · " + mode
       + " · " + data.agents.length + " agents";
+    if (data.agents.length && $("agents").querySelector(".empty"))
+      $("agents").querySelector(".empty").remove();
     for (const a of data.agents) {
       const entry = ensureCard(a);
-      entry.runId = entry.runId || a.run_id;
+      const g = groupKeyFor(a);
+      placeCard(entry, g.key, g.title);
       if (!entry.done) pollEvents(a.id, entry);
     }
+    if (mode === "dynamic") { $("filesPanel").style.display = ""; refreshFiles(); }
   } catch (e) { setError(String(e.message || e)); }
 }
 
+async function refreshFiles() {
+  if (!swarmId) return;
+  try {
+    const data = await getJSON("/api/files?swarm=" + encodeURIComponent(swarmId) + "&path=/");
+    const paths = data.paths || [];
+    $("filesCount").textContent = paths.length + " files";
+    const tree = $("ftree"); tree.innerHTML = "";
+    for (const p of paths) {
+      const depth = (p.match(/\//g) || []).length;
+      const div = document.createElement("div");
+      div.className = "f";
+      div.textContent = "  ".repeat(Math.max(0, depth - 1)) + p.split("/").filter(Boolean).pop();
+      div.title = p;
+      div.onclick = () => viewFile(p);
+      tree.appendChild(div);
+    }
+  } catch (e) { /* no volume yet */ }
+}
+
+async function viewFile(path) {
+  openFile = path;
+  try {
+    const data = await getJSON("/api/file?swarm=" + encodeURIComponent(swarmId)
+      + "&path=" + encodeURIComponent(path));
+    $("fview").style.display = "";
+    $("fpath").textContent = data.path + (data.truncated ? "  (truncated)" : "");
+    $("fbody").textContent = data.text || "(empty)";
+  } catch (e) { setError(String(e.message || e)); }
+}
+
+async function loadInjected() {
+  if (mode !== "dynamic") { $("injectedPanel").style.display = "none"; return; }
+  $("injectedPanel").style.display = "";
+  try {
+    const data = await getJSON("/api/injected?harness=" + encodeURIComponent($("harness").value)
+      + "&model=" + encodeURIComponent($("model").value.trim()));
+    $("injectedText").textContent = data.text || "";
+  } catch (e) { $("injectedText").textContent = "could not load: " + (e.message || e); }
+}
+
+function applyMode() {
+  const dyn = $("mode").value === "dynamic";
+  $("countWrap").style.display = dyn ? "none" : "";
+  $("goalWrap").style.display = dyn ? "none" : "";
+  $("timeoutLabel").textContent = dyn ? "orchestrator timeout (s)" : "timeout (s)";
+  $("timeout").placeholder = dyn ? "default 21600" : "none";
+  $("spawnBtn").textContent = dyn ? "spawn dynamic swarm" : "spawn swarm";
+  if (dyn) loadInjected(); else $("injectedPanel").style.display = "none";
+}
+
+const PRESET = "Research the person 'Shrivu Shankar' using browser automation and web search, then "
+  + "identify 3 distinct dimensions of their online/OSINT footprint. Create a dynamic workflow: for "
+  + "each dimension spawn 2 agents that each run under /goal for 30 minutes (wave 1); when wave 1 "
+  + "finishes, spawn a second wave of 2 agents per dimension, each /goal for another 30 minutes. "
+  + "Have all agents record findings to a shared message board and write their own report file in "
+  + "the shared workspace (you decide the exact files/paths and tell each agent). After all 12 agents "
+  + "finish, spawn one final agent that reads every report and writes a consolidated summary.";
+
+$("presetBtn").addEventListener("click", () => {
+  $("mode").value = "dynamic"; $("prompt").value = PRESET;
+  $("timeout").value = ""; applyMode();
+});
+$("mode").addEventListener("change", applyMode);
+$("harness").addEventListener("change", loadInjected);
+$("model").addEventListener("change", loadInjected);
+
 $("spawn").addEventListener("submit", async (e) => {
   e.preventDefault();
-  $("spawnBtn").disabled = true;
-  setError("spawning…");
+  $("spawnBtn").disabled = true; setError("spawning…");
   try {
     const body = {
-      harness: $("harness").value, model: $("model").value.trim(),
+      mode: $("mode").value, harness: $("harness").value, model: $("model").value.trim(),
       count: Number($("count").value) || 1, prompt: $("prompt").value,
       goal: $("goal").checked, timeout: $("timeout").value || null,
+      effort: $("effort").value || null,
     };
     const data = await getJSON("/api/spawn", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
-    swarmId = data.swarm;
+    swarmId = data.swarm; mode = data.mode || "naive";
     history.replaceState(null, "", "?swarm=" + encodeURIComponent(swarmId));
-    cards.clear(); $("grid").innerHTML = "";
-    setError("");
+    cards.clear(); groups.clear(); $("agents").innerHTML = ""; setError("");
     refresh();
   } catch (e) { setError(String(e.message || e)); }
   finally { $("spawnBtn").disabled = false; }
 });
 
 (async function init() {
-  if (!swarmId) {
-    try { const c = await getJSON("/api/config"); swarmId = c.swarm || ""; } catch (e) {}
-  }
+  applyMode();
+  if (!swarmId) { try { const c = await getJSON("/api/config"); swarmId = c.swarm || ""; } catch (e) {} }
   if (swarmId) $("swarmMeta").textContent = swarmId;
   refresh();
-  setInterval(refresh, 2000);
+  setInterval(refresh, 2500);
 })();
 </script>
 </body>
