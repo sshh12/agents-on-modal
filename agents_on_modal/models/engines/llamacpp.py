@@ -120,7 +120,16 @@ class LlamaCppEngine(Engine):
             "--ctx-size",
             str(int(model_json["context_window"])),
         ]
-        argv += self._checked_engine_args(model_json)
+        # llama.cpp's parser wants space-separated values (``--parallel 1``); it rejects the
+        # ``--parallel=1`` form SGLang accepts ("error: invalid argument: --parallel=1"). The
+        # catalog stores every engine_arg with a leading ``--`` (so a bare value passes
+        # validation), so split any ``--flag=value`` back into two tokens here.
+        for raw in self._checked_engine_args(model_json):
+            if raw.startswith("--") and "=" in raw:
+                flag, value = raw.split("=", 1)
+                argv += [flag, value]
+            else:
+                argv.append(raw)
         return argv
 
     def ready_url(self, port: int) -> str:
