@@ -373,8 +373,10 @@ def test_cli_status_renders(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------------------------- #
 def test_launch_spawns_orchestrator_with_injected_context(tmp_path, monkeypatch):
     created: list = []
-    monkeypatch.setattr(model_ops, "deploy", lambda m: FakeEndpoint())
-    monkeypatch.setattr(model_ops, "scale", lambda m, **k: None)
+    deployed: list = []
+    scaled: list = []
+    monkeypatch.setattr(model_ops, "deploy", lambda m: (deployed.append(m), FakeEndpoint())[1])
+    monkeypatch.setattr(model_ops, "scale", lambda m, **k: scaled.append(k))
     monkeypatch.setattr(sandbox, "new_id", lambda prefix="": f"{prefix}test")
 
     def fake_create(name, **opts):
@@ -397,6 +399,8 @@ def test_launch_spawns_orchestrator_with_injected_context(tmp_path, monkeypatch)
     assert "do research" in started["prompt"]
     assert started["goal"] is True
     assert started["meta"] == {"swarm_id": "swarm-test", "role": "orchestrator"}
+    # the shared model is deployed (idempotent) but NOT scaled per swarm.
+    assert deployed and scaled == []
     meta = control.get_json("_swarm/meta.json")
     assert meta["orchestrator_id"] == created[0].id and meta["model"] == "qwen3.8-27b"
 

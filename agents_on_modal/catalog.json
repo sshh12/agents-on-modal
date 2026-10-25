@@ -98,7 +98,7 @@
         "--enable-cache-report",
         "--trust-remote-code"
       ],
-      "scaling": { "target_concurrency": 4.0 },
+      "scaling": { "target_concurrency": 4.0, "max_containers": 1 },
       "reasoning": {
         "default": "high",
         "kwarg": "thinking",
@@ -126,7 +126,7 @@
         "--cuda-graph-max-bs-decode=32",
         "--enable-cache-report"
       ],
-      "scaling": { "target_concurrency": 8.0 },
+      "scaling": { "target_concurrency": 8.0, "max_containers": 1 },
       "reasoning": {
         "default": "high",
         "efforts": { "none": "low", "minimal": "low", "low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max" }

@@ -840,19 +840,17 @@ class DynamicSwarm:
         proxy: str | None = None,
         shared_volume: str | None = None,
         default_subagent_timeout: float = DEFAULT_TIMEOUT,
-        expected_agents: int = 32,
         control: "ControlPlane | None" = None,
     ) -> "DynamicSwarm":
         from . import models, sandbox
         from .models import lifecycle as model_ops
 
         resolved = models.get(model)
+        # Ensure the shared model is deployed (idempotent); do NOT scale it per swarm. The model is
+        # an account-level shared resource -- Modal's concurrency autoscaler sizes it from aggregate
+        # load across the orchestrator, this swarm's subagents, and any other consumer, under the
+        # conservative catalog policy (``Scaling``).
         endpoint = model_ops.deploy(resolved)
-        # Size the GPU pool by load (same policy as Swarm): one warm container, autoscale on demand.
-        plan = resolved.scaling.for_clients(max(1, expected_agents))
-        model_ops.scale(
-            resolved, min_containers=max(1, plan.min_containers), max_containers=plan.max_containers
-        )
 
         swarm_id = sandbox.new_id("swarm-")
         shared = shared_volume or f"aom-shared-{swarm_id}"

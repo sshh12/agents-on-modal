@@ -1,7 +1,8 @@
 """Swarm orchestrator: N Modal sandboxes running the same harness/model/prompt.
 
-A *swarm* is a fan-out. :meth:`Swarm.launch` deploys the model, pre-warms it
-(``models.scale``), then creates ``count`` Modal sandboxes tagged ``swarm=<id>`` and starts one
+A *swarm* is a fan-out. :meth:`Swarm.launch` ensures the (shared, account-level) model is deployed
+(idempotent; it does not scale it -- Modal autoscales the shared endpoint from aggregate load under
+the catalog policy), then creates ``count`` Modal sandboxes tagged ``swarm=<id>`` and starts one
 headless run in each. Everything a reader needs lives in the sandboxes themselves, so
 :meth:`Swarm.reconnect` can rebuild the whole swarm from its id alone, in a fresh process (the
 dashboard webapp after a restart): it lists the live sandboxes (``sandbox.list_sandboxes("modal",
@@ -74,25 +75,18 @@ class Swarm:
     def launch(cls, harness: str, model: str | Any, prompt: str, *, count: int,
                goal: bool = False, timeout: float | None = None, proxy: str | None = None,
                effort: str | None = None, shared_volume: str | None = None) -> "Swarm":
-        """Deploy + pre-warm the model, then create ``count`` modal sandboxes and start a run in each."""
+        """Ensure the shared model is deployed, then create ``count`` modal sandboxes and start a run in each."""
 
         if count < 1:
             raise AomError("swarm count must be >= 1.")
 
         resolved = models.get(model)
+        # Just ensure the shared model is deployed (idempotent). We do NOT scale it for this swarm:
+        # the model is an account-level shared resource and Modal's concurrency autoscaler sizes it
+        # from AGGREGATE load across every consumer, under the conservative catalog policy
+        # (``Scaling``). Scaling per launch would stomp that global setting and provision GPUs by
+        # agent count instead of by real request load.
         endpoint = model_ops.deploy(resolved)
-        # Size the GPU pool by concurrent request *load*, not agent count: the engine batches
-        # target_concurrency requests per container, so the agents share one GPU until they
-        # actually saturate it (an agent mostly runs tools, not inference). One warm container
-        # keeps the first wave off a cold start; Modal's autoscaler fans out to the ceiling only
-        # under genuinely saturating load. (Booting one GPU per agent -- the old behavior -- left
-        # every H100 at ~5% utilization and multiplied cold-start cost N-fold.)
-        plan = resolved.scaling.for_clients(count)
-        model_ops.scale(
-            resolved,
-            min_containers=plan.min_containers,
-            max_containers=plan.max_containers,
-        )
 
         swarm_id = sandbox.new_id("swarm-")
         shared = shared_volume or f"aom-shared-{swarm_id}"
@@ -177,17 +171,18 @@ class Swarm:
 
     # ---- teardown ---------------------------------------------------------------------------
     def stop(self) -> None:
-        """Terminate every agent sandbox and let the model scale back to zero (idempotent)."""
+        """Terminate every agent sandbox (idempotent).
+
+        The shared model is left alone: it is an account-level resource other swarms/apps may be
+        using, and it scales back to zero on its own once AGGREGATE demand is idle (``min=0`` +
+        ``scaledown_window``). Forcing its ``min_containers`` here would wrongly override the global
+        policy and could tear capacity out from under another consumer.
+        """
 
         for agent in self.agents():
             try:
                 agent.sandbox.stop()
             except SandboxError:
-                pass
-        if self.model:
-            try:
-                model_ops.scale(models.get(self.model), min_containers=0)
-            except AomError:
                 pass
 
     def __repr__(self) -> str:

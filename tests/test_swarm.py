@@ -115,19 +115,19 @@ def test_launch_creates_n_sandboxes_and_runs(launch_env):
         assert box.create_opts["shared_volume"] == "aom-shared-swarm-test"
 
 
-def test_launch_packs_agents_onto_one_gpu(launch_env):
-    # 10 agents fit a single container (target_concurrency=32): continuous batching, not a GPU
-    # each. Deploy happens once; the pool is pre-warmed to one container and capped at one.
+def test_launch_deploys_but_does_not_scale(launch_env):
+    # The model is a shared, account-level resource: launch only ensures it is deployed
+    # (idempotent). It must NOT scale per swarm -- Modal autoscales the shared endpoint from
+    # aggregate load under the catalog policy; scaling here would stomp that global setting.
     Swarm.launch("codex", "m", "p", count=10)
     assert len(launch_env["deployed"]) == 1
-    assert launch_env["scaled"] == [{"min_containers": 1, "max_containers": 1}]
+    assert launch_env["scaled"] == []
 
 
-def test_launch_fans_out_only_under_saturating_load(launch_env):
-    # 100 agents exceed one container's target_concurrency, so the ceiling rises to
-    # ceil(100/32)=4 -- but min stays at one warm container; Modal scales up only on real load.
+def test_launch_never_scales_regardless_of_count(launch_env):
+    # Even a large fan-out does not provision GPUs by agent count -- no scale call at all.
     Swarm.launch("codex", "m", "p", count=100)
-    assert launch_env["scaled"] == [{"min_containers": 1, "max_containers": 4}]
+    assert launch_env["scaled"] == []
 
 
 def test_launch_rejects_zero_count(launch_env):
@@ -217,7 +217,9 @@ def test_read_and_list_shared(monkeypatch):
     assert s.read_shared("/a.txt") == b"hello world"
 
 
-def test_stop_terminates_agents_and_resets_scale(monkeypatch):
+def test_stop_terminates_agents_without_scaling_model(monkeypatch):
+    # stop() tears down only its own sandboxes; the shared model is left to scale down on its own
+    # (another consumer may be using it), so it must NOT touch the autoscaler.
     boxes = [FakeBox(box_id="x0"), FakeBox(box_id="x1")]
     scaled = []
     monkeypatch.setattr(models, "get", lambda n: FakeModel(n))
@@ -226,7 +228,7 @@ def test_stop_terminates_agents_and_resets_scale(monkeypatch):
               _agents=[Agent(sandbox=b) for b in boxes])
     s.stop()
     assert all(b.stopped for b in boxes)
-    assert scaled == [{"min_containers": 0}]
+    assert scaled == []
 
 
 # --------------------------------------------------------------------------------------------- #

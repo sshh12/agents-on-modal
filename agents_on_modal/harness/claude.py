@@ -110,8 +110,11 @@ class ClaudeCode(Harness):
             "DISABLE_ERROR_REPORTING": "1",
             # Allow running bypass mode as root inside a container.
             "IS_SANDBOX": "1",
-            # Long header wait for a cold-starting, autoscaling backend.
-            "API_TIMEOUT_MS": "3600000",
+            # Long request timeout: a shared, conservatively-autoscaled backend may hold a request
+            # through a cold start (up to the largest catalog startup_timeout, ~2h) or a brief
+            # queue under load. Claude Code also retries transient 429/503/overloaded internally, so
+            # throttling is absorbed rather than surfaced as a failure.
+            "API_TIMEOUT_MS": "7200000",
         }
 
     def _mcp_path(self, home: str, posix: bool) -> str:

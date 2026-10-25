@@ -19,31 +19,27 @@ def _model() -> Model:
 
 
 # --------------------------------------------------------------------------- #
-# scaling by concurrent load                                                   #
+# conservative shared scaling policy                                           #
 # --------------------------------------------------------------------------- #
-def test_scaling_for_clients_packs_within_one_container():
-    # target_concurrency=32: up to 32 callers share a single GPU (continuous batching).
-    base = Scaling(target_concurrency=32.0)
-    for clients in (1, 2, 10, 32):
-        plan = base.for_clients(clients)
-        assert (plan.min_containers, plan.max_containers) == (1, 1), clients
+def test_scaling_defaults_are_conservative_and_shared():
+    # The catalog policy packs before spawning: scale to zero when idle, a small ceiling, a long
+    # scale-up window, and a high per-GPU concurrency (the sharing unit). No per-caller fan-out.
+    s = Scaling()
+    assert s.min_containers == 0          # idle -> zero (gateway holds the next cold start)
+    assert s.max_containers == 2          # small ceiling, not a GPU per caller
+    assert s.buffer_containers == 0
+    assert s.scaleup_window >= 30         # bursts queue instead of cold-starting a GPU
+    assert s.target_concurrency >= 32.0   # many requests share one GPU
 
 
-def test_scaling_for_clients_fans_out_by_ceiling():
-    base = Scaling(target_concurrency=32.0)
-    assert base.for_clients(33).max_containers == 2
-    assert base.for_clients(64).max_containers == 2
-    assert base.for_clients(100).max_containers == 4
-    # min stays at one warm container regardless of ceiling.
-    assert base.for_clients(100).min_containers == 1
-
-
-def test_scaling_for_clients_respects_prewarm_and_small_concurrency():
-    # A tiny target_concurrency still never provisions more than the ceiling, and prewarm is
-    # clamped to that ceiling so min never exceeds max.
-    plan = Scaling(target_concurrency=1.0).for_clients(5, prewarm=3)
-    assert (plan.min_containers, plan.max_containers) == (3, 5)
-    assert Scaling(target_concurrency=32.0).for_clients(2, prewarm=4).min_containers == 1
+def test_scaling_round_trips_through_model_json():
+    # The whole policy (incl. the new scaleup_window) survives Model.to_json/from_json so it is
+    # baked into AOM_MODEL_JSON and applied at deploy. Catalog partial overrides keep the defaults.
+    m = get("qwen3.8-27b")
+    assert m.scaling == Model.from_json(m.to_json()).scaling
+    over = Model.from_json({**m.to_json(), "scaling": {"target_concurrency": 4.0}})
+    assert over.scaling.target_concurrency == 4.0
+    assert over.scaling.max_containers == Scaling().max_containers  # inherits the conservative default
 
 
 # --------------------------------------------------------------------------- #

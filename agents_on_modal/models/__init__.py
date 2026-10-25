@@ -65,36 +65,44 @@ class Reasoning:
 
 @dataclass(frozen=True)
 class Scaling:
-    """Modal autoscaler settings for the model's GPU server."""
+    """Modal autoscaler settings for the model's GPU server -- the one place a model's capacity
+    policy lives, applied once at deploy.
+
+    A deployed model is a SHARED, account-level resource: every swarm/app that uses the same model
+    id hits the same Modal app (the app name derives from the model id and ``deploy`` is
+    idempotent), and Modal's concurrency autoscaler sizes it from the AGGREGATE request load across
+    all of them. Callers therefore never scale per launch -- they just ``deploy`` (idempotent) and
+    send requests; this policy is what governs the GPU pool.
+
+    It is deliberately conservative -- pack requests onto a GPU before spawning another, because GPU
+    compute is expensive and agents tolerate mild queueing better than a fleet wants to pay for idle
+    GPUs:
+
+    * ``target_concurrency`` -- the sharing unit: how many requests one container serves at once
+      (continuous batching) before Modal considers adding a container. Kept high, so many agents
+      share one GPU (an agent spends most of its wall-clock running tools, not awaiting tokens).
+    * ``max_containers`` -- a small ceiling: under genuine sustained saturation Modal may add a
+      container or two, never a GPU-per-caller fan-out.
+    * ``scaleup_window`` -- how long load must stay above target before a new container spawns;
+      long, so brief bursts queue (slightly slower agents) rather than cold-start another GPU.
+    * ``min_containers`` 0 -- scale to zero when idle (the gateway holds requests through the next
+      cold start); ``scaledown_window`` keeps a container warm a while so back-to-back use is not
+      punished by repeated cold starts.
+
+    Bigger/slower models override ``target_concurrency`` in the catalog (fewer concurrent requests
+    per GPU); everything else inherits these defaults.
+    """
 
     min_containers: int = 0
-    max_containers: int = 1
+    max_containers: int = 2
     buffer_containers: int = 0
     scaledown_window: int = 900
+    scaleup_window: int = 60
     target_concurrency: float = 32.0
 
     def replace(self, **overrides: Any) -> "Scaling":
         values = {**self.__dict__, **{k: v for k, v in overrides.items() if v is not None}}
         return Scaling(**values)
-
-    def for_clients(self, clients: int, *, prewarm: int = 1) -> "Scaling":
-        """Scaling sized by concurrent request *load*, not by the number of callers.
-
-        The engine serves ``target_concurrency`` requests at once per container via continuous
-        batching, so ``clients`` callers need only ``ceil(clients / target_concurrency)``
-        containers even if every one hit the model at the same instant -- and in practice fewer,
-        because an agent spends most of its wall-clock running tools, not awaiting tokens. That
-        ceiling becomes ``max_containers``; Modal's concurrency autoscaler keeps the live count
-        between ``min`` and ``max``, so the deployment sits at ``prewarm`` containers under light
-        load and fans out only when requests genuinely saturate a GPU (``prewarm`` keeps one warm
-        so a mid-run request never pays a cold start, without booting a GPU per caller).
-        """
-
-        import math
-
-        tc = max(1.0, float(self.target_concurrency))
-        ceiling = max(1, math.ceil(max(0, clients) / tc))
-        return self.replace(min_containers=max(0, min(prewarm, ceiling)), max_containers=ceiling)
 
 
 @dataclass(frozen=True)

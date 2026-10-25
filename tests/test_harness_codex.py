@@ -86,7 +86,11 @@ def test_config_toml_values():
         assert prov["env_key"] == "AOM_TOKEN"
         assert prov["requires_openai_auth"] is False
         assert prov["supports_websockets"] is False
-        assert prov["stream_idle_timeout_ms"] == 1800000
+        # Generous waits/retries for a conservatively-autoscaled shared backend (cold-start holds,
+        # brief queueing, transient 429/503) -- without abandoning a slow-but-valid response.
+        assert prov["stream_idle_timeout_ms"] >= 3600000
+        assert prov["request_max_retries"] >= 8
+        assert prov["stream_max_retries"] >= 8
         # CRITICAL: a dead endpoint must not retry connection failures forever.
         assert cfg["features"]["unbounded_connection_retries"] is False
         assert cfg["analytics"]["enabled"] is False
