@@ -46,8 +46,24 @@ TERMINAL_STATES = ("done", "timeout", "failed", "cancelled")
 #: How often to poll for deadline / cancel while a child runs (seconds).
 POLL_INTERVAL = float(os.environ.get("AOM_RUNNER_POLL", "0.1"))
 
-#: Consecutive goal iterations with no new events before we give up.
+#: Consecutive goal iterations with no new distinct action before we give up.
 MAX_NO_PROGRESS = 3
+
+
+def _distinct_actions(events: list) -> int:
+    """How many *distinct* tool calls the agent has made so far.
+
+    Goal progress is measured by distinct actions, not by output volume or raw tool-call count: a
+    finished agent that keeps narrating, or keeps re-running the same verification command on each
+    resume, makes no new distinct action and so terminates. An agent genuinely still working issues
+    new, different tool calls, so an impossible goal keeps progressing until the deadline.
+    """
+
+    seen = set()
+    for event in events:
+        if event.kind == "tool_call":
+            seen.add(json.dumps(event.data.get("input"), sort_keys=True, default=str))
+    return len(seen)
 
 #: Child subprocess currently running, so a signal handler can kill its tree.
 _ACTIVE: dict[str, "subprocess.Popen[str] | None"] = {"proc": None}
@@ -325,8 +341,10 @@ def _drive(spec: dict[str, Any], harness: Harness, setup: HarnessSetup,
         })
         status.set(state="running", turns=attempt, session_id=session_id, goal_state=goal_state)
 
-        # "Progress" = events other than session re-announcements (which repeat every resume).
-        progress_before = sum(1 for e in all_events if e.kind != "session")
+        # Progress toward a goal is measured by distinct actions (see _distinct_actions): narrating
+        # or re-running the same verification command does not count, so a settled goal terminates
+        # while an impossible one (new actions each turn) runs until the deadline.
+        progress_before = _distinct_actions(all_events)
         try:
             exit_code, reason, envelopes = _run_subprocess(cmd, env, cwd, sink, deadline, cancel_path)
         except _SpawnError as exc:
@@ -387,7 +405,7 @@ def _drive(spec: dict[str, Any], harness: Harness, setup: HarnessSetup,
             return 0 if final == "done" else 1
 
         # No-progress guard (the deadline may be None for an open-ended goal).
-        progress_after = sum(1 for e in all_events if e.kind != "session")
+        progress_after = _distinct_actions(all_events)
         no_progress = no_progress + 1 if progress_after <= progress_before else 0
         if no_progress >= MAX_NO_PROGRESS:
             status.set(state="done", goal_state=goal_state)

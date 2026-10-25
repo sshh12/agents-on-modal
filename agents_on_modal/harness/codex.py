@@ -36,12 +36,22 @@ _BASE_INSTRUCTIONS = (
     "output. Be concise in your final message and report what you did and how you verified it."
 )
 
-#: Appended to the first prompt in goal mode so the model opens a persisted goal (create_goal is
-#: only offered "when explicitly requested", per the tool description).
+#: Sentinel tokens the model emits to signal goal termination. ``codex exec`` does not reliably
+#: expose the create_goal/update_goal tools to an arbitrary open-weight model, so completion is
+#: signalled textually (tool-independent) and detected in :meth:`Codex.goal_state`; the update_goal
+#: path is kept as a fallback for when those tools are present.
+GOAL_DONE_TOKEN = "GOAL_COMPLETE"
+GOAL_BLOCKED_TOKEN = "GOAL_BLOCKED"
+
+#: Appended to the first prompt in goal mode. The model works across turns and marks termination with
+#: a sentinel line so the runner knows when to stop resuming (an unmet/impossible goal just keeps
+#: working until the deadline, which is the intended behaviour).
 _GOAL_PREAMBLE = (
-    "Treat this as a long-horizon goal: call create_goal with this objective, then keep working "
-    "across turns until every requirement is met and verified. Call update_goal with status "
-    '"complete" only after a requirement-by-requirement audit passes.'
+    "Treat this as a long-horizon goal: keep working across turns until every requirement is met "
+    "and verified. When -- and only when -- the goal is fully achieved and you have verified it "
+    "with a requirement-by-requirement audit, end your final message with a line containing "
+    f"exactly {GOAL_DONE_TOKEN} and nothing else on that line. If you become permanently blocked "
+    f"and cannot make progress, end with a line containing exactly {GOAL_BLOCKED_TOKEN}."
 )
 
 
@@ -178,9 +188,10 @@ class Codex(Harness):
     def continuation_prompt(self, *, goal: bool) -> str:
         if goal:
             return (
-                "Continue working toward the active goal. Keep going across turns until every "
-                'requirement is met and verified, then call update_goal with status "complete". '
-                'If the same blocker persists, call update_goal with status "blocked".'
+                "Continue working toward the goal. Keep going across turns until every requirement "
+                "is met and verified. When it is fully met and verified, end your message with a "
+                f"line containing exactly {GOAL_DONE_TOKEN}. If you are permanently blocked, end "
+                f"with a line containing exactly {GOAL_BLOCKED_TOKEN}. Otherwise keep working."
             )
         return "Continue."
 
@@ -320,15 +331,26 @@ class Codex(Harness):
     # -- goal ---------------------------------------------------------------------------------
     def goal_state(self, setup: HarnessSetup, events: list[Event], session_id: str | None) -> GoalState:
         """Codex exec does not auto-continue a goal, so the runner resumes until the model marks
-        the goal terminal. The last ``goal`` event wins: ``complete`` -> done, ``blocked`` ->
-        stop, otherwise keep resuming. No goal events yet means keep resuming (the goal may not be
-        created, or the turn simply ended).
+        the goal terminal. Termination is signalled either by a sentinel line in the model's own
+        message (:data:`GOAL_DONE_TOKEN` / :data:`GOAL_BLOCKED_TOKEN`) or, when available, by an
+        ``update_goal`` call surfaced as a ``goal`` event. The last terminal signal in order wins;
+        with none, keep resuming (an unmet/impossible goal runs until the runner's deadline).
+
+        The sentinel must stand alone on its line so that merely *mentioning* the token (e.g. "I
+        will print GOAL_COMPLETE when done") does not end the goal prematurely.
         """
 
         last_status: str | None = None
         for event in events:
             if event.kind == "goal" and event.data.get("status"):
                 last_status = str(event.data["status"])
+            elif event.kind == "text":
+                for line in str(event.data.get("text") or "").splitlines():
+                    stripped = line.strip()
+                    if stripped == GOAL_DONE_TOKEN:
+                        last_status = "complete"
+                    elif stripped == GOAL_BLOCKED_TOKEN:
+                        last_status = "blocked"
         if last_status == "complete":
             return "complete"
         if last_status == "blocked":

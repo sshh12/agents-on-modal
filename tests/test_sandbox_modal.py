@@ -127,6 +127,7 @@ def build_fake_modal(*, image_present: bool = True):
         volumes=[],            # FakeVolume instances
         list_calls=[],         # tags dicts passed to Sandbox.list
         from_dockerfile=[],    # dockerfile paths
+        context_dirs=[],       # context_dir passed to from_dockerfile
         images_built=[],
         app_lookups=[],
         image_present=image_present,
@@ -145,8 +146,9 @@ def build_fake_modal(*, image_present: bool = True):
             raise _NotFoundError(ref)
         return FakeImage(ref=ref)
 
-    def image_from_dockerfile(path):
+    def image_from_dockerfile(path, *, context_dir=None, **_):
         state.from_dockerfile.append(path)
+        state.context_dirs.append(context_dir)
         img = FakeImage(dockerfile=path)
         state.images_built.append(img)
         return img

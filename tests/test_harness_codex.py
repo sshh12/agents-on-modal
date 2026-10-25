@@ -182,7 +182,8 @@ def test_headless_argv_goal_adds_preamble():
     h, setup = _prepared()
     argv = h.headless_argv(setup, "ship the feature", goal=True, resume=None)
     assert argv[-1].startswith("ship the feature")
-    assert "create_goal" in argv[-1]
+    # Goal termination is signalled by a textual sentinel (tool-independent), not update_goal.
+    assert "GOAL_COMPLETE" in argv[-1]
 
 
 def test_headless_argv_resume_form():
@@ -191,7 +192,7 @@ def test_headless_argv_resume_form():
     argv = h.headless_argv(setup, cont, goal=True, resume="01a172d1")
     assert argv[:4] == ["codex", "exec", "resume", "01a172d1"]
     assert argv[-1] == cont
-    assert "update_goal" in cont
+    assert "GOAL_COMPLETE" in cont
 
 
 # -- parse -------------------------------------------------------------------------------------
@@ -321,3 +322,20 @@ def test_goal_state_complete_blocked_active():
     # create-only / none -> keep resuming
     assert h.goal_state(s, [Event("goal", {"status": "active"})], None) == "active"
     assert h.goal_state(s, [], None) == "active"
+
+
+def test_goal_state_textual_sentinel():
+    """The model signals termination with a standalone sentinel line (update_goal fallback aside)."""
+
+    h = Codex()
+    s = HarnessSetup(harness="codex", home="/h", workdir="/work", env={})
+    done = [Event("text", {"text": "all requirements verified.\nGOAL_COMPLETE"})]
+    assert h.goal_state(s, done, None) == "complete"
+    blocked = [Event("text", {"text": "cannot proceed\nGOAL_BLOCKED\n"})]
+    assert h.goal_state(s, blocked, None) == "blocked"
+    # merely mentioning the token inline must NOT terminate the goal
+    mention = [Event("text", {"text": "I will print GOAL_COMPLETE when the task is done."})]
+    assert h.goal_state(s, mention, None) == "active"
+    # the last terminal signal wins across text and goal events
+    seq = [Event("text", {"text": "GOAL_BLOCKED"}), Event("text", {"text": "fixed it\nGOAL_COMPLETE"})]
+    assert h.goal_state(s, seq, None) == "complete"
