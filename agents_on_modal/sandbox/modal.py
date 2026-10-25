@@ -273,6 +273,8 @@ class ModalSandbox(Sandbox):
             endpoint_host=endpoint_host,
             relay_env=relay_env,
         )
+        if shared:
+            box._prepare_shared()
         if upstream is not None:
             box._start_relay(proxy or "", sid, endpoint_host)
         return box
@@ -482,6 +484,21 @@ class ModalSandbox(Sandbox):
         )
 
     # ---- internals --------------------------------------------------------------------------
+    def _prepare_shared(self) -> None:
+        """Make the shared Volume writable by the agent user.
+
+        Modal mounts the Volume at ``/shared`` owned by root, so the unprivileged agent (uid 10001)
+        cannot create files there -- every collaboration write would fail with EACCES. chmod the
+        mount world-writable (as root) so agents can write; the mode change commits with the Volume,
+        so every agent sharing it sees a writable ``/shared``. Best-effort: a read-only shared dir is
+        better than a failed sandbox.
+        """
+
+        try:
+            self.exec(["chmod", "0777", "/shared"], root=True, timeout=30)
+        except SandboxError:
+            pass
+
     def _start_relay(self, proxy_url: str, session: str, model_host: str) -> None:
         """Start the loopback residential-proxy relay inside the sandbox (detached)."""
 
