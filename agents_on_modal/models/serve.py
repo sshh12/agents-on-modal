@@ -93,10 +93,23 @@ base_volume = modal.Volume.from_name(str(_base_volume_name), version=2) if _base
 if base_volume is not None:
     _volumes[BASE_MOUNT] = base_volume
 
+# Bake the model identity into every image. Modal does NOT propagate the host's deploy-time
+# AOM_MODEL_JSON / AOM_APP_NAME into containers, so without this the container re-imports this
+# module with neither var set, falls back to _STUB_MODEL_JSON, and builds DIFFERENT module-level
+# Modal objects than the deploy registered -- a different weights Volume name and no HF secret --
+# which fails hydration with "Function has N dependencies but container got N+1 object ids" (A1,
+# corrected). As image ENV, these are in os.environ before this module is imported in the
+# container, so _load_model_json() returns the real spec identically at deploy and at hydration.
+# The HF *token* is never put here (model_json carries only hf_token_env); it stays in the Secret.
+_IDENTITY_ENV = {
+    AOM_MODEL_JSON_ENV: json.dumps(model_json),
+    AOM_APP_NAME_ENV: app_name,
+}
+
 prepare_image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install("huggingface_hub[hf_xet]>=0.35,<2")
-    .env(HF_PREPARE_ENV)
+    .env({**HF_PREPARE_ENV, **_IDENTITY_ENV})
 )
 
 # The serving image is just the engine's image; the ``agents_on_modal`` package (for the gateway)
@@ -104,7 +117,7 @@ prepare_image = (
 # module-level ``add_local_python_source`` -- that builds an app-level mount object at import time
 # that is rebuilt on container re-import, which desyncs a function's object-id count between deploy
 # and hydration ("Function has N dependencies but container got N+1 object ids", lesson A1).
-serving_image = engine.image(model_json)
+serving_image = engine.image(model_json).env(_IDENTITY_ENV)
 
 
 def _hf_secrets() -> list["modal.Secret"]:
@@ -331,14 +344,21 @@ class Server:
         os._exit(1 if code else 0)
 
     def _run_gateway(self) -> None:
+        import asyncio
+
         from ..gateway import server as gateway
 
         try:
-            gateway.run(
-                model_json,
-                f"http://127.0.0.1:{ENGINE_PORT}",
-                host="0.0.0.0",
-                port=SERVER_PORT,
+            # gateway.run is a coroutine; this runs in a fresh daemon thread with no event loop,
+            # so asyncio.run() owns the loop. (Calling it bare leaves the coroutine un-awaited and
+            # the gateway never binds -- the container then exits immediately.)
+            asyncio.run(
+                gateway.run(
+                    model_json,
+                    f"http://127.0.0.1:{ENGINE_PORT}",
+                    host="0.0.0.0",
+                    port=SERVER_PORT,
+                )
             )
         except BaseException as exc:  # noqa: BLE001 - last-resort container exit
             print(f"[aom] gateway crashed: {exc!r}", flush=True)
