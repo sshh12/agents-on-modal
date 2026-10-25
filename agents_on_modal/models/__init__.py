@@ -110,11 +110,6 @@ class Model:
     max_output_tokens: int
     reasoning: Reasoning
     scaling: Scaling = Scaling()
-    #: Persist the engine's JIT/compile caches (DeepGEMM FP8, Triton, inductor) to a shared
-    #: Volume so a cold start reuses them instead of recompiling for minutes. The caches are
-    #: shape/arch-addressed, so one Volume is shared safely across every model in the catalog.
-    #: Set false to opt a model out (e.g. an engine that compiles nothing).
-    jit_cache: bool = True
     revision: str | None = None
     image: str | None = None
     engine_args: tuple[str, ...] = ()

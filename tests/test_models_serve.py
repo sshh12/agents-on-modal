@@ -51,23 +51,3 @@ def test_model_volume_name_contract_for_real_model():
     # serve derives the same shape from the model name (independent of app shortening)
     derived = f"aom-{model.name.replace('.', '-')}-weights"
     assert derived == model.volume_name
-
-
-def test_serve_mounts_shared_jit_cache_on_server_only():
-    # The stub defaults jit_cache on: the one shared cache Volume is mounted on the GPU Server and
-    # the engine's compile-cache env points at it, while the CPU prepare step stays minimal.
-    assert serve.CACHE_MOUNT in serve._server_volumes
-    assert serve.CACHE_MOUNT not in serve._volumes
-    assert serve._CACHE_ENV["SGLANG_DG_CACHE_DIR"] == f"{serve.CACHE_MOUNT}/deep_gemm"
-    assert all(v.startswith(serve.CACHE_MOUNT + "/") for v in serve._CACHE_ENV.values())
-
-
-def test_model_jit_cache_defaults_on_and_round_trips():
-    model = get("qwen3.8-27b")
-    assert model.jit_cache is True
-    assert model.to_json()["jit_cache"] is True
-    # opt-out round-trips, and a payload written before the field existed still loads (default on).
-    assert Model.from_json({**model.to_json(), "jit_cache": False}).jit_cache is False
-    legacy = model.to_json()
-    legacy.pop("jit_cache")
-    assert Model.from_json(legacy).jit_cache is True
