@@ -1,7 +1,12 @@
 .venv/
 .codex-modal/
+.agents-on-modal/
 .env
 *.log
 __pycache__/
 *.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
 lab-*/

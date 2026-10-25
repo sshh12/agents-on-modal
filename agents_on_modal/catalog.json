@@ -1,0 +1,136 @@
+{
+  "_comment": "agents-on-modal model catalog. Each entry is parsed into agents_on_modal.models.Model and fully describes one persistent Modal deployment (app aom-<name>, weights volume aom-<name>-weights). 'reasoning.efforts' maps the normalized effort scale (none/minimal/low/medium/high/xhigh/max) onto an engine value: a string is sent as reasoning_effort=<value> with thinking on; true = thinking on with no effort parameter; false = thinking off. 'reasoning.kwarg' is the chat-template thinking switch. Parsers, GPU sizing and image notes are hard-won; see git history of the old catalog.json and docs/DESIGN.md.",
+  "models": {
+    "qwen3.8-27b": {
+      "description": "Qwen3.8-27B-FP8 (dense hybrid, ~29 GiB) on 1x H100. Agentic-coding default for tests: evaluated with coding harnesses, reliable qwen3_coder tool calls. reasoning_effort must be low/medium/xhigh ONLY (the chat template raises on high/max/minimal), so the effort map never emits those.",
+      "repo": "Qwen/Qwen3.8-27B-FP8",
+      "engine": "sglang",
+      "gpu": "H100",
+      "context_window": 262144,
+      "max_output_tokens": 32768,
+      "region": "us-west",
+      "hf_token_env": "HF_TOKEN",
+      "image": "lmsysorg/sglang:v0.5.22-cu130",
+      "engine_args": [
+        "--reasoning-parser=qwen3",
+        "--tool-call-parser=qwen3_coder",
+        "--kv-cache-dtype=fp8_e4m3",
+        "--mem-fraction-static=0.85",
+        "--enable-cache-report"
+      ],
+      "sampling": { "temperature": 0.7, "top_p": 0.95, "top_k": 20 },
+      "reasoning": {
+        "default": "medium",
+        "kwarg": "enable_thinking",
+        "efforts": {
+          "none": false,
+          "minimal": "low",
+          "low": "low",
+          "medium": "medium",
+          "high": "xhigh",
+          "xhigh": "xhigh",
+          "max": "xhigh"
+        }
+      }
+    },
+    "qwen3.6-35b-a3b": {
+      "description": "Qwen3.6-35B-A3B-FP8 (MoE, 3B active, ~35 GiB) on 1x H100. Cheapest/fastest capable option; no reasoning-effort knob in the template (thinking just on/off). preserve_thinking true for agent tool loops.",
+      "repo": "Qwen/Qwen3.6-35B-A3B-FP8",
+      "engine": "sglang",
+      "gpu": "H100",
+      "context_window": 262144,
+      "max_output_tokens": 32768,
+      "region": "us-west",
+      "hf_token_env": "HF_TOKEN",
+      "image": "lmsysorg/sglang:v0.5.22-cu130",
+      "engine_args": [
+        "--reasoning-parser=qwen3",
+        "--tool-call-parser=qwen3_coder",
+        "--mem-fraction-static=0.85",
+        "--enable-cache-report",
+        "--chat-template-kwargs={\"preserve_thinking\": true}"
+      ],
+      "reasoning": {
+        "default": "high",
+        "kwarg": "enable_thinking",
+        "efforts": { "none": false, "minimal": true, "low": true, "medium": true, "high": true, "xhigh": true, "max": true }
+      }
+    },
+    "gpt-oss-120b": {
+      "description": "openai/gpt-oss-120b (MXFP4, 5.1B active, ~61 GiB) on 1x H200. Different model family for cross-checks; harmony always reasons; effort low/medium/high only (none errors).",
+      "repo": "openai/gpt-oss-120b",
+      "engine": "sglang",
+      "gpu": "H200",
+      "context_window": 131072,
+      "max_output_tokens": 32768,
+      "region": "us-west",
+      "image": "lmsysorg/sglang:v0.5.22-cu130",
+      "engine_args": [
+        "--reasoning-parser=gpt-oss",
+        "--tool-call-parser=gpt-oss",
+        "--mem-fraction-static=0.9",
+        "--enable-cache-report"
+      ],
+      "reasoning": {
+        "default": "medium",
+        "efforts": { "none": "low", "minimal": "low", "low": "low", "medium": "medium", "high": "high", "xhigh": "high", "max": "high" }
+      }
+    },
+    "deepseek-v4-flash-0731": {
+      "description": "deepseek-ai/DeepSeek-V4-Flash-0731 (304B MoE, ~156 GiB) via SGLang on H200:2. Thinking is OFF unless an effort is sent; the official profile honors low/high/max. marlin MoE runner + swa ratio are the proven Hopper recipe.",
+      "repo": "deepseek-ai/DeepSeek-V4-Flash-0731",
+      "engine": "sglang",
+      "gpu": "H200:2",
+      "context_window": 262144,
+      "max_output_tokens": 32768,
+      "region": "us-west",
+      "hf_token_env": "HF_TOKEN",
+      "image": "lmsysorg/sglang:v0.5.22-cu130",
+      "startup_timeout": 7200,
+      "engine_args": [
+        "--reasoning-parser=deepseek-v4",
+        "--tool-call-parser=deepseekv4",
+        "--moe-runner-backend=marlin",
+        "--swa-full-tokens-ratio=0.1",
+        "--mem-fraction-static=0.85",
+        "--chunked-prefill-size=4096",
+        "--cuda-graph-max-bs-decode=16",
+        "--enable-cache-report",
+        "--trust-remote-code"
+      ],
+      "scaling": { "target_concurrency": 4.0 },
+      "reasoning": {
+        "default": "high",
+        "kwarg": "thinking",
+        "efforts": { "none": false, "minimal": "low", "low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max" }
+      }
+    },
+    "glm-5.3-flash-uncensored": {
+      "description": "orcarouter/GLM-5.3-Flash-Uncensored-FP8 (320B/18B MoE, block-FP8, ~306 GiB) via SGLang on B300:2. glm47 tool parser + glm45 reasoning are mandatory (auto picks wrong). Template always opens <think>; effort low/high/max, anything else becomes max, so always send an explicit level. mem-fraction-static 0.78 is required at tp2 (0.92 OOMs cuda-graph capture).",
+      "repo": "orcarouter/GLM-5.3-Flash-Uncensored-FP8",
+      "engine": "sglang",
+      "gpu": "B300:2",
+      "context_window": 262144,
+      "max_output_tokens": 32768,
+      "region": "us-west",
+      "hf_token_env": "HF_TOKEN",
+      "image": "lmsysorg/sglang:glm-5.3-flash",
+      "startup_timeout": 7200,
+      "engine_args": [
+        "--reasoning-parser=glm45",
+        "--tool-call-parser=glm47",
+        "--ep-size=2",
+        "--kv-cache-dtype=fp8_e4m3",
+        "--mem-fraction-static=0.78",
+        "--moe-runner-backend=deep_gemm",
+        "--cuda-graph-max-bs-decode=32",
+        "--enable-cache-report"
+      ],
+      "scaling": { "target_concurrency": 8.0 },
+      "reasoning": {
+        "default": "high",
+        "efforts": { "none": "low", "minimal": "low", "low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max" }
+      }
+    }
+  }
+}
