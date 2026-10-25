@@ -77,6 +77,25 @@ class Scaling:
         values = {**self.__dict__, **{k: v for k, v in overrides.items() if v is not None}}
         return Scaling(**values)
 
+    def for_clients(self, clients: int, *, prewarm: int = 1) -> "Scaling":
+        """Scaling sized by concurrent request *load*, not by the number of callers.
+
+        The engine serves ``target_concurrency`` requests at once per container via continuous
+        batching, so ``clients`` callers need only ``ceil(clients / target_concurrency)``
+        containers even if every one hit the model at the same instant -- and in practice fewer,
+        because an agent spends most of its wall-clock running tools, not awaiting tokens. That
+        ceiling becomes ``max_containers``; Modal's concurrency autoscaler keeps the live count
+        between ``min`` and ``max``, so the deployment sits at ``prewarm`` containers under light
+        load and fans out only when requests genuinely saturate a GPU (``prewarm`` keeps one warm
+        so a mid-run request never pays a cold start, without booting a GPU per caller).
+        """
+
+        import math
+
+        tc = max(1.0, float(self.target_concurrency))
+        ceiling = max(1, math.ceil(max(0, clients) / tc))
+        return self.replace(min_containers=max(0, min(prewarm, ceiling)), max_containers=ceiling)
+
 
 @dataclass(frozen=True)
 class Model:

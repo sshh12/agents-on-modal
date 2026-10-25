@@ -26,6 +26,7 @@ EXAMPLES = Path(__file__).resolve().parents[1] / "examples" / "swarm"
 class FakeModel:
     def __init__(self, name="m"):
         self.name = name
+        self.scaling = models.Scaling()  # defaults: target_concurrency=32.0
 
 
 class FakeEndpoint:
@@ -114,15 +115,19 @@ def test_launch_creates_n_sandboxes_and_runs(launch_env):
         assert box.create_opts["shared_volume"] == "aom-shared-swarm-test"
 
 
-def test_launch_prewarms_model(launch_env):
+def test_launch_packs_agents_onto_one_gpu(launch_env):
+    # 10 agents fit a single container (target_concurrency=32): continuous batching, not a GPU
+    # each. Deploy happens once; the pool is pre-warmed to one container and capped at one.
     Swarm.launch("codex", "m", "p", count=10)
     assert len(launch_env["deployed"]) == 1
-    assert launch_env["scaled"] == [{"min_containers": 4, "max_containers": 10}]
+    assert launch_env["scaled"] == [{"min_containers": 1, "max_containers": 1}]
 
 
-def test_launch_small_count_prewarm(launch_env):
-    Swarm.launch("codex", "m", "p", count=2)
-    assert launch_env["scaled"] == [{"min_containers": 2, "max_containers": 4}]
+def test_launch_fans_out_only_under_saturating_load(launch_env):
+    # 100 agents exceed one container's target_concurrency, so the ceiling rises to
+    # ceil(100/32)=4 -- but min stays at one warm container; Modal scales up only on real load.
+    Swarm.launch("codex", "m", "p", count=100)
+    assert launch_env["scaled"] == [{"min_containers": 1, "max_containers": 4}]
 
 
 def test_launch_rejects_zero_count(launch_env):

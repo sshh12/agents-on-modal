@@ -36,8 +36,6 @@ from .sandbox.base import Run, Sandbox, SandboxError
 MAX_CONCURRENCY = 16
 CREATE_RETRIES = 5
 RETRY_BACKOFF = 2.0
-#: Pre-warm at most this many containers eagerly (the rest scale up on load).
-PREWARM_MIN = 4
 
 
 @dataclass
@@ -83,11 +81,17 @@ class Swarm:
 
         resolved = models.get(model)
         endpoint = model_ops.deploy(resolved)
-        # Pre-warm so the first wave of agents does not all hit a scaled-to-zero server (503s).
+        # Size the GPU pool by concurrent request *load*, not agent count: the engine batches
+        # target_concurrency requests per container, so the agents share one GPU until they
+        # actually saturate it (an agent mostly runs tools, not inference). One warm container
+        # keeps the first wave off a cold start; Modal's autoscaler fans out to the ceiling only
+        # under genuinely saturating load. (Booting one GPU per agent -- the old behavior -- left
+        # every H100 at ~5% utilization and multiplied cold-start cost N-fold.)
+        plan = resolved.scaling.for_clients(count)
         model_ops.scale(
             resolved,
-            min_containers=min(count, PREWARM_MIN),
-            max_containers=max(count, PREWARM_MIN),
+            min_containers=plan.min_containers,
+            max_containers=plan.max_containers,
         )
 
         swarm_id = sandbox.new_id("swarm-")

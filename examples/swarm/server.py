@@ -87,11 +87,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._write_response(status, "application/json", body)
 
     def _send_index(self) -> None:
         try:
@@ -99,11 +95,21 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             self._send_json({"error": "index.html missing"}, 500)
             return
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._write_response(200, "text/html; charset=utf-8", body)
+
+    def _write_response(self, status: int, content_type: str, body: bytes) -> None:
+        # The dashboard is polled continuously; a browser that navigates away or refreshes
+        # drops the socket mid-write, which surfaces as ConnectionError here. That is normal
+        # client behavior, not a server fault, so swallow it instead of letting it bubble up
+        # as a noisy traceback (see handle_error on the server below).
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except ConnectionError:
+            self.close_connection = True
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -141,8 +147,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": f"{type(error).__name__}: {error}"}, 500)
 
 
+class _QuietServer(ThreadingHTTPServer):
+    """A browser polling the dashboard and then navigating away aborts in-flight requests;
+    on Windows that is ConnectionAbortedError. These are client-side and benign, so we drop
+    them silently instead of printing a traceback per aborted poll (which drowned the log)."""
+
+    def handle_error(self, request: object, client_address: object) -> None:  # type: ignore[override]
+        if isinstance(sys.exc_info()[1], ConnectionError):
+            return
+        super().handle_error(request, client_address)
+
+
 def main() -> int:
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    server = _QuietServer((HOST, PORT), Handler)
     swarm_id = os.environ.get("AOM_SWARM", "")
     print(f"aom swarm dashboard on http://{HOST}:{PORT}"
           + (f"  (swarm {swarm_id})" if swarm_id else "  (set AOM_SWARM or spawn one in the UI)"))
