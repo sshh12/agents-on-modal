@@ -36,6 +36,19 @@ AOM_APP_NAME_ENV = "AOM_APP_NAME"
 MODEL_MOUNT = "/aom-weights"
 MODEL_PATH = f"{MODEL_MOUNT}/model"
 BASE_MOUNT = "/aom-base"
+# One JIT/compile-cache Volume, shared across every model (the cached kernels are shape/arch-
+# addressed, so there are no cross-model collisions and one model's compile warms the next).
+CACHE_MOUNT = "/aom-cache"
+JIT_CACHE_VOLUME = "aom-jit-cache"
+# Caches worth persisting, as {env var: subdir under CACHE_MOUNT}. Several spellings of the
+# DeepGEMM knob are set so this works across SGLang/DeepGEMM versions; an unused one is harmless.
+JIT_CACHE_DIRS = {
+    "SGLANG_DG_CACHE_DIR": "deep_gemm",  # SGLang's DeepGEMM kernel cache (the big cold-start cost)
+    "DG_JIT_CACHE_DIR": "deep_gemm",     # DeepGEMM native (newer)
+    "DG_CACHE_DIR": "deep_gemm",         # DeepGEMM native (older forks)
+    "TRITON_CACHE_DIR": "triton",        # Triton autotune/compile
+    "TORCHINDUCTOR_CACHE_DIR": "inductor",  # torch.compile inductor
+}
 ENGINE_PORT = 8001  # the engine binds loopback here
 SERVER_PORT = 8000  # the gateway binds 0.0.0.0 here; Modal routes to it
 
@@ -93,6 +106,19 @@ base_volume = modal.Volume.from_name(str(_base_volume_name), version=2) if _base
 if base_volume is not None:
     _volumes[BASE_MOUNT] = base_volume
 
+# Optional shared JIT/compile-cache Volume (A1: built deterministically from the baked model_json,
+# so the object graph is identical at deploy and hydration). Mounted on the GPU Server only -- the
+# CPU prepare step compiles nothing -- and the cache env points the engine's compilers at it.
+_jit_cache = bool(model_json.get("jit_cache", True))
+cache_volume = (
+    modal.Volume.from_name(JIT_CACHE_VOLUME, version=2, create_if_missing=True) if _jit_cache else None
+)
+_server_volumes = dict(_volumes)
+_CACHE_ENV: dict[str, str] = {}
+if cache_volume is not None:
+    _server_volumes[CACHE_MOUNT] = cache_volume
+    _CACHE_ENV = {var: f"{CACHE_MOUNT}/{sub}" for var, sub in JIT_CACHE_DIRS.items()}
+
 # Bake the model identity into every image. Modal does NOT propagate the host's deploy-time
 # AOM_MODEL_JSON / AOM_APP_NAME into containers, so without this the container re-imports this
 # module with neither var set, falls back to _STUB_MODEL_JSON, and builds DIFFERENT module-level
@@ -117,7 +143,7 @@ prepare_image = (
 # module-level ``add_local_python_source`` -- that builds an app-level mount object at import time
 # that is rebuilt on container re-import, which desyncs a function's object-id count between deploy
 # and hydration ("Function has N dependencies but container got N+1 object ids", lesson A1).
-serving_image = engine.image(model_json).env(_IDENTITY_ENV)
+serving_image = engine.image(model_json).env({**_IDENTITY_ENV, **_CACHE_ENV})
 
 
 def _hf_secrets() -> list["modal.Secret"]:
@@ -323,12 +349,19 @@ def prepare() -> dict[str, Any]:
     unauthenticated=False,
     exit_grace_period=25,
     startup_timeout=_startup_timeout,
-    volumes=_volumes,
+    volumes=_server_volumes,
     include_source=True,
 )
 class Server:
     @modal.enter()
     def startup(self) -> None:
+        # The cache env points the engine's compilers at the shared Volume; make sure each target
+        # directory exists before the engine imports (some compilers error on a missing cache dir).
+        for subdir in sorted(set(_CACHE_ENV.values())):
+            try:
+                Path(subdir).mkdir(parents=True, exist_ok=True)
+            except OSError as error:
+                print(f"[aom] could not create cache dir {subdir}: {error}", flush=True)
         argv = engine.launch_argv(model_json, MODEL_PATH, ENGINE_PORT)
         env = {**os.environ, **engine.env(model_json)}
         print(f"[aom] launching engine: {' '.join(argv)}", flush=True)
@@ -373,3 +406,11 @@ class Server:
                 proc.wait(timeout=20)
             except Exception:  # noqa: BLE001
                 proc.kill()
+        # Persist any kernels compiled this run (Modal v2 also commits in the background, but a
+        # container killed on scaledown might not flush otherwise -- so the next cold start reuses
+        # them). Best-effort: a cache that fails to commit just recompiles next time.
+        if cache_volume is not None:
+            try:
+                cache_volume.commit()
+            except Exception as error:  # noqa: BLE001
+                print(f"[aom] cache volume commit failed: {error}", flush=True)
