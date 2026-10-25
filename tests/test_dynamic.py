@@ -310,6 +310,61 @@ def test_controller_unknown_verb_and_bad_plan_ack(tmp_path):
 
 
 # --------------------------------------------------------------------------------------------- #
+# durable traces (persist full parsed events to the volume so a done agent still renders)        #
+# --------------------------------------------------------------------------------------------- #
+class _Ev:
+    def __init__(self, text):
+        self._text = text
+
+    def to_json(self):
+        return {"kind": "text", "data": {"text": self._text}}
+
+
+class _ParsingRun:
+    """A run whose parse() turns each envelope into one text event."""
+
+    def parse(self, env):
+        return [_Ev(str(env))]
+
+
+def test_controller_append_events_persists_full_parsed_trace(tmp_path):
+    c, control, _ = _controller(tmp_path)
+    run = _ParsingRun()
+    c._append_events("agentX", run, ["a", "b"])
+    lines = [ln for ln in (control.read_text("_swarm/traces/agentX.jsonl") or "").splitlines() if ln]
+    assert len(lines) == 2
+    assert json.loads(lines[0])["data"]["text"] == "a"
+    # appends across calls (full trace), not truncated
+    c._append_events("agentX", run, ["c"])
+    lines = [ln for ln in control.read_text("_swarm/traces/agentX.jsonl").splitlines() if ln]
+    assert [json.loads(ln)["data"]["text"] for ln in lines] == ["a", "b", "c"]
+
+
+def test_controller_tails_orchestrator_trace(tmp_path):
+    served = {"n": 0}
+
+    class ORun(_ParsingRun):
+        def read_trace(self, offset=0):
+            served["n"] += 1
+            return (["orch-env"], 1) if served["n"] == 1 else ([], offset)
+
+    class OBox:
+        def run(self, run_id):
+            return ORun()
+
+    class SB:
+        def get(self, kind, sid):
+            return OBox()
+
+    control = LocalDirControlPlane(str(tmp_path))
+    c = Controller(control, "sw", FakeEndpoint(), "aom-shared-sw", "claude",
+                   orchestrator_id="orch-1", orchestrator_run_id="orch-1-run", sandboxes=SB())
+    c._tail_orchestrator()  # resolves the orchestrator run via sandboxes.get(), tails + persists
+    text = control.read_text("_swarm/traces/orch-1.jsonl")
+    assert text and json.loads(text.splitlines()[0])["data"]["text"] == "orch-env"
+
+
+# --------------------------------------------------------------------------------------------- #
 # aom-swarm CLI                                                                                 #
 # --------------------------------------------------------------------------------------------- #
 def _run_cli(argv, swarm_dir, monkeypatch):

@@ -13,7 +13,7 @@ reserved namespace, ``/shared/_swarm/``, is the control plane:
     _swarm/ack/<reqid>.json       controller -> CLI replies    {id, ok, errors, warnings, result}
     _swarm/workflows/<name>.json  controller-published plan + live stage/agent state
     _swarm/agents/<agent_id>.json controller-published per-agent status
-    _swarm/traces/<agent_id>.txt  controller-published recent trace tail (for `aom-swarm trace`)
+    _swarm/traces/<agent_id>.jsonl durable per-agent trace (parsed events; survives teardown)
     _swarm/outputs/<agent_id>.json structured outputs for agents given a `schema` (soft contract)
 
 **Nothing else under ``/shared`` is a lib primitive.** How subagents coordinate -- a message board,
@@ -479,6 +479,7 @@ class Controller:
         *,
         proxy: str | None = None,
         orchestrator_id: str | None = None,
+        orchestrator_run_id: str | None = None,
         default_timeout: float = DEFAULT_TIMEOUT,
         sandboxes: Any = None,
     ) -> None:
@@ -489,12 +490,17 @@ class Controller:
         self.harness = harness
         self.proxy = proxy
         self.orchestrator_id = orchestrator_id
+        self.orchestrator_run_id = orchestrator_run_id
         self.default_timeout = default_timeout
         if sandboxes is None:
             from . import sandbox as sandboxes  # noqa: PLC0415 - lazy so swarmctl stays import-light
         self._sb = sandboxes
         self._workflows: dict[str, _WorkflowRuntime] = {}
         self._wrote_meta = False
+        # Orchestrator trace tailing (its sandbox is not a subagent; tail it so its trace persists
+        # to the volume too and survives teardown).
+        self._orch_run: Any = None
+        self._orch_offset = 0
 
     # -- lifecycle ---------------------------------------------------------------------------- #
     def run_forever(self, interval: float = 3.0, stop: Any = None) -> None:
@@ -520,6 +526,7 @@ class Controller:
                     "model": getattr(self.endpoint.model, "name", ""),
                     "harness": self.harness,
                     "orchestrator_id": self.orchestrator_id,
+                    "orchestrator_run_id": self.orchestrator_run_id,
                     "default_timeout": self.default_timeout,
                     "created_at": time.time(),
                 },
@@ -539,6 +546,8 @@ class Controller:
         for wf in list(self._workflows.values()):
             self._advance(wf)
             self._publish_workflow(wf)
+
+        self._tail_orchestrator()
 
     # -- request handling --------------------------------------------------------------------- #
     def _ack(self, reqid: str, *, ok: bool, errors=None, warnings=None, result=None) -> None:
@@ -724,18 +733,56 @@ class Controller:
         self._publish_agent(ar)
 
     # -- publishing ---------------------------------------------------------------------------- #
+    #: Keep this many of the most recent events per agent on the volume. Generous: enough for the
+    #: UI to render a completed agent's whole trace after teardown, bounded so a very long /goal run
+    #: can't grow a trace file without limit.
+    TRACE_EVENT_CAP = 5000
+
     def _publish_trace(self, ar: _AgentRun) -> None:
         try:
             envelopes, ar.offset = ar.run.read_trace(ar.offset)
         except Exception:  # noqa: BLE001
             return
+        self._append_events(ar.id, ar.run, envelopes)
+
+    def _tail_orchestrator(self) -> None:
+        """Persist the orchestrator's trace too (it is a sandbox, not a subagent), so it survives
+        teardown and the dashboard can show it after the run ends."""
+
+        if not self.orchestrator_id or not self.orchestrator_run_id:
+            return
+        try:
+            if self._orch_run is None:
+                self._orch_run = self._sb.get("modal", self.orchestrator_id).run(
+                    self.orchestrator_run_id
+                )
+            envelopes, self._orch_offset = self._orch_run.read_trace(self._orch_offset)
+        except Exception:  # noqa: BLE001 - orchestrator gone / mid-flight read
+            return
+        self._append_events(self.orchestrator_id, self._orch_run, envelopes)
+
+    def _append_events(self, agent_id: str, run: Any, envelopes: list) -> None:
+        """Parse new trace envelopes into events and append them to the agent's durable trace file
+        on the volume (``_swarm/traces/<id>.jsonl``, one event JSON per line). Parsed, not raw, so
+        the dashboard can render a completed agent straight from the volume once its sandbox is
+        gone -- the live ``/api/events`` path reads the sandbox; this is the fallback."""
+
         if not envelopes:
             return
-        existing = self.control.read_text(f"{RESERVED}/traces/{ar.id}.txt") or ""
-        lines = existing.splitlines()
+        events: list[dict] = []
         for env in envelopes:
-            lines.append(json.dumps(env, default=str))
-        self.control.put_text(f"{RESERVED}/traces/{ar.id}.txt", "\n".join(lines[-200:]) + "\n")
+            try:
+                events.extend(ev.to_json() for ev in run.parse(env))
+            except Exception:  # noqa: BLE001 - never let one bad envelope drop the batch
+                continue
+        if not events:
+            return
+        existing = self.control.read_text(f"{RESERVED}/traces/{agent_id}.jsonl") or ""
+        lines = existing.splitlines()
+        lines.extend(json.dumps(ev, default=str) for ev in events)
+        self.control.put_text(
+            f"{RESERVED}/traces/{agent_id}.jsonl", "\n".join(lines[-self.TRACE_EVENT_CAP:]) + "\n"
+        )
 
     def _publish_agent(self, ar: _AgentRun) -> None:
         self.control.put_json(
@@ -824,6 +871,7 @@ class DynamicSwarm:
     shared_volume: str
     harness: str
     orchestrator_id: str | None = None
+    orchestrator_run_id: str | None = None
     default_timeout: float = DEFAULT_TIMEOUT
     _orchestrator_box: Any = None
     _orchestrator_run: Any = None
@@ -899,6 +947,7 @@ class DynamicSwarm:
             shared_volume=shared,
             harness=harness,
             orchestrator_id=box.id,
+            orchestrator_run_id=getattr(run, "run_id", None),
             default_timeout=default_subagent_timeout,
             _orchestrator_box=box,
             _orchestrator_run=run,
@@ -915,6 +964,7 @@ class DynamicSwarm:
             self.harness,
             proxy=proxy,
             orchestrator_id=self.orchestrator_id,
+            orchestrator_run_id=self.orchestrator_run_id,
             default_timeout=self.default_timeout,
             sandboxes=sandboxes,
         )
@@ -934,6 +984,7 @@ class DynamicSwarm:
             shared_volume=shared,
             harness=str(meta.get("harness", "")),
             orchestrator_id=meta.get("orchestrator_id"),
+            orchestrator_run_id=meta.get("orchestrator_run_id"),
             default_timeout=float(meta.get("default_timeout", DEFAULT_TIMEOUT)),
         )
 

@@ -240,22 +240,37 @@ async function pollSelected() {
   const id = selected, runId = runIds.get(id);
   if (!runId) return;
   let t = traces.get(id);
-  if (!t) { t = { events: [], offset: 0, done: false, runId }; traces.set(id, t); }
+  if (!t) { t = { events: [], offset: 0, done: false, runId, source: "" }; traces.set(id, t); }
   try {
-    const data = await getJSON("/api/events?agent=" + encodeURIComponent(id)
+    const data = await getJSON("/api/events?swarm=" + encodeURIComponent(swarmId)
+      + "&agent=" + encodeURIComponent(id)
       + "&run=" + encodeURIComponent(runId) + "&offset=" + t.offset);
     t.offset = data.offset; t.done = data.done;
-    const fresh = data.events || [];
-    if (fresh.length) {
-      const empty = $("dtrace").querySelector(".empty"); if (empty) empty.remove();
-      t.events.push(...fresh);
-      if (selected === id) {
-        const pre = $("dtrace");
-        const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
-        for (const ev of fresh) { const n = renderEvent(ev); if (n) pre.appendChild(n); }
-        if (atBottom) pre.scrollTop = pre.scrollHeight;
+    const pre = $("dtrace");
+    if (data.source === "persisted") {
+      // The live sandbox is gone; the server returned the whole durable trace. Replace once
+      // (idempotent across ticks) rather than appending, and only re-render when it changed.
+      if (t.source !== "persisted" || (data.events || []).length !== t.events.length) {
+        t.events = data.events || [];
+        if (selected === id) {
+          pre.innerHTML = "";
+          for (const ev of t.events) { const n = renderEvent(ev); if (n) pre.appendChild(n); }
+          pre.scrollTop = pre.scrollHeight;
+        }
+      }
+    } else {
+      const fresh = data.events || [];
+      if (fresh.length) {
+        const empty = pre.querySelector(".empty"); if (empty) empty.remove();
+        t.events.push(...fresh);
+        if (selected === id) {
+          const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
+          for (const ev of fresh) { const n = renderEvent(ev); if (n) pre.appendChild(n); }
+          if (atBottom) pre.scrollTop = pre.scrollHeight;
+        }
       }
     }
+    t.source = data.source || "live";
     if (selected === id) {
       $("dstate").textContent = data.state; $("dstate").className = "state " + data.state;
     }
@@ -350,7 +365,7 @@ async function refresh() {
       if (first) selectAgent(first.id, orch ? "orchestrator"
         : ("agent " + (first.idx != null ? first.idx : first.id.slice(0, 10))));
     }
-    if (selected) pollSelected();
+    if (selected) { const t = traces.get(selected); if (!t || !t.done) pollSelected(); }
     if (mode === "dynamic") { $("filesPanel").style.display = ""; refreshFiles(); }
     else $("filesPanel").style.display = "none";
   } catch (e) { setError(String(e.message || e)); }

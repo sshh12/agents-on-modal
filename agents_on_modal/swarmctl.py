@@ -147,14 +147,30 @@ def _cmd_status(args, control, out) -> int:
     return 0
 
 
+def _fmt_event(ev: dict) -> str:
+    kind = ev.get("kind", "?")
+    d = ev.get("data") or {}
+    if kind in ("text", "thinking"):
+        return f"[{kind}] {str(d.get('text', ''))[:400]}"
+    if kind == "tool_call":
+        return f"[tool_call] {d.get('name', '?')} {json.dumps(d.get('input', {}))[:300]}"
+    if kind == "tool_result":
+        return f"[tool_result] {'error ' if d.get('is_error') else ''}{str(d.get('output', ''))[:300]}"
+    if kind == "error":
+        return f"[error] {d.get('message', '')}"
+    return f"[{kind}] {json.dumps(d)[:200]}"
+
+
 def _cmd_trace(args, control, out) -> int:
-    text = control.read_text(f"traces/{args.agent_id}.txt")
+    text = control.read_text(f"traces/{args.agent_id}.jsonl")
     if text is None:
         print(f"no trace for {args.agent_id} yet", file=out)
         return 0
-    lines = text.splitlines()
-    for line in lines[-args.tail:]:
-        print(line, file=out)
+    for line in text.splitlines()[-args.tail:]:
+        try:
+            print(_fmt_event(json.loads(line)), file=out)
+        except ValueError:
+            print(line, file=out)
     return 0
 
 

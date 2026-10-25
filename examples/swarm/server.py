@@ -172,13 +172,38 @@ def _agents_payload(swarm_id: str) -> dict:
     return _naive_agents_payload(swarm_id)
 
 
-def _events_payload(agent_id: str, run_id: str, offset: int) -> dict:
-    box = sandbox.get("modal", agent_id)
-    run = box.run(run_id)
-    envelopes, new_offset = run.read_trace(offset)
-    events = [event.to_json() for envelope in envelopes for event in run.parse(envelope)]
-    state = str(run.status().get("state", "starting"))
-    return {"events": events, "offset": new_offset, "state": state, "done": state in TERMINAL}
+def _events_payload(agent_id: str, run_id: str, offset: int, swarm_id: str = "") -> dict:
+    # Live-first: read the running sandbox's trace (byte-offset, incremental).
+    try:
+        box = sandbox.get("modal", agent_id)
+        run = box.run(run_id)
+        envelopes, new_offset = run.read_trace(offset)
+        events = [event.to_json() for envelope in envelopes for event in run.parse(envelope)]
+        state = str(run.status().get("state", "starting"))
+        return {"events": events, "offset": new_offset, "state": state,
+                "done": state in TERMINAL, "source": "live"}
+    except Exception:  # noqa: BLE001 - sandbox gone/unreachable -> serve the durable copy
+        if not swarm_id:
+            raise
+        # The controller persists every agent's full trace (parsed events) to the volume, so a
+        # completed/torn-down agent still renders. Returns the whole trace each call (persisted).
+        control = VolumeControlPlane(f"aom-shared-{swarm_id}")
+        text = control.read_text(f"{RESERVED}/traces/{agent_id}.jsonl")
+        if text is None:
+            raise  # nothing live and nothing persisted -> surface the live error; the UI retries
+        events = []
+        for line in text.splitlines():
+            try:
+                events.append(json.loads(line))
+            except ValueError:
+                pass
+        record = control.get_json(f"{RESERVED}/agents/{agent_id}.json")
+        state = (record or {}).get("state", "done")
+        # A running subagent whose live read merely blipped keeps done=False so the UI retries live;
+        # a terminal subagent or the orchestrator (no agent record once gone) is done.
+        done = state in TERMINAL or record is None
+        return {"events": events, "offset": len(events), "state": state, "done": done,
+                "source": "persisted"}
 
 
 def _files_payload(swarm_id: str, path: str) -> dict:
@@ -280,7 +305,8 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/agents":
                 self._send_json(_agents_payload(one("swarm", os.environ.get("AOM_SWARM", ""))))
             elif parsed.path == "/api/events":
-                self._send_json(_events_payload(one("agent"), one("run"), int(one("offset", "0") or 0)))
+                self._send_json(_events_payload(one("agent"), one("run"), int(one("offset", "0") or 0),
+                                                one("swarm", os.environ.get("AOM_SWARM", ""))))
             elif parsed.path == "/api/files":
                 self._send_json(_files_payload(one("swarm", os.environ.get("AOM_SWARM", "")), one("path", "/")))
             elif parsed.path == "/api/file":
