@@ -13,6 +13,8 @@ import os
 import secrets
 from typing import Any
 
+from urllib.parse import urlsplit
+
 import aiohttp
 from aiohttp import web
 
@@ -50,11 +52,66 @@ def build_app(model: dict, engine_url: str) -> web.Application:
     reasoning_cfg = model.get("reasoning") or {}
     sampling_defaults = dict(model.get("sampling") or {})
     engine = engine_url.rstrip("/")
+    _engine_split = urlsplit(engine)
+    engine_host = _engine_split.hostname or "127.0.0.1"
+    engine_port = _engine_split.port or (443 if _engine_split.scheme == "https" else 80)
     keepalive = float(os.environ.get("AOM_GATEWAY_KEEPALIVE", "10"))
+    #: How long a request will wait for a cold-starting engine before giving up (seconds). The
+    #: harnesses use hour-long header/idle timeouts, so holding here keeps a cold start transparent
+    #: instead of surfacing the engine's "not up yet" as a hard 503 that aborts the agent's run.
+    engine_wait = float(os.environ.get("AOM_GATEWAY_ENGINE_WAIT", "600"))
 
     app = web.Application(client_max_size=256 * 1024 * 1024)
     # Runtime state lives in a closure dict, not on the (post-startup immutable) app mapping.
     state: dict[str, Any] = {"healthy": False, "session": None}
+
+    async def _probe_engine(session: aiohttp.ClientSession) -> bool:
+        """True once the engine can actually serve (SGLang's 1-token generation returns choices)."""
+
+        probe = {"model": name, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1, "stream": False}
+        try:
+            async with session.post(
+                engine + "/v1/chat/completions", json=probe, timeout=aiohttp.ClientTimeout(total=15)
+            ) as upstream:
+                if upstream.status != 200:
+                    return False
+                data = await upstream.json(content_type=None)
+                return bool(data.get("choices"))
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return False
+
+    async def _ensure_engine_ready(_session: aiohttp.ClientSession) -> bool:
+        """Hold the caller only while the engine's TCP socket is unreachable (or ``engine_wait``).
+
+        A fresh container's gateway binds its port and starts accepting requests well before the
+        engine subprocess has loaded the weights (a multi-minute cold start). Without this gate the
+        first requests -- e.g. every agent in a just-scaled-up swarm -- would hit a connection
+        refused and get a 503 that the harness treats as a fatal error. SGLang binds its HTTP port
+        only once it can serve, so a bare TCP connect is the readiness signal: no HTTP request is
+        sent (nothing for the proxied request to race or for a genuine engine error to hide behind),
+        and once connectable the real request proceeds. Steady state is a single dict lookup.
+        """
+
+        if state["healthy"]:
+            return True
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + engine_wait
+        while True:
+            try:
+                _reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(engine_host, engine_port), timeout=10
+                )
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:  # noqa: BLE001 - close is best-effort
+                    pass
+                state["healthy"] = True
+                return True
+            except (OSError, asyncio.TimeoutError):
+                if loop.time() >= deadline:
+                    return False
+                await asyncio.sleep(2)
 
     def build_chat_body(parsed, *, stream: bool) -> dict[str, Any]:
         body: dict[str, Any] = {"model": name, "messages": parsed.messages, "stream": stream}
@@ -90,6 +147,10 @@ def build_app(model: dict, engine_url: str) -> web.Application:
             return web.json_response(
                 {"type": "error", "error": {"type": "invalid_request_error", "message": "invalid JSON"}}, status=400)
         session: aiohttp.ClientSession = state["session"]
+        if not await _ensure_engine_ready(session):
+            return web.json_response(
+                {"type": "error", "error": {"type": "overloaded_error", "message": "engine not ready"}},
+                status=503, headers={"request-id": _request_id()})
         parsed = anthropic.parse_request(body)
         if not body.get("stream"):
             # Always stream upstream and aggregate: one engine code path for both client modes.
@@ -125,6 +186,8 @@ def build_app(model: dict, engine_url: str) -> web.Application:
         except (ValueError, json.JSONDecodeError):
             return web.json_response({"error": {"message": "invalid JSON", "type": "invalid_request_error"}}, status=400)
         session = state["session"]
+        if not await _ensure_engine_ready(session):
+            return web.json_response({"error": {"message": "engine not ready", "type": "api_error"}}, status=503)
         parsed = responses.parse_request(body)
         chat_body = build_chat_body(parsed, stream=True)
         resp = web.StreamResponse(status=200, headers={**_SSE_HEADERS})
@@ -143,6 +206,8 @@ def build_app(model: dict, engine_url: str) -> web.Application:
         except (ValueError, json.JSONDecodeError):
             return web.json_response({"error": {"message": "invalid JSON", "type": "invalid_request_error"}}, status=400)
         session = state["session"]
+        if not await _ensure_engine_ready(session):
+            return web.json_response({"error": {"message": "engine not ready", "type": "api_error"}}, status=503)
         body["model"] = name
         _apply_reasoning(body, chat_reasoning_fields(body.get("reasoning_effort"), reasoning_cfg))
         prompt_estimate = estimate_tokens(json.dumps(body.get("messages") or [], ensure_ascii=False))
@@ -175,21 +240,7 @@ def build_app(model: dict, engine_url: str) -> web.Application:
              "created": 0, "owned_by": "agents-on-modal"}]})
 
     async def health_handler(request: web.Request) -> web.Response:
-        if state["healthy"]:
-            return web.json_response({"status": "ok"})
-        session = state["session"]
-        probe = {"model": name, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1, "stream": False}
-        try:
-            async with session.post(
-                engine + "/v1/chat/completions", json=probe, timeout=aiohttp.ClientTimeout(total=15)
-            ) as upstream:
-                ok = upstream.status == 200
-                if ok:
-                    data = await upstream.json(content_type=None)
-                    ok = bool(data.get("choices"))
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
-            ok = False
-        if ok:
+        if state["healthy"] or await _probe_engine(state["session"]):
             state["healthy"] = True
             return web.json_response({"status": "ok"})
         return web.json_response({"status": "loading"}, status=503)

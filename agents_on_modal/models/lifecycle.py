@@ -133,13 +133,20 @@ def _modal_deploy(app_name: str, env: dict[str, str]) -> None:
     chunks: list[str] = []
     for line in process.stdout:
         chunks.append(line)
-        # The console encoding (cp1252 on Windows) may not cover modal's progress glyphs; never
-        # let streaming the child's output crash the deploy.
+        # The console encoding (cp1252 on Windows) may not cover modal's progress glyphs, and a
+        # programmatic caller (Swarm.launch, the dashboard) never ran cli._configure_stdio, so its
+        # stdout can be cp1252. Re-encode to the console's OWN codec -- not utf-8, which can encode
+        # the glyph and so would raise again -- turning unrepresentable glyphs into '?'. Never let
+        # streaming the child's output crash the deploy.
         try:
             print(line, end="", flush=True)
         except UnicodeEncodeError:
-            sys.stdout.write(line.encode("utf-8", "replace").decode("utf-8", "replace"))
-            sys.stdout.flush()
+            try:
+                enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+                sys.stdout.write(line.encode(enc, "replace").decode(enc, "replace"))
+                sys.stdout.flush()
+            except Exception:  # noqa: BLE001 - output is best-effort; the deploy must not die for it
+                pass
     code = process.wait()
     if code != 0:
         detail = "".join(chunks).strip()
