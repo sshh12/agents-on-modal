@@ -133,7 +133,13 @@ def _modal_deploy(app_name: str, env: dict[str, str]) -> None:
     chunks: list[str] = []
     for line in process.stdout:
         chunks.append(line)
-        print(line, end="", flush=True)
+        # The console encoding (cp1252 on Windows) may not cover modal's progress glyphs; never
+        # let streaming the child's output crash the deploy.
+        try:
+            print(line, end="", flush=True)
+        except UnicodeEncodeError:
+            sys.stdout.write(line.encode("utf-8", "replace").decode("utf-8", "replace"))
+            sys.stdout.flush()
     code = process.wait()
     if code != 0:
         detail = "".join(chunks).strip()

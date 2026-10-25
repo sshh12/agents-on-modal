@@ -99,9 +99,12 @@ prepare_image = (
     .env(HF_PREPARE_ENV)
 )
 
-# The serving image is the engine's image plus the aom package source baked in (copy=True),
-# so the gateway is importable in the container.
-serving_image = engine.image(model_json).add_local_python_source("agents_on_modal", copy=True)
+# The serving image is just the engine's image; the ``agents_on_modal`` package (for the gateway)
+# is added to every function by Modal's source inclusion (``include_source=True`` below), NOT by a
+# module-level ``add_local_python_source`` -- that builds an app-level mount object at import time
+# that is rebuilt on container re-import, which desyncs a function's object-id count between deploy
+# and hydration ("Function has N dependencies but container got N+1 object ids", lesson A1).
+serving_image = engine.image(model_json)
 
 
 def _hf_secrets() -> list["modal.Secret"]:
@@ -147,6 +150,7 @@ def _metadata_identity(sibling: Any) -> tuple[str, str] | None:
     max_containers=1,
     volumes=_volumes,
     secrets=_hf_secrets(),
+    include_source=True,
 )
 def prepare() -> dict[str, Any]:
     """Materialize the checkpoint to the Volume on CPU: resumable, size-verified, committed.
@@ -307,6 +311,7 @@ def prepare() -> dict[str, Any]:
     exit_grace_period=25,
     startup_timeout=_startup_timeout,
     volumes=_volumes,
+    include_source=True,
 )
 class Server:
     @modal.enter()
