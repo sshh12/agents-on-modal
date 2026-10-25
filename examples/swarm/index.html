@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>aom swarm dashboard</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #262b36; --text: #e6e9ef;
+    --muted: #8b93a3; --accent: #6ea8fe; --ok: #4ade80; --warn: #fbbf24; --err: #f87171;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  header { padding: 14px 16px; border-bottom: 1px solid var(--border);
+    display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; }
+  header .meta { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+  main { padding: 16px; }
+  form { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px; margin-bottom: 18px; display: grid; gap: 10px;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); align-items: end; }
+  form .wide { grid-column: 1 / -1; }
+  label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+  input, select, textarea, button { font: inherit; color: var(--text); background: #0d0f14;
+    border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; width: 100%; }
+  textarea { font-family: var(--mono); min-height: 60px; resize: vertical; }
+  .check { display: flex; align-items: center; gap: 8px; }
+  .check input { width: auto; }
+  button { background: var(--accent); color: #0b1020; border: none; font-weight: 650;
+    cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    display: flex; flex-direction: column; overflow: hidden; }
+  .card h2 { font-size: 12px; margin: 0; padding: 10px 12px; border-bottom: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: center; font-family: var(--mono); }
+  .state { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
+  .state.running, .state.starting { color: var(--warn); }
+  .state.done { color: var(--ok); }
+  .state.failed, .state.timeout, .state.cancelled { color: var(--err); }
+  .trace { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word;
+    padding: 10px 12px; max-height: 420px; overflow-y: auto; margin: 0; }
+  .ev { padding: 1px 0; }
+  .ev.text {} .ev.thinking { color: var(--muted); } .ev.tool_call { color: var(--accent); }
+  .ev.tool_result { color: #a0d8c0; } .ev.error { color: var(--err); }
+  .ev.status, .ev.usage, .ev.compaction, .ev.session { color: var(--muted); }
+  .ev.goal { color: var(--warn); }
+  #error { color: var(--err); font-family: var(--mono); font-size: 12px; min-height: 16px; }
+  .empty { color: var(--muted); padding: 20px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>aom swarm</h1>
+  <span class="meta" id="swarmMeta">no swarm</span>
+  <span id="error"></span>
+</header>
+<main>
+  <form id="spawn">
+    <div><label for="harness">harness</label>
+      <select id="harness"><option>claude</option><option>codex</option></select></div>
+    <div><label for="model">model</label>
+      <input id="model" value="qwen3.8-27b" /></div>
+    <div><label for="count">count</label>
+      <input id="count" type="number" min="1" value="4" /></div>
+    <div><label for="timeout">timeout (s)</label>
+      <input id="timeout" type="number" min="0" placeholder="none" /></div>
+    <div class="check"><input id="goal" type="checkbox" /><label for="goal" style="margin:0">use /goal</label></div>
+    <div class="wide"><label for="prompt">prompt</label>
+      <textarea id="prompt" placeholder="what should every agent do?"></textarea></div>
+    <div class="wide"><button type="submit" id="spawnBtn">spawn swarm</button></div>
+  </form>
+  <div class="grid" id="grid"><div class="empty">No agents yet. Spawn a swarm above, or start one with
+    <code>aom swarm</code> and reload with <code>?swarm=&lt;id&gt;</code>.</div></div>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const qs = new URLSearchParams(location.search);
+let swarmId = qs.get("swarm") || "";
+const cards = new Map();   // agentId -> {el, trace, offset, done}
+
+function setError(msg) { $("error").textContent = msg || ""; }
+
+async function getJSON(url, opts) {
+  const res = await fetch(url, opts);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error(data.error || ("HTTP " + res.status));
+  return data;
+}
+
+function renderEvent(ev) {
+  const div = document.createElement("div");
+  div.className = "ev " + ev.kind;
+  const d = ev.data || {};
+  const who = ev.agent ? (ev.agent + ": ") : "";
+  let text = "";
+  switch (ev.kind) {
+    case "text": text = d.text || ""; break;
+    case "thinking": text = "(thinking) " + (d.text || ""); break;
+    case "tool_call": text = "> " + (d.name || "?") + " " + JSON.stringify(d.input || {}); break;
+    case "tool_result": text = "< " + (d.is_error ? "error " : "") + short(d.output); break;
+    case "usage": text = "[usage in=" + d.input_tokens + " out=" + d.output_tokens + "]"; break;
+    case "compaction": text = "[compaction]"; break;
+    case "subagent": text = "[subagent " + (d.id || "") + " " + (d.status || "") + "]"; break;
+    case "goal": text = "[goal " + (d.status || "") + "] " + (d.reason || ""); break;
+    case "turn_end": text = d.result ? short(d.result) : ""; break;
+    case "error": text = "[error] " + (d.message || ""); break;
+    case "status": text = "[" + (d.event || "status") + "]"; break;
+    case "session": text = "-- session " + (d.session_id || ""); break;
+    default: text = d.text || JSON.stringify(d);
+  }
+  if (!text) return null;
+  div.textContent = who + text;
+  return div;
+}
+function short(v) {
+  const s = typeof v === "string" ? v : JSON.stringify(v);
+  return s && s.length > 300 ? s.slice(0, 299) + "…" : (s || "");
+}
+
+function ensureCard(a) {
+  if (cards.has(a.id)) return cards.get(a.id);
+  const empty = $("grid").querySelector(".empty");
+  if (empty) empty.remove();
+  const el = document.createElement("div");
+  el.className = "card";
+  const title = (a.idx !== null && a.idx !== undefined) ? ("agent " + a.idx) : a.id;
+  el.innerHTML = '<h2><span>' + title + '</span><span class="state"></span></h2>'
+    + '<pre class="trace"></pre>';
+  $("grid").appendChild(el);
+  const entry = { el, trace: el.querySelector(".trace"), state: el.querySelector(".state"),
+                  offset: 0, done: false, runId: a.run_id };
+  cards.set(a.id, entry);
+  return entry;
+}
+
+async function pollEvents(agentId, entry) {
+  if (!entry.runId) return;
+  try {
+    const data = await getJSON("/api/events?swarm=" + encodeURIComponent(swarmId)
+      + "&agent=" + encodeURIComponent(agentId)
+      + "&run=" + encodeURIComponent(entry.runId)
+      + "&offset=" + entry.offset);
+    entry.offset = data.offset;
+    entry.done = data.done;
+    const atBottom = entry.trace.scrollTop + entry.trace.clientHeight >= entry.trace.scrollHeight - 8;
+    for (const ev of (data.events || [])) {
+      const node = renderEvent(ev);
+      if (node) entry.trace.appendChild(node);
+    }
+    if (atBottom) entry.trace.scrollTop = entry.trace.scrollHeight;
+    entry.state.textContent = data.state;
+    entry.state.className = "state " + data.state;
+  } catch (e) { /* transient; keep going */ }
+}
+
+async function refresh() {
+  if (!swarmId) return;
+  try {
+    const data = await getJSON("/api/agents?swarm=" + encodeURIComponent(swarmId));
+    setError("");
+    $("swarmMeta").textContent = data.swarm + " · " + (data.model || "?")
+      + " · " + data.agents.length + " agents";
+    for (const a of data.agents) {
+      const entry = ensureCard(a);
+      entry.runId = entry.runId || a.run_id;
+      if (!entry.done) pollEvents(a.id, entry);
+    }
+  } catch (e) { setError(String(e.message || e)); }
+}
+
+$("spawn").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  $("spawnBtn").disabled = true;
+  setError("spawning…");
+  try {
+    const body = {
+      harness: $("harness").value, model: $("model").value.trim(),
+      count: Number($("count").value) || 1, prompt: $("prompt").value,
+      goal: $("goal").checked, timeout: $("timeout").value || null,
+    };
+    const data = await getJSON("/api/spawn", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    swarmId = data.swarm;
+    history.replaceState(null, "", "?swarm=" + encodeURIComponent(swarmId));
+    cards.clear(); $("grid").innerHTML = "";
+    setError("");
+    refresh();
+  } catch (e) { setError(String(e.message || e)); }
+  finally { $("spawnBtn").disabled = false; }
+});
+
+(async function init() {
+  if (!swarmId) {
+    try { const c = await getJSON("/api/config"); swarmId = c.swarm || ""; } catch (e) {}
+  }
+  if (swarmId) $("swarmMeta").textContent = swarmId;
+  refresh();
+  setInterval(refresh, 2000);
+})();
+</script>
+</body>
+</html>

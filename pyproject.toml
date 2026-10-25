@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agents-on-modal"
+version = "0.2.0"
+description = "Run agent CLIs (Claude Code, Codex) in local, Docker, or Modal sandboxes against open-weight models served on Modal."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Shrivu Shankar" }]
+dependencies = [
+    "modal>=1.6.2,<1.7",
+    "aiohttp>=3.9,<4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[project.scripts]
+aom = "agents_on_modal.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/sshh12/agents-on-modal"
+
+[tool.setuptools.packages.find]
+include = ["agents_on_modal*"]
+
+[tool.setuptools.package-data]
+agents_on_modal = [
+    "catalog.json",
+    "sandbox/image/*",
+    "sandbox/image/**/*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q"

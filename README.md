@@ -1,171 +1,112 @@
-# codex-via-modal
+# agents-on-modal
 
-Run Codex against a Hugging Face model on Modal. The wrapper supports Modal's managed
-Endpoints and a generic self-managed SGLang app for models outside the catalog. Codex
-is launched with an isolated, Modal-only configuration; wrapper-owned resources are
-cleaned up on exit.
+Run agent coding CLIs — **Claude Code**, **Codex**, and more to come — inside a sandbox of your
+choice, against **open-weight models you serve on [Modal](https://modal.com)** GPUs. Three
+independent axes you mix freely:
 
-<img width="897" height="313" alt="Code_LtxLIER9F5" src="https://github.com/user-attachments/assets/65793242-3629-4959-9f5e-9b2a2f4af000" />
+- **model** — any entry in the catalog (Qwen3, GPT-OSS, DeepSeek-V4, GLM-5.3, …), served by SGLang or
+  llama.cpp on a Modal GPU that scales to zero when idle.
+- **harness** — the agent CLI: `claude` (Claude Code) or `codex` (Codex CLI).
+- **sandbox** — where the harness runs: `local` (directly on your machine, no container), `docker`
+  (a throwaway local container with full internet but no access to your LAN or host), or `modal`
+  (a Modal Sandbox, batteries-included, massively parallel).
 
-## Quick start
+Every harness reaches every model through one in-container **gateway** that translates the harness's
+native protocol (Anthropic Messages for Claude Code, OpenAI Responses for Codex) to the engine's
+chat-completions API — so any harness works with any model, with reasoning effort and context limits
+mapped per model.
 
-Requires Python 3.10+, `codex-cli 0.146.1`, the `codex` executable on `PATH`, and a
-Modal account. The launcher creates `.venv` and installs the pinned dependencies.
+```python
+import agents_on_modal as aom
+
+model = aom.models.get("qwen3.8-27b")
+endpoint = aom.models.deploy(model)                 # idempotent; weights downloaded on CPU first
+
+box = aom.sandbox.create("docker")                  # batteries-included container
+run = box.start("claude", endpoint, "add a /health route and test it", goal=True, timeout=1800)
+for event in run.events(follow=True):
+    print(event.kind, event.data)
+```
+
+## Install
 
 ```sh
-# macOS/Linux
-./codex-modal.sh setup
-./codex-modal.sh --modal-dry-run
-./codex-modal.sh
+pip install git+https://github.com/sshh12/agents-on-modal
+aom setup            # logs into Modal and stores a workspace proxy token
 ```
 
-```powershell
-# Windows PowerShell
-.\codex-modal.ps1 setup
-.\codex-modal.ps1 --modal-dry-run
-.\codex-modal.ps1
-```
+Requires Python 3.10+ and a Modal account. For the `docker` sandbox you also need Docker Desktop; the
+`local` sandbox additionally needs the harness CLI (`claude` / `codex`) installed on your PATH.
 
-The remaining examples use the POSIX launcher. On Windows, substitute
-`.\codex-modal.ps1` for `./codex-modal.sh`; every option is the same.
-
-`setup` logs into Modal if needed and creates a proxy token. Credentials come from
-`MODAL_PROXY_TOKEN` (or separate ID/secret variables), the OS keyring, or an
-owner-only, git-ignored local fallback. For an RBAC environment, use
-`setup --modal-env prod`.
-
-## Choose a model
-
-The default preset is `deepseek-ai/DeepSeek-V4-Flash-0731`.
+## Choose and deploy a model
 
 ```sh
-./codex-modal.sh --modal-list
-./codex-modal.sh --modal-pick
-./codex-modal.sh --modal-model Qwen/Qwen3.6-27B
+aom models list
+aom models deploy qwen3.8-27b
+aom models scale qwen3.8-27b --min 2 --max 32     # live, no redeploy — for a fan-out
 ```
 
-For a catalog-compatible fine-tune, give Modal the supported base architecture and
-the custom checkpoint:
+Adding a model is one entry in `agents_on_modal/catalog.json` (repo, engine, GPU, parsers, context,
+and the per-model reasoning-effort map), not new code.
+
+## Run an agent
 
 ```sh
-./codex-modal.sh \
-  --modal-model Qwen/Qwen3.6-27B \
-  --modal-custom-hf-repo your-org/your-finetune \
-  --modal-custom-hf-revision <exact-commit>
+# drop into an interactive session on THIS repo, no container, pick harness + model by flag
+aom shell --harness claude --model qwen3.8-27b
+
+# a batteries-included local Docker container (full internet, no LAN), interactive
+aom shell --sandbox docker --harness codex --model qwen3.8-27b
+
+# a headless goal run in a Modal sandbox; streams the live trace
+aom run --sandbox modal --harness claude --model qwen3.8-27b --goal --timeout 3600 \
+  "make the test suite pass"
 ```
 
-For a model outside Modal's catalog, deploy the generic SGLang app. GPU topology is
-required because it cannot be inferred safely for arbitrary weights. Start with the
-model card's known-good SGLang command and repeat `--modal-sglang-arg` for its engine
-flags.
+The example scripts in [`examples/`](examples/) show the same three flows as ~50-line programs.
+
+## Route sandbox traffic through a residential proxy
+
+For the `docker` and `modal` sandboxes you can send the agent's code/browser traffic through a
+SOCKS5 or HTTP residential proxy. **Model inference always stays direct**, so you never pay to tunnel
+gigabytes of token traffic.
 
 ```sh
-./codex-modal.sh \
-  --modal-self-managed \
-  --modal-model your-org/your-model \
-  --modal-model-revision <exact-commit> \
-  --modal-gpu B200:2 \
-  --modal-sglang-arg '--trust-remote-code' \
-  --modal-startup-timeout 7200
+aom run --sandbox docker --proxy "socks5h://user-{session}:pass@gate.example.com:7000" \
+  --harness claude --model qwen3.8-27b "scrape and summarize example.com"
 ```
 
-Private repositories can use `--modal-hf-token-env HF_PRIVATE_TOKEN`. Large
-fine-tunes can reuse unchanged shards from an existing Modal Volume with
-`--modal-base-volume` and `--modal-base-volume-path`; run `--modal-help` for the full
-surface. SGLang architecture support, parsers, quantization, tensor parallelism, and
-GPU memory must still match the checkpoint.
+`{session}` is replaced per sandbox, so each agent gets its own sticky IP. The credential lives in the
+egress layer, never in the agent container.
 
-### Catalog deploys
+## Swarms and the live dashboard
 
-Repeatable self-managed deploys live in `catalog.json` under its `self_managed`
-section (a `models` array of full deploy specs; the `modal_managed` section
-holds the managed-endpoint presets used by `--modal-list`). Bring one up by
-index or name; the served endpoint URL is printed and the app is left warm
-(subject to scale-to-zero):
+Spawn N Modal sandboxes running the same harness/model/prompt, sharing a `/shared` directory they
+collaborate in, and watch every agent's trace stream live — the dashboard is a single static HTML
+page that re-discovers in-flight agents after a restart, so you can close the tab and come back.
 
 ```sh
-./modal-deploy.sh glm-5.3-flash-uncensored
-./modal-deploy.sh 0 --gpu H200:4 --dry-run
+aom swarm --harness claude --model qwen3.8-27b --count 50 --goal --timeout 7200 \
+  "design a REST API for a library; write the spec and a reference impl in /shared"
+python examples/swarm/server.py            # open the dashboard
 ```
 
-Adding a model is one catalog entry, not new code. Afterwards, attach by the
-entry's `endpoint_name` with `--modal-use-app <name>`, or from another client such
-as blue-green-red via `--model <role>=modal:<endpoint_name>`.
+An impossible `/goal` keeps running (auto-compacting) until the timeout, then you read whatever the
+agents left in `/shared`.
 
-## Lifecycle and cost controls
+## Lifecycle and cost
 
-Self-managed apps default to zero warm containers, at most one serving container, and
-GPU scale-to-zero after 300 idle seconds. Set 15 minutes with:
-
-```sh
-./codex-modal.sh --modal-self-managed <other-options> --modal-scaledown-window 900
-```
-
-Normally, the wrapper stops only the exact endpoint/app it created and deletes only
-its owned temporary Volume. A detached watchdog and `cleanup` recover resources after
-a local crash. `--modal-keep-endpoint` keeps a deployment intentionally; idle
-scale-to-zero still applies.
-
-Attach without taking ownership or changing the deployed scale-down policy:
-
-```sh
-./codex-modal.sh --modal-use-endpoint <endpoint-name-or-host>
-./codex-modal.sh --modal-use-app <app-name> --modal-model your-org/your-model
-```
-
-Useful operator hooks:
-
-```text
-setup / cleanup                     credentials / stale-resource recovery
---modal-dry-run                     validate without login or provisioning
---modal-startup-timeout SECONDS     provisioning/readiness timeout
---modal-routing-region REGION       request-proxy placement
---modal-compute-region REGION       repeatable compute placement
---modal-no-history                  disable isolated Codex transcripts
---modal-help                        complete wrapper CLI
-```
-
-## Codex isolation
-
-Each run uses a git-ignored `CODEX_HOME` containing exactly one model/provider. The
-wrapper pins the main, review, and subagent models to Modal; removes OpenAI credentials
-and base-URL overrides; disables analytics, feedback, OpenTelemetry exporters, prompt
-logging, web search, plugins/apps, memories, and remote compaction; and rejects Codex
-arguments that could override the provider. Project instructions and ordinary Codex
-commands still work.
-
-## Local Docker sandbox
-
-`--docker` runs Codex in a throwaway local container with approvals and Codex's
-own sandbox bypassed: the agent is unrestricted inside the box, and the box is the
-boundary. The image is a general dev/cyber box (compilers, Python/Node/Go/Rust,
-network tools, and a headless Chromium the agent can drive). It has internet but
-no view of the host — it sits alone on a Docker `--internal` network whose only
-peer is an egress broker allowing public addresses on ports 80/443 only (host,
-LAN, loopback, link-local, metadata, CGNAT refused; second-layer in-container
-iptables default-deny). No host path is mounted (per-run volumes, read-only
-rootfs, caps dropped, non-root, no Docker socket), and the broker attaches the
-Modal token per request so the agent can use the model but never read it.
-
-```sh
-./codex-modal.sh --docker                    # Modal model, Codex in a container
-./codex-modal.sh --docker --docker-shell     # a shell in the same sandbox
-./codex-modal.sh --docker-prune              # remove leftovers after a crash
-```
-
-Each run exports raw logs (session rollout, `agent-console.log`, `egress.jsonl`)
-to `.codex-modal/docker-runs/<id>/`. Run `--modal-help` for the full option list;
-`--docker-upstream` targets any OpenAI-compatible server with no Modal at all.
+Models deploy as persistent Modal apps with a persistent weights volume and scale to zero after an
+idle window; you pay for GPU only while a request is in flight (plus the one-time CPU weight
+download). Sandboxes have an idle timeout so a wedged run can't bill forever. `aom models stop
+<name>` tears a model's app down.
 
 ## Development
 
-The test suite and dry run do not create paid Modal resources:
-
 ```sh
-python -m unittest discover -s tests -v
-./codex-modal.sh --modal-dry-run
+pip install -e ".[dev]"
+python -m pytest            # offline unit tests; no Modal, Docker, or CLIs required
+AOM_E2E=1 python -m pytest tests/e2e    # opt-in; spends Modal credits
 ```
 
-See [Modal Endpoints](https://modal.com/docs/guide/endpoints),
-[Modal Servers](https://modal.com/docs/guide/servers), and
-[Codex configuration](https://developers.openai.com/codex/config-basic).
+See [`docs/DESIGN.md`](docs/DESIGN.md) for the architecture.
