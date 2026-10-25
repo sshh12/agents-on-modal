@@ -190,10 +190,10 @@ def build_fake_modal(*, image_present: bool = True):
 
     # ---- Workspace / proxy tokens
     class FakeProxyTokens:
-        def create(self, name):
-            state.tokens_created.append(name)
+        def create(self):
             token_counter["n"] += 1
             n = token_counter["n"]
+            state.tokens_created.append(f"wk-{n}")
             return SimpleNamespace(token_id=f"wk-{n}", token_secret=f"ws-{n}")
 
         def delete(self, token_id):
@@ -255,8 +255,8 @@ def test_create_mints_token_and_sets_sandbox_args(fake_modal):
     endpoint = make_endpoint()
     box = ModalSandbox.create(endpoint)
 
-    # one run-scoped token minted, named after the sandbox id
-    assert fake_modal.tokens_created == [f"aom-{box.id}"]
+    # exactly one run-scoped token minted (1.6.2 create() takes no name)
+    assert fake_modal.tokens_created == ["wk-1"]
     assert box.token == "wk-1.ws-1"
 
     # exactly one sandbox created with the right shape

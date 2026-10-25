@@ -192,7 +192,7 @@ class ModalSandbox(Sandbox):
         token_id = ""
         if bearer is None:
             try:
-                created = modal.Workspace.from_context().proxy_tokens.create(name=f"aom-{sid}")
+                created = modal.Workspace.from_context().proxy_tokens.create()
                 token_id = getattr(created, "token_id", "")
                 bearer = f"{token_id}.{getattr(created, 'token_secret', '')}"
             except Exception:  # noqa: BLE001 - any failure falls back to the shared endpoint token

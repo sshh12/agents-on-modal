@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-import agents_on_modal.models.deploy as model_ops
+import agents_on_modal.models.lifecycle as model_ops
 from agents_on_modal import models, sandbox, swarm
 from agents_on_modal.config import AomError
 from agents_on_modal.swarm import Agent, Swarm

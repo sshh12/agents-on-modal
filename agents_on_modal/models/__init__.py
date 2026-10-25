@@ -212,9 +212,8 @@ class Endpoint:
         return f"{self.url}/v1"
 
 
-def __getattr__(name: str) -> Any:
-    if name in {"deploy", "endpoint", "wait_ready", "scale", "stop", "status"}:
-        from . import deploy as _deploy
-
-        return getattr(_deploy, name)
-    raise AttributeError(name)
+# The lifecycle functions live in ``lifecycle.py`` (which imports ``modal`` only inside its
+# functions, so this stays import-cheap and modal-free). They are re-exported here as
+# ``models.deploy`` / ``models.scale`` / ... — the public names callers use. The submodule is
+# named ``lifecycle`` (not ``deploy``) so there is no clash with the ``deploy`` function.
+from .lifecycle import deploy, endpoint, scale, status, stop, wait_ready  # noqa: E402

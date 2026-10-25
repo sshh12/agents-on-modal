@@ -22,15 +22,13 @@ import json
 import sys
 from typing import Any
 
-import agents_on_modal.models.deploy as model_ops  # the submodule; see note below
+import agents_on_modal.models.lifecycle as model_ops
 from . import models, sandbox, swarm
 from .config import AomError
 
-# ``models.deploy``/``endpoint``/``scale``/``wait_ready``/``stop``/``status`` are callables living in
-# ``agents_on_modal.models.deploy``. The catalog package re-exports them lazily, but only the dotted
-# ``import agents_on_modal.models.deploy`` form resolves them without tripping the package's
-# ``__getattr__``; call them via ``model_ops`` here. ``models.get``/``models.list_models`` are real
-# functions on the package and are called through ``models`` directly.
+# ``model_ops`` is the lifecycle submodule: deploy/endpoint/scale/wait_ready/stop/status. It is
+# aliased (rather than calling ``models.deploy`` etc.) so these stay easy to monkeypatch in tests.
+# ``models.get``/``models.list_models`` are called through ``models`` directly.
 
 SANDBOX_KINDS = ("local", "docker", "modal")
 HARNESSES = ("claude", "codex")
@@ -143,7 +141,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
         ) from error
 
     try:
-        minted = workspace.proxy_tokens.create(name=args.name)
+        minted = workspace.proxy_tokens.create()
     except Exception as error:  # noqa: BLE001
         raise AomError(f"Could not mint a Modal proxy token: {error}") from error
 

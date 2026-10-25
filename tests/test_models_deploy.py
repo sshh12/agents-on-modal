@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-import agents_on_modal.models.deploy as deploy
+import agents_on_modal.models.lifecycle as deploy
 from agents_on_modal.config import AomError, ProxyToken
 from agents_on_modal.models import Endpoint, Model, Scaling, get
 

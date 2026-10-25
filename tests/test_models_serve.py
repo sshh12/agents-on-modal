@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-import agents_on_modal.models.deploy as deploy
+import agents_on_modal.models.lifecycle as deploy
 import agents_on_modal.models.serve as serve
 from agents_on_modal.models import Model, get
 

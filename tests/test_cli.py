@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-import agents_on_modal.models.deploy as model_ops
+import agents_on_modal.models.lifecycle as model_ops
 from agents_on_modal import cli, models, sandbox, swarm
 from agents_on_modal.cli import build_parser, main
 from agents_on_modal.config import AomError

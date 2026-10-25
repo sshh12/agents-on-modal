@@ -23,15 +23,14 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-import agents_on_modal.models.deploy as model_ops  # the submodule; see note below
+import agents_on_modal.models.lifecycle as model_ops
 
 from . import models, sandbox
 from .config import AomError
 from .sandbox.base import Run, Sandbox, SandboxError
 
-# ``models.deploy``/``scale`` are callables in ``agents_on_modal.models.deploy``; reach them via the
-# dotted-import ``model_ops`` alias (the package's lazy re-export recurses under ``from``-import).
-# ``models.get`` is a real function on the package.
+# ``model_ops`` is the lifecycle submodule (deploy/scale/endpoint/...); aliased so tests can
+# monkeypatch it. ``models.get`` is the catalog lookup on the package.
 
 #: Bounded concurrency and retry policy for the create/start fan-out.
 MAX_CONCURRENCY = 16

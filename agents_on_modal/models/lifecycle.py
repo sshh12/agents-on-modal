@@ -89,15 +89,36 @@ def base_url(app_name: str, workspace_slug: str, region: str) -> str:
 # Modal seams (imported lazily; monkeypatched in tests)                        #
 # --------------------------------------------------------------------------- #
 def _workspace_slug() -> str:
-    """The workspace DNS slug used in ``*.modal.direct`` URLs."""
+    """The workspace DNS slug used in ``*.modal.direct`` URLs.
+
+    ``Workspace.from_context()`` is lazy; its ``name`` is ``None`` until hydrated. Hydrate it, and
+    fall back to parsing ``modal profile current`` if the SDK path is unavailable.
+    """
 
     import modal
 
-    workspace = modal.Workspace.from_context()
-    slug = getattr(workspace, "name", None)
-    if not slug:
-        raise AomError("Could not determine the active Modal workspace slug.")
-    return str(slug)
+    try:
+        workspace = modal.Workspace.from_context()
+        hydrate = getattr(workspace, "hydrate", None)
+        if callable(hydrate):
+            hydrate()
+        slug = getattr(workspace, "name", None)
+        if slug:
+            return str(slug)
+    except Exception:  # noqa: BLE001 - fall through to the CLI probe
+        pass
+
+    result = subprocess.run(
+        [sys.executable, "-m", "modal", "profile", "current"],
+        text=True, encoding="utf-8", errors="replace",
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
+    )
+    slug = (result.stdout or "").strip().splitlines()
+    if result.returncode == 0 and slug and slug[-1].strip():
+        return slug[-1].strip()
+    raise AomError(
+        "Could not determine the active Modal workspace slug. Run `modal token new` / `aom setup`."
+    )
 
 
 def _modal_deploy(app_name: str, env: dict[str, str]) -> None:
