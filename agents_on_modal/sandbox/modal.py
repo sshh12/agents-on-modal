@@ -29,6 +29,7 @@ packet filter.
 from __future__ import annotations
 
 import hashlib
+import os
 import shlex
 from collections.abc import Mapping, Sequence
 from importlib.resources import files
@@ -46,6 +47,10 @@ APP_NAME = "aom-sandboxes"
 IMAGE_NAME = "aom-sandbox"
 #: Bump to force a new image tag even when the Dockerfile/init.sh bytes are unchanged.
 IMAGE_VERSION = "1"
+#: Modern Modal image builder (matches the deploy path). The legacy builder injects a
+#: ``pip install --upgrade pip`` layer that fails on this Debian base's apt-managed pip
+#: ("uninstall-no-record-file"), so the batteries image only builds on a modern builder.
+MODAL_IMAGE_BUILDER_VERSION = "2025.06"
 
 #: uid:gid of the ``agent`` user baked into the image (Dockerfile creates uid/gid 10001).
 AGENT_UID_GID = "10001:10001"
@@ -149,8 +154,14 @@ class ModalSandbox(Sandbox):
             except Exception as error:  # noqa: BLE001 - re-raise anything that is not "not found"
                 if not _is_not_found(modal, error):
                     raise
+        # Force the modern image builder for the build below (the account default may be legacy,
+        # which cannot build this Debian-based Dockerfile; see MODAL_IMAGE_BUILDER_VERSION).
+        os.environ.setdefault("MODAL_IMAGE_BUILDER_VERSION", MODAL_IMAGE_BUILDER_VERSION)
+        # context_dir must be the image resources dir so the Dockerfile's `COPY init.sh` resolves;
+        # Modal does not default the build context to the Dockerfile's own directory.
         image = modal.Image.from_dockerfile(
-            str(_IMAGE_RESOURCES.joinpath("Dockerfile"))
+            str(_IMAGE_RESOURCES.joinpath("Dockerfile")),
+            context_dir=str(_IMAGE_RESOURCES),
         ).add_local_dir(str(files("agents_on_modal")), "/opt/aom/agents_on_modal", copy=True)
         with modal.enable_output():
             image = image.build(cls._app())
