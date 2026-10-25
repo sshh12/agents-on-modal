@@ -131,6 +131,12 @@ class Model:
     startup_timeout: int = 3600
     cpu: int = 8
     memory: int = 98_304
+    # Optional base-volume reuse: serve.py's prepare() symlinks content-identical files from an
+    # already-downloaded base model's Volume instead of re-downloading them. All four go together.
+    base_repo: str | None = None
+    base_revision: str | None = None
+    base_volume: str | None = None
+    base_volume_path: str | None = None
 
     @property
     def app_name(self) -> str:
@@ -185,6 +191,8 @@ def _validate(model: Model) -> None:
         raise AomError(f"{where}: region must be one of {', '.join(REGIONS)}.")
     if model.context_window < 8192 or model.max_output_tokens >= model.context_window:
         raise AomError(f"{where}: need context_window >= 8192 and max_output_tokens < context_window.")
+    if model.base_volume and not model.base_repo:
+        raise AomError(f"{where}: base_volume requires base_repo (the base model to symlink from).")
     if model.reasoning.default not in EFFORTS:
         raise AomError(f"{where}: reasoning.default must be one of {', '.join(EFFORTS)}.")
     bad = sorted(set(model.reasoning.efforts) - set(EFFORTS))
