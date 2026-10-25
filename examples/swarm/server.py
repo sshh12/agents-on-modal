@@ -22,6 +22,7 @@ Endpoints
     GET  /api/files?swarm=&path=/               -> {paths:[...]}            (live /shared listing)
     GET  /api/file?swarm=&path=...              -> {path, text, truncated}  (one shared file)
     GET  /api/injected?harness=&model=          -> {text}                   (orchestrator context)
+    GET  /api/models                            -> {models:[{name,description,gpu,context_window}]}
     POST /api/spawn  {mode,harness,model,...}   -> {swarm, mode}            (launches; hits Modal)
 """
 
@@ -106,6 +107,29 @@ def _naive_agents_payload(swarm_id: str) -> dict:
             "workflows": []}
 
 
+def _orchestrator_state(meta: dict) -> str:
+    """Live state of the orchestrator sandbox (its state is not published to the volume)."""
+
+    oid, rid = meta.get("orchestrator_id"), meta.get("orchestrator_run_id")
+    if not oid or not rid:
+        return "running"
+    try:
+        return str(sandbox.get("modal", oid).run(rid).status().get("state", "running"))
+    except Exception:  # noqa: BLE001 - mid-flight read; assume still running
+        return "running"
+
+
+def _models_payload() -> dict:
+    """The model catalog, for the dashboard's model dropdown."""
+
+    out = [
+        {"name": m.name, "description": m.description, "gpu": m.gpu,
+         "context_window": m.context_window}
+        for m in models.list_models()
+    ]
+    return {"models": out}
+
+
 def _dynamic_agents_payload(swarm_id: str, meta: dict) -> dict:
     control = VolumeControlPlane(f"aom-shared-{swarm_id}")
     # resume: make sure a controller is driving this swarm (e.g. after a server restart)
@@ -119,7 +143,8 @@ def _dynamic_agents_payload(swarm_id: str, meta: dict) -> dict:
     agents: list[dict] = []
     if meta.get("orchestrator_id"):
         agents.append({"id": meta["orchestrator_id"], "run_id": meta.get("orchestrator_run_id"),
-                       "idx": None, "role": "orchestrator", "workflow": None, "stage": None})
+                       "idx": None, "role": "orchestrator", "workflow": None, "stage": None,
+                       "state": _orchestrator_state(meta)})
     for name in control.listdir(f"{RESERVED}/agents"):
         if not name.endswith(".json"):
             continue
@@ -127,7 +152,7 @@ def _dynamic_agents_payload(swarm_id: str, meta: dict) -> dict:
         if a and a.get("id"):
             agents.append({"id": a["id"], "run_id": a.get("run_id"), "idx": a.get("idx"),
                            "role": "subagent", "workflow": a.get("workflow"),
-                           "stage": a.get("stage")})
+                           "stage": a.get("stage"), "state": a.get("state", "starting")})
     workflows = []
     for name in control.listdir(f"{RESERVED}/workflows"):
         if name.endswith(".json"):
@@ -262,6 +287,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(_file_payload(one("swarm", os.environ.get("AOM_SWARM", "")), one("path")))
             elif parsed.path == "/api/injected":
                 self._send_json(_injected_payload(one("harness"), one("model", "qwen3.8-27b")))
+            elif parsed.path == "/api/models":
+                self._send_json(_models_payload())
             elif parsed.path == "/api/config":
                 self._send_json({"swarm": os.environ.get("AOM_SWARM", "")})
             else:
