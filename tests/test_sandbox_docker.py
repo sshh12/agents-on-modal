@@ -342,8 +342,13 @@ def test_write_file_tees_as_root_then_chowns(fake):
     shell = write[-1]
     assert 'mkdir -p "/home/agent/.aom/runs/r"' in shell
     assert fake.inputs[-1] == b"hello"
-    chown = find(fake, lambda c: "chown" in c)
-    assert chown[chown.index("chown") + 1] == "10001:10001"
+    # chown runs as root and walks up chowning root-owned parent dirs to the agent, so the
+    # agent-user runner can write status.json/trace.jsonl into the run dir it did not create.
+    chown = find(fake, lambda c: c[:1] == ["exec"] and any("chown 10001:10001" in a for a in c))
+    assert "-u" not in chown
+    script = chown[-1]
+    assert "chown 10001:10001" in script
+    assert "stat -c %u" in script
 
 
 def test_write_file_accepts_bytes(fake):

@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -403,7 +404,18 @@ class DockerSandbox(Sandbox):
         if result.returncode != 0:
             detail = (result.stderr or b"").decode("utf-8", "replace").strip()
             raise SandboxError(f"{self.agent_container}: could not write {path}: {detail}")
-        chown = self._exec_argv(["chown", "10001:10001", path], env=None, cwd=None, root=True)
+        # `mkdir -p` ran as root, so hand the file AND any root-owned parent dirs it had to create to
+        # the agent, stopping at the first dir the agent already owns. Without this the run directory
+        # stays root-owned and the agent-user runner cannot write status.json/trace.jsonl into it.
+        quoted = shlex.quote(path)
+        chown_script = (
+            f"chown 10001:10001 {quoted} 2>/dev/null || true; "
+            f"d=$(dirname {quoted}); "
+            'while [ "$d" != "/" ] && [ "$d" != "." ] && '
+            '[ "$(stat -c %u "$d" 2>/dev/null)" = 0 ]; do '
+            'chown 10001:10001 "$d" 2>/dev/null || true; d=$(dirname "$d"); done'
+        )
+        chown = self._exec_argv(["sh", "-c", chown_script], env=None, cwd=None, root=True)
         _run(chown, check=False, timeout=60.0)
 
     def read_file(self, path: str, offset: int = 0) -> bytes:
