@@ -26,7 +26,9 @@ not baked into the image — a harness installs them into its own skill dir.
   `--no-sandbox` drop-in) so every browser tool works with zero flags.
 - Browser agents: `@playwright/mcp` (the `browser_*` MCP server), `agent-browser`
   (shell CLI), plus Python/Node Playwright and `puppeteer-core`.
-- The agent CLIs, pinned: Claude Code and Codex.
+- The agent CLIs, pinned: Claude Code and Codex, plus the DeepSeek Harness
+  (`dsh`) via its Python SDK (`deepseek-harness-sdk`, imported by the in-sandbox
+  `agents_on_modal.harness._dsh_adapter`).
 - A non-root `agent` user (uid 10001) with passwordless `sudo`; `/work` is the
   default workdir and `/home/agent/.aom` its state dir.
 
@@ -42,6 +44,7 @@ versions; tests assert the Dockerfile still carries them.
 | `PW_MCP_VERSION` | `0.0.83` | `@playwright/mcp` |
 | `AGENT_BROWSER_VERSION` | `0.39.2` | `agent-browser` |
 | `PY_PLAYWRIGHT_VERSION` | `1.64.1` | pip `playwright` |
+| `DSH_SDK_VERSION` | `0.2.1rc2` | pip `deepseek-harness-sdk` (the `dsh` harness) |
 | `UV_VERSION` | `0.13.5` | pip `uv` |
 | `GO_VERSION` | `1.24.8` | upstream Go tarball |
 | `TARGETARCH` | (from buildkit) | `amd64` / `arm64` for the Go tarball |

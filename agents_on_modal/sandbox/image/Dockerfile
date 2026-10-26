@@ -25,6 +25,7 @@ ARG CODEX_VERSION=0.155.1
 ARG PW_MCP_VERSION=0.0.83
 ARG AGENT_BROWSER_VERSION=0.39.2
 ARG PY_PLAYWRIGHT_VERSION=1.64.1
+ARG DSH_SDK_VERSION=0.2.1rc2
 ARG UV_VERSION=0.13.5
 ARG GO_VERSION=1.24.8
 ARG TARGETARCH
@@ -125,6 +126,15 @@ RUN set -eux; \
 RUN set -eux; \
     pip3 install --no-cache-dir --break-system-packages \
         playwright==${PY_PLAYWRIGHT_VERSION} "uv==${UV_VERSION}"
+
+# --- DeepSeek Harness SDK (the `dsh` harness). The wheel vendors the `dsh` runtime + binary and the
+# `deepseek_harness` Python module that agents_on_modal.harness._dsh_adapter imports. System-wide so
+# the agent-user runner can import it; the import smoke-check keeps a broken pin from shipping.
+RUN set -eux; \
+    pip3 install --no-cache-dir --break-system-packages \
+        "deepseek-harness-sdk==${DSH_SDK_VERSION}"; \
+    python3 -c "import deepseek_harness; print('deepseek_harness ok')"; \
+    command -v dsh || true
 
 # This is a throwaway devbox: let the agent `pip install` without a venv or the
 # per-command --break-system-packages dance.
