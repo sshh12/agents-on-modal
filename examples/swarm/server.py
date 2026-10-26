@@ -23,6 +23,7 @@ Endpoints
     GET  /api/file?swarm=&path=...              -> {path, text, truncated}  (one shared file)
     GET  /api/injected?harness=&model=          -> {text}                   (orchestrator context)
     GET  /api/models                            -> {models:[{name,description,gpu,context_window}]}
+    GET  /api/presets                           -> {presets:[{name,label,mode,prompt?,locked}]}
     POST /api/spawn  {mode,harness,model,...}   -> {swarm, mode}            (launches; hits Modal)
 """
 
@@ -49,6 +50,8 @@ from agents_on_modal.dynamic import (  # noqa: E402
     _model_efforts,
 )
 from agents_on_modal.swarm import Swarm  # noqa: E402
+
+import presets as presets_mod  # noqa: E402 - local module beside this file
 
 HERE = Path(__file__).resolve().parent
 INDEX = HERE / "index.html"
@@ -123,7 +126,7 @@ def _models_payload() -> dict:
     """The model catalog, for the dashboard's model dropdown."""
 
     out = [
-        {"name": m.name, "description": m.description, "gpu": m.gpu,
+        {"name": m.name, "repo": m.repo, "description": m.description, "gpu": m.gpu,
          "context_window": m.context_window}
         for m in models.list_models()
     ]
@@ -223,12 +226,47 @@ def _file_payload(swarm_id: str, path: str) -> dict:
     return {"path": path, "text": text, "truncated": truncated}
 
 
+def _presets_payload() -> dict:
+    """The swarm presets from presets.json, with encrypted entries decrypted where possible.
+
+    Encrypted entries we can decrypt (the key is in the environment) come back with their
+    cleartext ``prompt``; those we cannot come back ``locked: true`` with no prompt, so a
+    missing key never fails the whole endpoint.
+    """
+
+    try:
+        return {"presets": presets_mod.resolve_presets()}
+    except Exception as error:  # noqa: BLE001 - a bad presets.json should not 500 the UI
+        return {"presets": [], "error": f"{type(error).__name__}: {error}"}
+
+
 def _injected_payload(harness: str, model: str) -> dict:
     m = models.get(model)
     text = build_orchestrator_instructions(
         default_timeout=DEFAULT_TIMEOUT, model_name=m.name, allowed_efforts=_model_efforts(m)
     )
     return {"text": text, "model": m.name, "harness": harness or "claude"}
+
+
+def _apply_max_instances(model_name: str, max_instances) -> None:
+    """Apply the dashboard's max-instances cap to the (shared) endpoint's live autoscaler.
+
+    ``1`` (the default) caps the endpoint at one GPU container so it throttles gracefully instead of
+    fanning out GPUs; ``0`` / ``None`` / blank means "unbounded" -- leave the endpoint at its catalog
+    autoscaler policy. Best-effort: the model is a shared account-level resource and a spawn must not
+    fail just because the live autoscaler update hiccuped.
+    """
+
+    if max_instances in (None, "", 0, "0", "unbounded"):
+        return  # unbounded -> leave the catalog autoscaler policy untouched
+    try:
+        n = max(1, int(max_instances))
+    except (TypeError, ValueError):
+        return
+    try:
+        models.scale(models.get(model_name), max_containers=n)
+    except Exception:  # noqa: BLE001 - shared resource; never fail a spawn on a scaling hiccup
+        pass
 
 
 def _spawn(body: dict) -> dict:
@@ -239,6 +277,7 @@ def _spawn(body: dict) -> dict:
         raise AomError("spawn requires a model name.")
     proxy = body.get("proxy") or None
     effort = body.get("effort") or None
+    _apply_max_instances(model, body.get("max_instances"))
 
     if mode == "dynamic":
         timeout = float(body["timeout"]) if body.get("timeout") else DYNAMIC_ORCHESTRATOR_TIMEOUT
@@ -315,6 +354,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(_injected_payload(one("harness"), one("model", "qwen3.8-27b")))
             elif parsed.path == "/api/models":
                 self._send_json(_models_payload())
+            elif parsed.path == "/api/presets":
+                self._send_json(_presets_payload())
             elif parsed.path == "/api/config":
                 self._send_json({"swarm": os.environ.get("AOM_SWARM", "")})
             else:

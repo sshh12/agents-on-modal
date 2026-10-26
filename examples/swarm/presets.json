@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "presets": [
+    {
+      "name": "coding-llms",
+      "label": "Coding-LLM survey (demo)",
+      "mode": "dynamic",
+      "prompt": "Research the current state of open-weight large language models for coding. Compare the top 3 models on context window, license, and reported benchmark performance, then write a short summary with a recommendation. Record your findings to the shared workspace."
+    },
+    {
+      "name": "engine-dossier",
+      "label": "Inference-engine dossier (complex swarm)",
+      "mode": "dynamic",
+      "prompt": "Produce a rigorous, cited comparison dossier on three open-source LLM inference engines -- vLLM, SGLang, and llama.cpp -- plus a small working demo, by coordinating a TEAM of subagents through the shared workspace. Do not do all the work yourself: decompose and delegate.\n\nWave 1 (parallel research -- spawn one subagent per engine): each subagent uses the browser to visit that engine's official GitHub repository and documentation and extracts four facts -- supported quantization formats, continuous/batched inference support, multi-GPU / tensor-parallel support, and one notable recent feature (with its source URL). Each subagent writes findings/<engine>.md (engine = vllm, sglang, or llamacpp) into the shared workspace, containing those four facts with citations.\n\nWave 2 (synthesis + demo -- only after Wave 1 finishes): spawn one subagent that reads all three findings files, then writes tools/compare.py -- a Python script that builds a comparison table from the facts and prints it (install any needed package such as tabulate with pip, and actually RUN the script, redirecting its output to tools/compare.txt) -- and finally writes DOSSIER.md with the sections ## Summary, ## vLLM, ## SGLang, ## llama.cpp, ## Comparison table, and ## Recommendation, embedding the produced table and citing the source URLs.\n\nFinish: verify in the shared workspace that findings/vllm.md, findings/sglang.md and findings/llamacpp.md all exist, that tools/compare.txt was produced by running the script, and that DOSSIER.md contains all six sections. Only then stop. If any check fails, spawn a fix-up subagent and re-verify before stopping."
+    },
+    {
+      "name": "osint",
+      "label": "OSINT footprint",
+      "mode": "dynamic",
+      "enc": {
+        "scheme": "sha256-xor-b64-v1",
+        "key": "env:AOM_SWARM_PRESET_KEY",
+        "ciphertext": "nJkWTqZOq1gt8wPOO/bwsF+vBRKc/b7OFB6nM1WLIT7KZoa5ZK2FzfV5KK3MmATju9htO7kH2fDlLG1QGdnNluUkThkgT5FqgGVrhU/C2O53yFKbtlzPQJpR2cyef07l/4WdBftUjSvqr2K8LzsZN6HMnTcfDrwpbxzvf0dxTSCMmgqn7QBxqSrxg5USrb8e+/1eKxDmCQKH/FPU98s4fNQAxX5RyI0wrzkh5jKrb/NuL9bM86G7wOfCT4HzZ8RzYnokySuHq69O6pNG19hDXMrC167MpcqS7jhVbSEPq8g0LVabRRCxhiLIth5DoJmJfwyt8Mu3UagxMSxwv5Vq5lrN5WDZg/D6KVpauC1uUrNU4mKSGYOBn/a3GNeut1ulb+GiDSEAapUtp3YP+dm+9FILP8YGVao5gQzUUWm3GUEfBdvaLD+tQOledecxF+3ngzCpbrxxJp1UXK91ijaqCiJn6yoLH/dAQzKNQn6YACc98oykosALqUzhD66E7xQluUJGI9YRPi3YZqT/HgYYvwYLbnL6eyQZYdmev0Q5XP0x3Hnyc+WqTc8+mmAkM3ZP1T1ixGtCVFVquRQhZmJWBSg5Fjm3Z0t1L8zc5XNCpO5ciGClqosE8yj+sYXdjaov6Pgocl2Ey2GSSh+h0DP3DTyIEPomItA0QQrFdOuhAZCR3CaNbJVY05AJoEgj+0AIAYl/K6EgZW4sOZufJ2p8VpnJVs4FuNRdMFjQLC4RMiv6QiVYyyPw1pLSxh9tmQx80YjmdPh+ijqGzV8LlJj3NGsUMRBYvkH3P6NxpSzbMNfY1Adyrsz8jUdx8ilxVcFdx93u2qR/iPX2y3H09XtekPs="
+      }
+    }
+  ]
+}

@@ -120,13 +120,20 @@
     <div><label for="effort">effort</label>
       <select id="effort"><option value="">default</option><option>low</option>
         <option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></div>
+    <div><label for="maxInst">max instances</label>
+      <input id="maxInst" type="number" min="0" value="1"
+        title="endpoint max GPU containers (live autoscaler cap). 1 = cap at one, throttle gracefully. 0 or blank = unbounded (leave at catalog default)." /></div>
     <div class="check" id="goalWrap"><input id="goal" type="checkbox" />
       <label for="goal" style="margin:0">use /goal</label></div>
     <div class="wide"><label for="prompt">prompt</label>
       <textarea id="prompt" placeholder="what should the swarm do?"></textarea></div>
     <div class="wide" style="display:flex; gap:10px;">
       <button type="submit" id="spawnBtn" style="flex:1">spawn swarm</button>
-      <button type="button" id="presetBtn" class="ghost" style="flex:0 0 auto">load OSINT preset</button>
+      <select id="presetSel" class="ghost" style="flex:0 0 auto; width:auto; min-width:160px"
+        title="load a preset">
+        <option value="">presets…</option>
+      </select>
+      <button type="button" id="presetBtn" class="ghost" style="flex:0 0 auto">load preset</button>
     </div>
   </form>
 
@@ -411,8 +418,11 @@ async function loadModels() {
     sel.innerHTML = "";
     for (const m of (data.models || [])) {
       const o = document.createElement("option");
-      o.value = m.name; o.textContent = m.name;
-      o.title = (m.gpu ? m.gpu + " · " : "") + (m.description || "");
+      o.value = m.name;
+      // show the full Hugging Face repo alongside the catalog name (value stays the catalog name)
+      o.textContent = m.repo ? m.name + " — " + m.repo : m.name;
+      o.title = (m.repo ? m.repo + "\n" : "") + (m.gpu ? m.gpu + " · " : "")
+        + (m.context_window ? m.context_window + " ctx · " : "") + (m.description || "");
       sel.appendChild(o);
     }
     if (!sel.options.length) { const o = document.createElement("option"); o.value = cur; o.textContent = cur; sel.appendChild(o); }
@@ -440,17 +450,41 @@ function applyMode() {
   if (dyn) loadInjected(); else $("injectedPanel").style.display = "none";
 }
 
-const PRESET = "Research the person 'Shrivu Shankar' using browser automation and web search, then "
-  + "identify 3 distinct dimensions of their online/OSINT footprint. Create a dynamic workflow: for "
-  + "each dimension spawn 2 agents that each run under /goal for 30 minutes (wave 1); when wave 1 "
-  + "finishes, spawn a second wave of 2 agents per dimension, each /goal for another 30 minutes. "
-  + "Have all agents record findings to a shared message board and write their own report file in "
-  + "the shared workspace (you decide the exact files/paths and tell each agent). After all 12 agents "
-  + "finish, spawn one final agent that reads every report and writes a consolidated summary.";
+// Presets are fetched from /api/presets (sourced from presets.json). Encrypted presets the
+// server cannot decrypt (no key) come back locked:true with no prompt; we show them disabled.
+const presets = new Map();          // name -> {label, mode, prompt, locked}
 
-$("presetBtn").addEventListener("click", () => {
-  $("mode").value = "dynamic"; $("prompt").value = PRESET; $("timeout").value = ""; applyMode();
-});
+async function loadPresets() {
+  const sel = $("presetSel");
+  try {
+    const data = await getJSON("/api/presets");
+    presets.clear();
+    sel.innerHTML = '<option value="">presets…</option>';
+    for (const p of (data.presets || [])) {
+      presets.set(p.name, p);
+      const o = document.createElement("option");
+      o.value = p.name;
+      o.textContent = p.label + (p.locked ? " (locked)" : "");
+      o.disabled = !!p.locked;
+      o.title = p.locked ? "encrypted preset; key unavailable on the server" : (p.mode + " mode");
+      sel.appendChild(o);
+    }
+  } catch (e) { /* no presets available; keep the placeholder option */ }
+}
+
+function applyPreset(name) {
+  const p = presets.get(name);
+  if (!p) { setError(name ? "unknown preset" : "pick a preset first"); return; }
+  if (p.locked || typeof p.prompt !== "string") {
+    setError("preset '" + (p.label || name) + "' is locked (no key on the server)");
+    return;
+  }
+  if (p.mode) $("mode").value = p.mode;
+  $("prompt").value = p.prompt; $("timeout").value = ""; applyMode(); setError("");
+}
+
+$("presetBtn").addEventListener("click", () => applyPreset($("presetSel").value));
+$("presetSel").addEventListener("change", () => { if ($("presetSel").value) applyPreset($("presetSel").value); });
 $("mode").addEventListener("change", applyMode);
 $("harness").addEventListener("change", loadInjected);
 $("model").addEventListener("change", loadInjected);
@@ -464,6 +498,7 @@ $("spawn").addEventListener("submit", async (e) => {
       count: Number($("count").value) || 1, prompt: $("prompt").value,
       goal: $("goal").checked, timeout: $("timeout").value || null,
       effort: $("effort").value || null,
+      max_instances: $("maxInst").value === "" ? null : Number($("maxInst").value),
     };
     const data = await getJSON("/api/spawn", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
@@ -480,6 +515,7 @@ $("spawn").addEventListener("submit", async (e) => {
 
 (async function init() {
   await loadModels();
+  loadPresets();
   applyMode();
   if (!swarmId) { try { const c = await getJSON("/api/config"); swarmId = c.swarm || ""; } catch (e) {} }
   if (swarmId) $("swarmMeta").textContent = swarmId;

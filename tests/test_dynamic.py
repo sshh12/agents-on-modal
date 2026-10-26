@@ -492,7 +492,8 @@ def test_orchestrator_instructions_mention_cli_and_efforts():
 def test_index_html_wires_dynamic_mode():
     html = (EXAMPLES / "index.html").read_text(encoding="utf-8")
     for needle in ("/api/files", "/api/injected", "/api/agents", "/api/spawn",
-                   "dynamic", "load OSINT preset", 'id="mode"', 'id="timeout"', 'id="effort"'):
+                   "dynamic", "/api/presets", 'id="presetSel"', 'id="mode"',
+                   'id="timeout"', 'id="effort"'):
         assert needle in html
 
 
