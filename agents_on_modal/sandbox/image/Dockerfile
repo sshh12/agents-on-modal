@@ -176,15 +176,23 @@ RUN printf '%s\n' '#!/bin/sh' 'exec python3 -m agents_on_modal.swarmctl "$@"' \
         > /usr/local/bin/aom-swarm; \
     chmod 0755 /usr/local/bin/aom-swarm
 
-# --- Non-root agent user (uid 10001, passwordless sudo).
-# uid/gid 10001 avoids colliding with the base image's `node` user. The agent
-# may install arbitrary system packages; the container is the boundary, so
-# passwordless root inside it is intended.
+# --- Non-root agent user (uid 10001).
+# uid/gid 10001 avoids colliding with the base image's `node` user. Passwordless
+# sudo is configured below and works on the docker backend; the MODAL backend runs
+# sandboxes with the `no_new_privileges` flag set, which neuters setuid sudo, so the
+# agent cannot escalate there. To keep sudo-free `pip install <pkg>` working on BOTH
+# backends (this is a throwaway devbox), the agent OWNS pip's install targets
+# (/usr/local/lib/python3*/dist-packages for packages, /usr/local/bin for console
+# scripts) and pre-created cache/local dirs -- so a plain `pip install` lands in a
+# writable location without root. (/usr/local/lib/.../dist-packages holds only the
+# few build-time pip installs, so this chown stays small.)
 RUN set -eux; \
     groupadd --gid 10001 agent; \
     useradd --uid 10001 --gid 10001 --create-home --shell /bin/bash agent; \
-    mkdir -p /work /home/agent/.aom /home/agent/.npm-global /home/agent/go; \
+    mkdir -p /work /home/agent/.aom /home/agent/.npm-global /home/agent/go \
+        /home/agent/.cache /home/agent/.local/bin /home/agent/.local/lib; \
     chown -R agent:agent /work /home/agent; \
+    chown -R agent:agent /usr/local/bin /usr/local/lib/python3*/dist-packages; \
     printf '%s\n' \
         'agent ALL=(ALL) NOPASSWD:ALL' \
         'Defaults env_keep += "http_proxy https_proxy ftp_proxy no_proxy all_proxy"' \
