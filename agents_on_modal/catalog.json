@@ -175,7 +175,7 @@
       }
     },
     "deepseek-v4-flash-abliterated": {
-      "description": "DeepSeek-V4-Flash-0731 abliterated (uncensored) via SGLang on H200:2; reuses the existing base volume.",
+      "description": "DeepSeek-V4-Flash-0731 abliterated (uncensored) via SGLang on H200:2; self-contained (downloads its own ~156 GiB weights to its own Volume -- no base-volume reuse, which previously depended on a stale v1 cm-codex volume requested as v2 and failed at deploy).",
       "repo": "cebeuq/DeepSeek-V4-Flash-0731-abliterated",
       "engine": "sglang",
       "gpu": "H200:2",
@@ -212,11 +212,7 @@
           "xhigh": "max",
           "max": "max"
         }
-      },
-      "base_repo": "deepseek-ai/DeepSeek-V4-Flash-0731",
-      "base_revision": "9e165c30e2704aec5d9d593cce3eebd58bbef1cb",
-      "base_volume": "cm-codex-deepseek-v4-flash-0731-abliterated-e9a201-458e3e607a",
-      "base_volume_path": "/model"
+      }
     },
     "glm-5.3-abliterated-nvfp4": {
       "description": "GLM-5.3 abliterated, NVFP4 (ModelOpt experts-only W4A4, ~433 GiB) via SGLang on B300:2. NVFP4 needs Blackwell; B300 (288 GiB/GPU) is the cheapest fit since TP must be a power of 2 and B200 (180 GiB) would need 4. No transformers pin: the v0.5.19 image ships 5.12.1, which already has glm_moe_dsa - forcing 5.16.0 makes SGLang's qwen3_asr config registration collide with the now-native one and the server exits 1 before the health check.",
