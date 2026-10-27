@@ -2,6 +2,7 @@
 .codex-modal/
 .agents-on-modal/
 .env
+proxies.csv
 *.log
 __pycache__/
 *.py[cod]

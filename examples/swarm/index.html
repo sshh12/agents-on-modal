@@ -125,6 +125,13 @@
         title="endpoint max GPU containers (live autoscaler cap). 1 = cap at one, throttle gracefully. 0 or blank = unbounded (leave at catalog default)." /></div>
     <div class="check" id="goalWrap"><input id="goal" type="checkbox" />
       <label for="goal" style="margin:0">use /goal</label></div>
+    <div><label for="proxyMode">proxies</label>
+      <select id="proxyMode" disabled
+        title="agent browser/web egress (model inference ALWAYS stays direct). always = route all agent web/browser through a residential proxy, each agent a distinct sticky IP. agent opt-in = direct by default, but the agent is given the proxy endpoints to use only when a site blocks the direct IP (saves cost). off = no proxy.">
+        <option value="optin">agent opt-in</option>
+        <option value="always">always on</option>
+        <option value="off">off</option>
+      </select></div>
     <div class="wide"><label for="prompt">prompt</label>
       <textarea id="prompt" placeholder="what should the swarm do?"></textarea></div>
     <div class="wide" style="display:flex; gap:10px;">
@@ -499,6 +506,7 @@ $("spawn").addEventListener("submit", async (e) => {
       goal: $("goal").checked, timeout: $("timeout").value || null,
       effort: $("effort").value || null,
       max_instances: $("maxInst").value === "" ? null : Number($("maxInst").value),
+      proxy_mode: $("proxyMode").value,
     };
     const data = await getJSON("/api/spawn", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
@@ -517,7 +525,16 @@ $("spawn").addEventListener("submit", async (e) => {
   await loadModels();
   loadPresets();
   applyMode();
-  if (!swarmId) { try { const c = await getJSON("/api/config"); swarmId = c.swarm || ""; } catch (e) {} }
+  try {
+    const c = await getJSON("/api/config");
+    if (!swarmId) swarmId = c.swarm || "";
+    const n = c.proxies_available || 0;
+    const sel = $("proxyMode");
+    sel.disabled = n === 0;
+    if (n === 0) sel.value = "off";
+    const lbl = document.querySelector('label[for="proxyMode"]');
+    if (lbl) lbl.textContent = n ? "proxies (" + n + ")" : "proxies (none)";
+  } catch (e) {}
   if (swarmId) $("swarmMeta").textContent = swarmId;
   refresh();
   setInterval(refresh, 2000);

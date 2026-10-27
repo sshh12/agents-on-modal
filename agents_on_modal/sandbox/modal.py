@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shlex
 from collections.abc import Mapping, Sequence
 from importlib.resources import files
@@ -517,11 +518,16 @@ class ModalSandbox(Sandbox):
     def _start_relay(self, proxy_url: str, session: str, model_host: str) -> None:
         """Start the loopback residential-proxy relay inside the sandbox (detached)."""
 
+        # Sticky-session ids for residential providers (e.g. decodo) must be alphanumeric: the
+        # provider splits the username on '-', so a sandbox id's dashes would truncate/corrupt the
+        # session and break the upstream tunnel. Sanitize here (host side) so the relay works even on
+        # a sandbox image whose baked parse_proxy predates the in-parse_proxy sanitization.
+        safe_session = re.sub(r"[^A-Za-z0-9]", "", session)[:48] or "s"
         self.spawn(
             [*self.python, "-m", "agents_on_modal.sandbox.net.relay"],
             env={
                 "AOM_UPSTREAM_PROXY": proxy_url,
-                "AOM_PROXY_SESSION": session,
+                "AOM_PROXY_SESSION": safe_session,
                 "AOM_MODEL_HOST": model_host,
             },
         )

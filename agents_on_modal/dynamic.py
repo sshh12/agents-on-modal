@@ -478,6 +478,7 @@ class Controller:
         harness: str,
         *,
         proxy: str | None = None,
+        proxy_note: str | None = None,
         orchestrator_id: str | None = None,
         orchestrator_run_id: str | None = None,
         default_timeout: float = DEFAULT_TIMEOUT,
@@ -489,6 +490,9 @@ class Controller:
         self.shared_volume = shared_volume
         self.harness = harness
         self.proxy = proxy
+        #: 'agent opt-in' proxy note prepended to EVERY subagent's prompt (so fan-out agents can
+        #: route through the residential proxy only when needed). None unless opt-in mode is set.
+        self.proxy_note = proxy_note
         self.orchestrator_id = orchestrator_id
         self.orchestrator_run_id = orchestrator_run_id
         self.default_timeout = default_timeout
@@ -685,6 +689,8 @@ class Controller:
             shared_volume=self.shared_volume,
         )
         prompt = spec.prompt
+        if self.proxy_note:  # 'agent opt-in' mode: give this fan-out agent the proxy endpoints too
+            prompt = self.proxy_note + "\n\n---\n\n" + prompt
         if spec.schema is not None:
             out = f"/shared/{RESERVED}/outputs/{box.id}.json"
             prompt += _SCHEMA_INSTRUCTION.format(path=out, schema=json.dumps(spec.schema, indent=2))
@@ -953,7 +959,8 @@ class DynamicSwarm:
             _orchestrator_run=run,
         )
 
-    def controller(self, endpoint: Any, *, proxy: str | None = None, sandboxes: Any = None) -> Controller:
+    def controller(self, endpoint: Any, *, proxy: str | None = None,
+                   proxy_note: str | None = None, sandboxes: Any = None) -> Controller:
         """Build a :class:`Controller` for this swarm (the dashboard runs ``.run_forever()``)."""
 
         return Controller(
@@ -963,6 +970,7 @@ class DynamicSwarm:
             self.shared_volume,
             self.harness,
             proxy=proxy,
+            proxy_note=proxy_note,
             orchestrator_id=self.orchestrator_id,
             orchestrator_run_id=self.orchestrator_run_id,
             default_timeout=self.default_timeout,
