@@ -92,6 +92,26 @@
     white-space: pre-wrap; max-height: 260px; overflow-y: auto; }
   #error { color: var(--err); font-family: var(--mono); font-size: 12px; min-height: 16px; }
   .empty { color: var(--muted); padding: 20px; font-size: 13px; }
+
+  /* loading spinner (shown while a fetch is in flight, so a pending panel is never just blank) */
+  .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite;
+    vertical-align: -2px; flex: 0 0 auto; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .loading { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 8px;
+    padding: 16px 12px; }
+  .muted { color: var(--muted); font-weight: 400; }
+
+  /* active model endpoints panel */
+  .eprow { display: flex; gap: 10px; align-items: center; font-family: var(--mono); font-size: 12px;
+    padding: 3px 2px; }
+  .eprow .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); flex: 0 0 auto; }
+  .eprow.on .dot { background: var(--ok); }
+  .eprow .nm { color: var(--text); min-width: 220px; }
+  .eprow.on .nm { color: var(--ok); }
+  .eprow .gp { color: var(--muted); } .eprow .cap { color: var(--accent); }
+  .eprow .repo { color: var(--muted); overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+  option.active { color: var(--ok); }
   @media (max-width: 980px) {
     .layout { flex-direction: column; }
     .explorer, .files { position: static; width: 100%; flex: none; max-height: 340px; }
@@ -120,9 +140,13 @@
     <div><label for="effort">effort</label>
       <select id="effort"><option value="">default</option><option>low</option>
         <option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></div>
-    <div><label for="maxInst">max instances</label>
-      <input id="maxInst" type="number" min="0" value="1"
-        title="endpoint max GPU containers (live autoscaler cap). 1 = cap at one, throttle gracefully. 0 or blank = unbounded (leave at catalog default)." /></div>
+    <div><label for="maxInst">max instances <span class="muted">(per-model, global)</span></label>
+      <div style="display:flex; gap:6px;">
+        <input id="maxInst" type="number" min="1" value="1" style="flex:1"
+          title="This model endpoint's max GPU containers — a GLOBAL autoscaler cap SHARED by every naive/dynamic swarm on this model. Applied on spawn; click 'set' to apply now without spawning. Blank = leave the endpoint's current cap unchanged." />
+        <button type="button" id="setMaxBtn" class="ghost" style="flex:0 0 auto; width:auto"
+          title="apply this max to the model endpoint now (no spawn)">set</button>
+      </div></div>
     <div class="check" id="goalWrap"><input id="goal" type="checkbox" />
       <label for="goal" style="margin:0">use /goal</label></div>
     <div class="wide"><label for="prompt">prompt</label>
@@ -136,6 +160,13 @@
       <button type="button" id="presetBtn" class="ghost" style="flex:0 0 auto">load preset</button>
     </div>
   </form>
+
+  <details class="injected" id="endpointsPanel" open>
+    <summary>active model endpoints <span class="muted" id="epCount"></span>
+      <button type="button" id="epRefresh" class="ghost"
+        style="width:auto; padding:2px 8px; font-size:11px; margin-left:8px;">refresh</button></summary>
+    <div id="endpointsBody"><div class="loading"><span class="spinner"></span> querying endpoints…</div></div>
+  </details>
 
   <details class="injected" id="injectedPanel" style="display:none">
     <summary>injected orchestrator context (shown exactly as the orchestrator receives it)</summary>
@@ -231,7 +262,7 @@ function selectAgent(id, title) {
     for (const ev of t.events) { const n = renderEvent(ev); if (n) pre.appendChild(n); }
     pre.scrollTop = pre.scrollHeight;
   } else {
-    pre.innerHTML = '<div class="empty">waiting for trace…</div>';
+    pre.innerHTML = '<div class="loading"><span class="spinner"></span> waiting for trace…</div>';
   }
   highlightSelection();
   pollSelected();
@@ -381,6 +412,9 @@ async function refresh() {
 // --------------------------------------------------------------------------- file explorer
 async function refreshFiles() {
   if (!swarmId) return;
+  const ft = $("ftree");
+  if (!ft.children.length)  // first load: spinner instead of a blank panel
+    ft.innerHTML = '<div class="loading"><span class="spinner"></span> loading files…</div>';
   try {
     const data = await getJSON("/api/files?swarm=" + encodeURIComponent(swarmId) + "&path=/");
     const paths = data.paths || [];
@@ -395,6 +429,7 @@ async function refreshFiles() {
       div.onclick = () => viewFile(p);
       tree.appendChild(div);
     }
+    if (!paths.length) tree.innerHTML = '<div class="empty">no shared files yet</div>';
     if (openFile) viewFile(openFile);
   } catch (e) { /* no volume yet */ }
 }
@@ -410,24 +445,89 @@ async function viewFile(path) {
   } catch (e) { setError(String(e.message || e)); }
 }
 
-// --------------------------------------------------------------------------- form
+// --------------------------------------------------------------------------- form + endpoints
+// model name -> live endpoint status {deployed, max_containers, min_containers, gpu, repo}. A model
+// endpoint is a shared, account-level resource: all naive/dynamic swarms on the same model hit the
+// same Modal app under one autoscaler, so `max_containers` is a GLOBAL cap they all share.
+const endpoints = new Map();
+
+function decorateModelOptions() {
+  // mark deployed models in the dropdown (● + their current global max) so the active ones stand out.
+  for (const o of $("model").options) {
+    const base = o.dataset.base || o.value; o.dataset.base = base;
+    const ep = endpoints.get(o.value);
+    if (ep && ep.deployed) {
+      o.classList.add("active");
+      o.textContent = "● " + base + (ep.max_containers != null ? "  [max " + ep.max_containers + "]" : "");
+    } else {
+      o.classList.remove("active");
+      o.textContent = base;
+    }
+  }
+}
+
+function prefillMaxForModel() {
+  // reflect the selected model's CURRENT global cap in the field (so it's clear it's per-model).
+  const ep = endpoints.get($("model").value);
+  if (ep && ep.deployed && ep.max_containers != null) $("maxInst").value = ep.max_containers;
+}
+
 async function loadModels() {
+  const sel = $("model"); const cur = sel.value || "qwen3.8-27b";
+  sel.disabled = true; sel.innerHTML = '<option value="">loading…</option>';
   try {
     const data = await getJSON("/api/models");
-    const sel = $("model"); const cur = sel.value || "qwen3.8-27b";
     sel.innerHTML = "";
     for (const m of (data.models || [])) {
       const o = document.createElement("option");
       o.value = m.name;
-      // show the full Hugging Face repo alongside the catalog name (value stays the catalog name)
-      o.textContent = m.repo ? m.name + " — " + m.repo : m.name;
+      // the catalog name + full Hugging Face repo (value stays the catalog name)
+      o.dataset.base = m.repo ? m.name + " — " + m.repo : m.name;
+      o.textContent = o.dataset.base;
       o.title = (m.repo ? m.repo + "\n" : "") + (m.gpu ? m.gpu + " · " : "")
         + (m.context_window ? m.context_window + " ctx · " : "") + (m.description || "");
       sel.appendChild(o);
     }
     if (!sel.options.length) { const o = document.createElement("option"); o.value = cur; o.textContent = cur; sel.appendChild(o); }
     if ([...sel.options].some((o) => o.value === cur)) sel.value = cur;
-  } catch (e) { /* keep the default option */ }
+    decorateModelOptions();
+  } catch (e) { sel.innerHTML = '<option value="' + cur + '">' + cur + '</option>'; }
+  finally { sel.disabled = false; }
+}
+
+async function loadEndpoints() {
+  const body = $("endpointsBody");
+  body.innerHTML = '<div class="loading"><span class="spinner"></span> querying endpoints…</div>';
+  try {
+    const data = await getJSON("/api/endpoints");
+    endpoints.clear();
+    for (const e of (data.endpoints || [])) endpoints.set(e.name, e);
+    renderEndpoints(data.endpoints || []);
+    decorateModelOptions();
+    prefillMaxForModel();
+  } catch (e) {
+    body.innerHTML = '<div class="empty">could not load endpoints: ' + (e.message || e) + "</div>";
+  }
+}
+
+function renderEndpoints(list) {
+  const body = $("endpointsBody");
+  const nActive = list.filter((e) => e.deployed).length;
+  $("epCount").textContent = "(" + nActive + " deployed / " + list.length + ")";
+  body.innerHTML = "";
+  const sorted = [...list].sort((a, b) => (b.deployed ? 1 : 0) - (a.deployed ? 1 : 0)
+    || a.name.localeCompare(b.name));
+  for (const e of sorted) {
+    const row = document.createElement("div");
+    row.className = "eprow" + (e.deployed ? " on" : "");
+    const cap = e.deployed ? ("max " + (e.max_containers != null ? e.max_containers : "?")
+      + (e.min_containers ? " · min " + e.min_containers : "")) : "not deployed";
+    for (const [cls, txt] of [["dot", ""], ["nm", e.name], ["gp", e.gpu || ""],
+                              ["cap", cap], ["repo", e.repo || ""]]) {
+      const s = document.createElement("span"); s.className = cls; s.textContent = txt; row.appendChild(s);
+    }
+    body.appendChild(row);
+  }
 }
 
 async function loadInjected() {
@@ -444,8 +544,20 @@ function applyMode() {
   const dyn = $("mode").value === "dynamic";
   $("countWrap").style.display = dyn ? "none" : "";
   $("goalWrap").style.display = dyn ? "none" : "";
-  $("timeoutLabel").textContent = dyn ? "orchestrator timeout (s)" : "timeout (s)";
-  $("timeout").placeholder = dyn ? "default 21600" : "none";
+  // timeout is explicit in BOTH modes: dynamic prefills its real default (21600s); naive states
+  // plainly that blank means no limit. The number stays editable either way.
+  const to = $("timeout");
+  if (dyn) {
+    $("timeoutLabel").textContent = "orchestrator timeout (s)";
+    to.placeholder = "default 21600 (6h)";
+    to.title = "Dynamic: max seconds the orchestrator may run. Blank = default 21600 (6h).";
+    if (!to.value) to.value = "21600";
+  } else {
+    $("timeoutLabel").textContent = "timeout / agent (s)";
+    to.placeholder = "blank = no limit";
+    to.title = "Naive: max seconds EACH agent may run. Blank = no limit (runs until done or crash).";
+    if (to.value === "21600") to.value = "";
+  }
   $("spawnBtn").textContent = dyn ? "spawn dynamic swarm" : "spawn swarm";
   if (dyn) loadInjected(); else $("injectedPanel").style.display = "none";
 }
@@ -487,7 +599,23 @@ $("presetBtn").addEventListener("click", () => applyPreset($("presetSel").value)
 $("presetSel").addEventListener("change", () => { if ($("presetSel").value) applyPreset($("presetSel").value); });
 $("mode").addEventListener("change", applyMode);
 $("harness").addEventListener("change", loadInjected);
-$("model").addEventListener("change", loadInjected);
+$("model").addEventListener("change", () => { prefillMaxForModel(); loadInjected(); });
+
+$("epRefresh").addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); loadEndpoints(); });
+$("setMaxBtn").addEventListener("click", async () => {
+  const model = $("model").value.trim(), mi = $("maxInst").value;
+  if (!model || mi === "") { setError("pick a model and a max to set"); return; }
+  $("setMaxBtn").disabled = true; setError("setting " + model + " endpoint max…");
+  try {
+    const d = await getJSON("/api/scale", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model, max_instances: Number(mi) }),
+    });
+    setError("set " + d.model + " endpoint max → " + d.max_containers + " (global, shared by all swarms)");
+    loadEndpoints();
+  } catch (e) { setError(String(e.message || e)); }
+  finally { $("setMaxBtn").disabled = false; }
+});
 
 $("spawn").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -516,9 +644,13 @@ $("spawn").addEventListener("submit", async (e) => {
 (async function init() {
   await loadModels();
   loadPresets();
+  loadEndpoints();          // async: fills the endpoints panel + decorates the dropdown when it returns
   applyMode();
   if (!swarmId) { try { const c = await getJSON("/api/config"); swarmId = c.swarm || ""; } catch (e) {} }
-  if (swarmId) $("swarmMeta").textContent = swarmId;
+  if (swarmId) {
+    $("swarmMeta").textContent = swarmId;
+    $("tree").innerHTML = '<div class="loading"><span class="spinner"></span> loading run…</div>';
+  }
   refresh();
   setInterval(refresh, 2000);
 })();
