@@ -40,13 +40,17 @@ def test_no_reserved_engine_args_in_catalog():
 
 
 def test_base_volume_reuse_round_trips():
-    m = get("deepseek-v4-flash-abliterated")
-    assert m.base_repo == "deepseek-ai/DeepSeek-V4-Flash-0731"
-    assert m.base_volume and m.base_volume_path == "/model"
-    assert m.base_revision and m.revision  # abliterated checkpoint pinned to its own revision
-    rt = Model.from_json(m.to_json())
+    # deepseek-v4-flash-abliterated is now self-contained (its base-volume reuse pointed at a stale
+    # v1 cm-codex volume requested as v2 and failed at deploy, so it was removed). No catalog model
+    # currently uses base-volume reuse, but the optional base_* plumbing must still round-trip
+    # through to_json/from_json -- verify that with a synthetic entry.
+    assert get("deepseek-v4-flash-abliterated").base_repo is None
+    spec = get("deepseek-v4-flash-abliterated").to_json()
+    spec.update(name="base-reuse-probe", base_repo="org/base", base_revision="abc123",
+                base_volume="vol-x", base_volume_path="/model")
+    rt = Model.from_json(spec)
     assert (rt.base_repo, rt.base_volume, rt.base_revision, rt.base_volume_path) == (
-        m.base_repo, m.base_volume, m.base_revision, m.base_volume_path
+        "org/base", "vol-x", "abc123", "/model"
     )
 
 
