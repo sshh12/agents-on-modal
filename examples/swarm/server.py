@@ -29,6 +29,7 @@ Endpoints
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import sys
@@ -137,6 +138,58 @@ def _models_payload() -> dict:
         for m in models.list_models()
     ]
     return {"models": out}
+
+
+def _endpoint_status(model) -> dict:
+    """Live status of one model's shared Modal endpoint (deployed? current autoscaler cap?).
+
+    A model endpoint is an account-level shared resource: every swarm (naive or dynamic) on the
+    same model id hits the same Modal app under one autoscaler. This reports whether that app is
+    deployed and its current ``max_containers`` -- the global cap all those swarms share.
+    """
+
+    info = {"name": model.name, "repo": model.repo, "gpu": model.gpu,
+            "context_window": model.context_window, "deployed": False,
+            "max_containers": None, "min_containers": None}
+    try:
+        st = models.status(model)
+        info["url"] = st.get("url")
+        if st.get("server_error"):
+            info["deployed"] = False
+        else:
+            asg = st.get("autoscaler") or {}
+            info["deployed"] = True
+            info["max_containers"] = asg.get("max_containers")
+            info["min_containers"] = asg.get("min_containers")
+    except Exception as error:  # noqa: BLE001 - not deployed / unreachable
+        info["error"] = f"{type(error).__name__}: {error}"
+    return info
+
+
+def _endpoints_payload() -> dict:
+    """Status of every catalog model's shared endpoint, queried concurrently (each hits Modal)."""
+
+    cat = models.list_models()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        out = list(pool.map(_endpoint_status, cat))
+    return {"endpoints": out}
+
+
+def _scale(body: dict) -> dict:
+    """Set a model endpoint's global ``max_containers`` live (shared by all swarms on that model)."""
+
+    model = body.get("model")
+    if not model:
+        raise AomError("scale requires a model name.")
+    raw = body.get("max_instances")
+    if raw in (None, "", "unbounded"):
+        raise AomError("scale requires a positive integer max_instances.")
+    try:
+        n = max(1, int(raw))
+    except (TypeError, ValueError):
+        raise AomError(f"invalid max_instances: {raw!r}") from None
+    models.scale(models.get(model), max_containers=n)
+    return {"model": model, "max_containers": n}
 
 
 def _dynamic_agents_payload(swarm_id: str, meta: dict) -> dict:
@@ -363,6 +416,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(_injected_payload(one("harness"), one("model")))
             elif parsed.path == "/api/models":
                 self._send_json(_models_payload())
+            elif parsed.path == "/api/endpoints":
+                self._send_json(_endpoints_payload())
             elif parsed.path == "/api/presets":
                 self._send_json(_presets_payload())
             elif parsed.path == "/api/config":
@@ -382,6 +437,8 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw or b"{}")
             if parsed.path == "/api/spawn":
                 self._send_json(_spawn(body))
+            elif parsed.path == "/api/scale":
+                self._send_json(_scale(body))
             else:
                 self._send_json({"error": "not found"}, 404)
         except AomError as error:
