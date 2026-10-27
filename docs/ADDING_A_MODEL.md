@@ -4,6 +4,14 @@ A model is one `agents_on_modal/catalog.json` entry (`Model` in `models/__init__
 is a catalog edit; everything below is about getting that entry **right** and proving the whole stack
 (serving × every harness feature) works on it before you trust it.
 
+> **Keep this file current.** This is a living logbook, not a frozen spec. Whenever you discover a new
+> per-model behavior that breaks something — a quant/arch that needs a specific engine image or
+> unmerged commit, a GPU/`mem-fraction`/`target_concurrency` combination that OOMs or won't boot, a
+> context/KV limit that the harness overflows, a parser/chat-template quirk, a sandbox or harness
+> friction that only shows up on certain models — **add it here** (and, when it's sizing, into that
+> model's catalog `description`). The next model is only fast to bring up because the last surprise got
+> written down.
+
 Two phases, cheap-before-expensive:
 
 - **Author + deploy** — editing the catalog and `aom models deploy` are **CPU-only** (image build +
