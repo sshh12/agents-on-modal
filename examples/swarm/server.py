@@ -57,7 +57,7 @@ HERE = Path(__file__).resolve().parent
 INDEX = HERE / "index.html"
 HOST = os.environ.get("AOM_DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.environ.get("AOM_DASHBOARD_PORT", "8787"))
-TERMINAL = ("done", "timeout", "failed", "cancelled")
+TERMINAL = ("done", "timeout", "failed", "cancelled", "stopped")
 #: The orchestrator must outlive the whole run; default its cap generously if the form omits one.
 DYNAMIC_ORCHESTRATOR_TIMEOUT = 6 * 3600
 MAX_FILE_BYTES = 200_000
@@ -118,7 +118,13 @@ def _orchestrator_state(meta: dict) -> str:
         return "running"
     try:
         return str(sandbox.get("modal", oid).run(rid).status().get("state", "running"))
-    except Exception:  # noqa: BLE001 - mid-flight read; assume still running
+    except Exception as error:  # noqa: BLE001
+        # A gone/terminated orchestrator sandbox cannot be read; report it as stopped rather than
+        # forever "running". Only a genuine not-found counts as gone -- a transient read blip during
+        # a live run still assumes running so the UI keeps polling.
+        msg = str(error).lower()
+        if "no modal sandbox" in msg or "not found" in msg or "does not exist" in msg:
+            return "stopped"
         return "running"
 
 
@@ -241,7 +247,10 @@ def _presets_payload() -> dict:
 
 
 def _injected_payload(harness: str, model: str) -> dict:
-    m = models.get(model)
+    catalog = models.list_models()
+    m = models.get(model) if model else (catalog[0] if catalog else None)
+    if m is None:
+        return {"text": "", "model": "", "harness": harness or "claude"}
     text = build_orchestrator_instructions(
         default_timeout=DEFAULT_TIMEOUT, model_name=m.name, allowed_efforts=_model_efforts(m)
     )
@@ -351,7 +360,7 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/file":
                 self._send_json(_file_payload(one("swarm", os.environ.get("AOM_SWARM", "")), one("path")))
             elif parsed.path == "/api/injected":
-                self._send_json(_injected_payload(one("harness"), one("model", "qwen3.8-27b")))
+                self._send_json(_injected_payload(one("harness"), one("model")))
             elif parsed.path == "/api/models":
                 self._send_json(_models_payload())
             elif parsed.path == "/api/presets":

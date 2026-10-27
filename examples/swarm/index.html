@@ -96,6 +96,36 @@
     .layout { flex-direction: column; }
     .explorer, .files { position: static; width: 100%; flex: none; max-height: 340px; }
   }
+  /* file fullscreen modal + rich rendering */
+  #fsModal { position: fixed; inset: 0; z-index: 1000; background: rgba(8,10,14,.94);
+    display: flex; flex-direction: column; }
+  #fsModal .fs-head { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+    border-bottom: 1px solid var(--border); background: var(--panel); }
+  #fsModal .fs-path { flex: 1; color: var(--accent); font-family: var(--mono); font-size: 13px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #fsModal .fs-head button { width: auto; }
+  #fsModal .fs-body { flex: 1; overflow: auto; padding: 22px 30px; }
+  pre.raw, pre.json { font-family: var(--mono); font-size: 13px; white-space: pre-wrap;
+    word-break: break-word; margin: 0; color: var(--text); }
+  .ftree .f { user-select: none; }
+  .md { color: var(--text); font-size: 15px; line-height: 1.65; max-width: 940px; }
+  .md h1,.md h2,.md h3,.md h4 { line-height: 1.25; margin: 1.2em 0 .5em; font-weight: 650; }
+  .md h1 { font-size: 1.7em; border-bottom: 1px solid var(--border); padding-bottom: .3em; }
+  .md h2 { font-size: 1.4em; border-bottom: 1px solid var(--border); padding-bottom: .25em; }
+  .md h3 { font-size: 1.2em; } .md h4 { font-size: 1.05em; color: var(--muted); }
+  .md p { margin: .6em 0; } .md ul,.md ol { margin: .6em 0; padding-left: 1.6em; }
+  .md li { margin: .25em 0; } .md a { color: var(--accent); }
+  .md code { font-family: var(--mono); font-size: .88em; background: #0d0f14;
+    border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+  .md pre { background: #0d0f14; border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px; overflow-x: auto; }
+  .md pre code { background: none; border: none; padding: 0; }
+  .md blockquote { border-left: 3px solid var(--border); margin: .6em 0; padding: .1em 1em;
+    color: var(--muted); }
+  .md hr { border: none; border-top: 1px solid var(--border); margin: 1.2em 0; }
+  .md table { border-collapse: collapse; margin: .8em 0; display: block; overflow-x: auto; }
+  .md th,.md td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+  .md th { background: var(--panel); }
 </style>
 </head>
 <body>
@@ -112,7 +142,7 @@
     <div><label for="harness">harness</label>
       <select id="harness"><option>claude</option><option>codex</option></select></div>
     <div><label for="model">model</label>
-      <select id="model"><option value="qwen3.8-27b">qwen3.8-27b</option></select></div>
+      <select id="model"><option value="">loading models…</option></select></div>
     <div id="countWrap"><label for="count">count</label>
       <input id="count" type="number" min="1" value="4" /></div>
     <div><label for="timeout" id="timeoutLabel">timeout (s)</label>
@@ -163,11 +193,18 @@
     </aside>
   </div>
 </main>
+<div id="fsModal" style="display:none" role="dialog" aria-modal="true">
+  <div class="fs-head">
+    <span class="fs-path" id="fsPath"></span>
+    <button class="ghost" id="fsClose" title="close (Esc)">✕ close</button>
+  </div>
+  <div class="fs-body" id="fsBody"></div>
+</div>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
 const qs = new URLSearchParams(location.search);
-const TERMINAL = ["done", "timeout", "failed", "cancelled"];
+const TERMINAL = ["done", "timeout", "failed", "cancelled", "stopped"];
 let swarmId = qs.get("swarm") || "";
 let mode = "naive";
 let selected = null;                 // selected agent id
@@ -392,14 +429,14 @@ async function refreshFiles() {
       div.className = "f";
       div.textContent = "  ".repeat(Math.max(0, depth - 1)) + p.split("/").filter(Boolean).pop();
       div.title = p;
-      div.onclick = () => viewFile(p);
+      div.onclick = () => viewFile(p, true);
       tree.appendChild(div);
     }
     if (openFile) viewFile(openFile);
   } catch (e) { /* no volume yet */ }
 }
 
-async function viewFile(path) {
+async function viewFile(path, click) {
   openFile = path;
   try {
     const data = await getJSON("/api/file?swarm=" + encodeURIComponent(swarmId)
@@ -407,6 +444,8 @@ async function viewFile(path) {
     $("fview").style.display = "";
     $("fpath").textContent = data.path + (data.truncated ? "  (truncated)" : "");
     $("fbody").textContent = data.text || "(empty)";
+    // a click opens the file full-screen with rich rendering (.json pretty-printed, .md rendered)
+    if (click) openFullscreen(data.path, data.text || "");
   } catch (e) { setError(String(e.message || e)); }
 }
 
@@ -414,7 +453,7 @@ async function viewFile(path) {
 async function loadModels() {
   try {
     const data = await getJSON("/api/models");
-    const sel = $("model"); const cur = sel.value || "qwen3.8-27b";
+    const sel = $("model"); const cur = sel.value || (sel.options[0] ? sel.options[0].value : "");
     sel.innerHTML = "";
     for (const m of (data.models || [])) {
       const o = document.createElement("option");
@@ -522,6 +561,81 @@ $("spawn").addEventListener("submit", async (e) => {
   refresh();
   setInterval(refresh, 2000);
 })();
+// ---- file rich rendering + fullscreen -------------------------------------------------------
+let fsPathCur = null;
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function mdInline(t) {
+  return t
+    .replace(/`([^`]+)`/g, (m, c) => "<code>" + c + "</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+}
+function mdToHtml(src) {
+  const lines = esc(src).replace(/\r\n?/g, "\n").split("\n");
+  const out = []; let i = 0;
+  const isBlock = (l) => /^(#{1,6}\s|```|\s*[-*]\s|\s*\d+\.\s|\s*>\s|\s*(-{3,}|\*{3,})\s*$)/.test(l);
+  while (i < lines.length) {
+    const ln = lines[i];
+    if (/^```/.test(ln)) {
+      const buf = []; i++;
+      while (i < lines.length && !/^```/.test(lines[i])) { buf.push(lines[i]); i++; }
+      i++; out.push("<pre><code>" + buf.join("\n") + "</code></pre>"); continue;
+    }
+    const h = ln.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { const n = h[1].length; out.push("<h" + n + ">" + mdInline(h[2]) + "</h" + n + ">"); i++; continue; }
+    if (/^\s*[-*]\s+/.test(ln)) {
+      const buf = [];
+      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) { buf.push("<li>" + mdInline(lines[i].replace(/^\s*[-*]\s+/, "")) + "</li>"); i++; }
+      out.push("<ul>" + buf.join("") + "</ul>"); continue;
+    }
+    if (/^\s*\d+\.\s+/.test(ln)) {
+      const buf = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) { buf.push("<li>" + mdInline(lines[i].replace(/^\s*\d+\.\s+/, "")) + "</li>"); i++; }
+      out.push("<ol>" + buf.join("") + "</ol>"); continue;
+    }
+    if (/^\s*>\s?/.test(ln)) { out.push("<blockquote>" + mdInline(ln.replace(/^\s*>\s?/, "")) + "</blockquote>"); i++; continue; }
+    if (/^\s*(-{3,}|\*{3,})\s*$/.test(ln)) { out.push("<hr>"); i++; continue; }
+    if (/\|/.test(ln) && i + 1 < lines.length && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1])) {
+      const row = (r) => r.replace(/^\s*\|?|\|?\s*$/g, "").split("|").map((c) => c.trim());
+      const head = row(ln); i += 2; const body = [];
+      while (i < lines.length && /\|/.test(lines[i]) && lines[i].trim()) { body.push(row(lines[i])); i++; }
+      out.push("<table><thead><tr>" + head.map((c) => "<th>" + mdInline(c) + "</th>").join("") +
+        "</tr></thead><tbody>" + body.map((r) => "<tr>" + r.map((c) => "<td>" + mdInline(c) + "</td>").join("") + "</tr>").join("") + "</tbody></table>");
+      continue;
+    }
+    if (ln.trim() === "") { i++; continue; }
+    const buf = [ln]; i++;
+    while (i < lines.length && lines[i].trim() !== "" && !isBlock(lines[i])) { buf.push(lines[i]); i++; }
+    out.push("<p>" + mdInline(buf.join(" ")) + "</p>");
+  }
+  return out.join("\n");
+}
+function renderInto(el, path, text) {
+  const p = (path || "").toLowerCase();
+  if (p.endsWith(".json")) {
+    let pretty = text || "";
+    try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch (e) { /* keep raw */ }
+    el.innerHTML = '<pre class="json">' + esc(pretty) + "</pre>";
+  } else if (p.endsWith(".md") || p.endsWith(".markdown")) {
+    el.innerHTML = '<div class="md">' + mdToHtml(text || "") + "</div>";
+  } else {
+    el.innerHTML = '<pre class="raw">' + esc(text || "(empty)") + "</pre>";
+  }
+}
+function openFullscreen(path, text) {
+  fsPathCur = path;
+  $("fsPath").textContent = path;
+  renderInto($("fsBody"), path, text);
+  $("fsModal").style.display = "flex";
+}
+function closeFullscreen() { $("fsModal").style.display = "none"; fsPathCur = null; }
+$("fsClose").addEventListener("click", closeFullscreen);
+$("fsModal").addEventListener("click", (e) => { if (e.target.id === "fsModal") closeFullscreen(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("fsModal").style.display !== "none") closeFullscreen(); });
 </script>
 </body>
 </html>
