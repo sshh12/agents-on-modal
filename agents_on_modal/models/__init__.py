@@ -65,12 +65,39 @@ class Reasoning:
 
 @dataclass(frozen=True)
 class Scaling:
-    """Modal autoscaler settings for the model's GPU server."""
+    """Modal autoscaler settings for the model's GPU server -- the one place a model's capacity
+    policy lives, applied once at deploy.
+
+    A deployed model is a SHARED, account-level resource: every swarm/app that uses the same model
+    id hits the same Modal app (the app name derives from the model id and ``deploy`` is
+    idempotent), and Modal's concurrency autoscaler sizes it from the AGGREGATE request load across
+    all of them. Callers therefore never scale per launch -- they just ``deploy`` (idempotent) and
+    send requests; this policy is what governs the GPU pool.
+
+    It is deliberately conservative -- pack requests onto a GPU before spawning another, because GPU
+    compute is expensive and agents tolerate mild queueing better than a fleet wants to pay for idle
+    GPUs:
+
+    * ``target_concurrency`` -- the sharing unit: how many requests one container serves at once
+      (continuous batching) before Modal considers adding a container. Kept high, so many agents
+      share one GPU (an agent spends most of its wall-clock running tools, not awaiting tokens).
+    * ``max_containers`` -- a small ceiling: under genuine sustained saturation Modal may add a
+      container or two, never a GPU-per-caller fan-out.
+    * ``scaleup_window`` -- how long load must stay above target before a new container spawns;
+      long, so brief bursts queue (slightly slower agents) rather than cold-start another GPU.
+    * ``min_containers`` 0 -- scale to zero when idle (the gateway holds requests through the next
+      cold start); ``scaledown_window`` keeps a container warm a while so back-to-back use is not
+      punished by repeated cold starts.
+
+    Bigger/slower models override ``target_concurrency`` in the catalog (fewer concurrent requests
+    per GPU); everything else inherits these defaults.
+    """
 
     min_containers: int = 0
-    max_containers: int = 1
+    max_containers: int = 2
     buffer_containers: int = 0
     scaledown_window: int = 900
+    scaleup_window: int = 60
     target_concurrency: float = 32.0
 
     def replace(self, **overrides: Any) -> "Scaling":
@@ -104,6 +131,12 @@ class Model:
     startup_timeout: int = 3600
     cpu: int = 8
     memory: int = 98_304
+    # Optional base-volume reuse: serve.py's prepare() symlinks content-identical files from an
+    # already-downloaded base model's Volume instead of re-downloading them. All four go together.
+    base_repo: str | None = None
+    base_revision: str | None = None
+    base_volume: str | None = None
+    base_volume_path: str | None = None
 
     @property
     def app_name(self) -> str:
@@ -158,6 +191,8 @@ def _validate(model: Model) -> None:
         raise AomError(f"{where}: region must be one of {', '.join(REGIONS)}.")
     if model.context_window < 8192 or model.max_output_tokens >= model.context_window:
         raise AomError(f"{where}: need context_window >= 8192 and max_output_tokens < context_window.")
+    if model.base_volume and not model.base_repo:
+        raise AomError(f"{where}: base_volume requires base_repo (the base model to symlink from).")
     if model.reasoning.default not in EFFORTS:
         raise AomError(f"{where}: reasoning.default must be one of {', '.join(EFFORTS)}.")
     bad = sorted(set(model.reasoning.efforts) - set(EFFORTS))

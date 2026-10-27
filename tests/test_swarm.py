@@ -26,6 +26,7 @@ EXAMPLES = Path(__file__).resolve().parents[1] / "examples" / "swarm"
 class FakeModel:
     def __init__(self, name="m"):
         self.name = name
+        self.scaling = models.Scaling()  # defaults: target_concurrency=32.0
 
 
 class FakeEndpoint:
@@ -114,15 +115,19 @@ def test_launch_creates_n_sandboxes_and_runs(launch_env):
         assert box.create_opts["shared_volume"] == "aom-shared-swarm-test"
 
 
-def test_launch_prewarms_model(launch_env):
+def test_launch_deploys_but_does_not_scale(launch_env):
+    # The model is a shared, account-level resource: launch only ensures it is deployed
+    # (idempotent). It must NOT scale per swarm -- Modal autoscales the shared endpoint from
+    # aggregate load under the catalog policy; scaling here would stomp that global setting.
     Swarm.launch("codex", "m", "p", count=10)
     assert len(launch_env["deployed"]) == 1
-    assert launch_env["scaled"] == [{"min_containers": 4, "max_containers": 10}]
+    assert launch_env["scaled"] == []
 
 
-def test_launch_small_count_prewarm(launch_env):
-    Swarm.launch("codex", "m", "p", count=2)
-    assert launch_env["scaled"] == [{"min_containers": 2, "max_containers": 4}]
+def test_launch_never_scales_regardless_of_count(launch_env):
+    # Even a large fan-out does not provision GPUs by agent count -- no scale call at all.
+    Swarm.launch("codex", "m", "p", count=100)
+    assert launch_env["scaled"] == []
 
 
 def test_launch_rejects_zero_count(launch_env):
@@ -212,7 +217,9 @@ def test_read_and_list_shared(monkeypatch):
     assert s.read_shared("/a.txt") == b"hello world"
 
 
-def test_stop_terminates_agents_and_resets_scale(monkeypatch):
+def test_stop_terminates_agents_without_scaling_model(monkeypatch):
+    # stop() tears down only its own sandboxes; the shared model is left to scale down on its own
+    # (another consumer may be using it), so it must NOT touch the autoscaler.
     boxes = [FakeBox(box_id="x0"), FakeBox(box_id="x1")]
     scaled = []
     monkeypatch.setattr(models, "get", lambda n: FakeModel(n))
@@ -221,7 +228,7 @@ def test_stop_terminates_agents_and_resets_scale(monkeypatch):
               _agents=[Agent(sandbox=b) for b in boxes])
     s.stop()
     assert all(b.stopped for b in boxes)
-    assert scaled == [{"min_containers": 0}]
+    assert scaled == []
 
 
 # --------------------------------------------------------------------------------------------- #

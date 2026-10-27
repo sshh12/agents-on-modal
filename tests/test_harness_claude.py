@@ -89,7 +89,9 @@ def test_prepare_env_telemetry_and_sandbox_off():
     assert env["CLAUDE_CODE_ATTRIBUTION_HEADER"] == "0"
     assert env["ENABLE_TOOL_SEARCH"] == "false"
     assert env["IS_SANDBOX"] == "1"
-    assert int(env["API_TIMEOUT_MS"]) >= 600000
+    # Generous request timeout so a cold-start hold / brief queue on the shared backend is waited
+    # out rather than aborted (covers the largest catalog startup_timeout).
+    assert int(env["API_TIMEOUT_MS"]) >= 3600000
 
 
 def test_model_id_never_claude_prefixed():

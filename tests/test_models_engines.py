@@ -135,7 +135,9 @@ def test_llamacpp_launch_argv_picks_first_shard(tmp_path):
     assert flag("--port") == "8001"
     assert flag("--n-gpu-layers") == "99"
     assert flag("--ctx-size") == "131072"
-    assert "--parallel=4" in argv
+    # llama.cpp needs space-separated values, so "--parallel=4" is split into two tokens
+    assert "--parallel=4" not in argv
+    assert flag("--parallel") == "4"
 
 
 def test_llamacpp_launch_argv_lone_gguf(tmp_path):

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shlex
 from collections.abc import Mapping, Sequence
 from importlib.resources import files
@@ -212,7 +213,17 @@ class ModalSandbox(Sandbox):
 
         endpoint_host = (urlsplit(endpoint.url).hostname or "").strip()
 
-        env: dict[str, str] = {"IS_SANDBOX": "1", "AOM_SANDBOX_ID": sid}
+        env: dict[str, str] = {
+            "IS_SANDBOX": "1",
+            "AOM_SANDBOX_ID": sid,
+            # Modal sandboxes set no_new_privileges (setuid sudo is neutered) and the agent's HOME
+            # cache dir can come up root-owned, so a HOME-based tool cache fails with EACCES. Point
+            # every common tool cache at world-writable /tmp so `pip`/`uv`/etc. never fail on a
+            # cache-permission error (the image also makes pip's install targets agent-owned).
+            "UV_CACHE_DIR": "/tmp/aom-uv-cache",
+            "PIP_CACHE_DIR": "/tmp/aom-pip-cache",
+            "XDG_CACHE_HOME": "/tmp/aom-cache",
+        }
         upstream = parse_proxy(proxy, session=sid)
         relay_env: dict[str, str] = {}
         if upstream is not None:
@@ -480,7 +491,12 @@ class ModalSandbox(Sandbox):
             posix=True,
             skills=load_skills(),
             mcp_servers={"playwright": PLAYWRIGHT_MCP},
-            env=dict(self._relay_env),
+            # Modal appends /pkg:/root to the image's PYTHONPATH, but /root is mode 700 (root-only),
+            # so any agent tool that walks sys.path (pip, setuptools, importlib.metadata) crashes with
+            # PermissionError: '/root'. Our package lives at /opt/aom, so pin PYTHONPATH to just that.
+            # As harness env (setup.env) it overrides the container's os.environ for the harness and
+            # every tool subprocess it spawns -- fixing sudo-free `pip install` on the Modal backend.
+            env={"PYTHONPATH": "/opt/aom", **self._relay_env},
         )
 
     # ---- internals --------------------------------------------------------------------------
@@ -502,11 +518,16 @@ class ModalSandbox(Sandbox):
     def _start_relay(self, proxy_url: str, session: str, model_host: str) -> None:
         """Start the loopback residential-proxy relay inside the sandbox (detached)."""
 
+        # Sticky-session ids for residential providers (e.g. decodo) must be alphanumeric: the
+        # provider splits the username on '-', so a sandbox id's dashes would truncate/corrupt the
+        # session and break the upstream tunnel. Sanitize here (host side) so the relay works even on
+        # a sandbox image whose baked parse_proxy predates the in-parse_proxy sanitization.
+        safe_session = re.sub(r"[^A-Za-z0-9]", "", session)[:48] or "s"
         self.spawn(
             [*self.python, "-m", "agents_on_modal.sandbox.net.relay"],
             env={
                 "AOM_UPSTREAM_PROXY": proxy_url,
-                "AOM_PROXY_SESSION": session,
+                "AOM_PROXY_SESSION": safe_session,
                 "AOM_MODEL_HOST": model_host,
             },
         )

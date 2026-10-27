@@ -19,6 +19,30 @@ def _model() -> Model:
 
 
 # --------------------------------------------------------------------------- #
+# conservative shared scaling policy                                           #
+# --------------------------------------------------------------------------- #
+def test_scaling_defaults_are_conservative_and_shared():
+    # The catalog policy packs before spawning: scale to zero when idle, a small ceiling, a long
+    # scale-up window, and a high per-GPU concurrency (the sharing unit). No per-caller fan-out.
+    s = Scaling()
+    assert s.min_containers == 0          # idle -> zero (gateway holds the next cold start)
+    assert s.max_containers == 2          # small ceiling, not a GPU per caller
+    assert s.buffer_containers == 0
+    assert s.scaleup_window >= 30         # bursts queue instead of cold-starting a GPU
+    assert s.target_concurrency >= 32.0   # many requests share one GPU
+
+
+def test_scaling_round_trips_through_model_json():
+    # The whole policy (incl. the new scaleup_window) survives Model.to_json/from_json so it is
+    # baked into AOM_MODEL_JSON and applied at deploy. Catalog partial overrides keep the defaults.
+    m = get("qwen3.8-27b")
+    assert m.scaling == Model.from_json(m.to_json()).scaling
+    over = Model.from_json({**m.to_json(), "scaling": {"target_concurrency": 4.0}})
+    assert over.scaling.target_concurrency == 4.0
+    assert over.scaling.max_containers == Scaling().max_containers  # inherits the conservative default
+
+
+# --------------------------------------------------------------------------- #
 # pure derivation                                                              #
 # --------------------------------------------------------------------------- #
 def test_shorten_app_name_short_name_unchanged():

@@ -129,9 +129,14 @@ class Codex(Harness):
             'env_key = "AOM_TOKEN"',
             "requires_openai_auth = false",
             "supports_websockets = false",
-            "stream_idle_timeout_ms = 1800000",
-            "request_max_retries = 4",
-            "stream_max_retries = 5",
+            # A shared, conservatively-autoscaled backend may hold a request through a cold start
+            # (up to the largest catalog startup_timeout, ~2h) or queue it under load. Wait it out
+            # rather than abort a valid-but-slow response, and retry transient 429/503 generously.
+            # unbounded_connection_retries stays false (above) so a genuinely dead endpoint still
+            # fails fast instead of hanging forever.
+            "stream_idle_timeout_ms = 7200000",
+            "request_max_retries = 8",
+            "stream_max_retries = 8",
             "",
             # Pre-trust the workspace so the TUI never shows the trust prompt.
             f"[projects.{_ts(workdir)}]",

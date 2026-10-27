@@ -35,9 +35,30 @@ def test_load_model_json_reads_env(monkeypatch):
 
 def test_load_model_json_falls_back_to_stub(monkeypatch):
     monkeypatch.delenv(serve.AOM_MODEL_JSON_ENV, raising=False)
+    monkeypatch.delenv(serve.AOM_MODEL_JSON_B64_ENV, raising=False)
     loaded = serve._load_model_json()
     assert loaded["engine"] == "sglang"
     assert loaded["name"] == "aom-import-stub"
+
+
+def test_load_model_json_decodes_base64(monkeypatch):
+    # The container sees only the base64 image ENV; it must decode to the same spec.
+    import base64
+    model = get("qwen3.8-27b")
+    monkeypatch.delenv(serve.AOM_MODEL_JSON_ENV, raising=False)
+    monkeypatch.setenv(serve.AOM_MODEL_JSON_B64_ENV,
+                       base64.b64encode(json.dumps(model.to_json()).encode()).decode("ascii"))
+    assert serve._load_model_json()["name"] == model.name
+
+
+def test_identity_env_is_quote_safe_base64():
+    # The baked identity ships the spec as base64 (no quotes), never raw JSON -- otherwise a model
+    # description containing an apostrophe breaks the image's Dockerfile `ENV KEY='...'`.
+    import base64
+    assert serve.AOM_MODEL_JSON_ENV not in serve._IDENTITY_ENV
+    value = serve._IDENTITY_ENV[serve.AOM_MODEL_JSON_B64_ENV]
+    assert "'" not in value and '"' not in value
+    assert json.loads(base64.b64decode(value).decode())["name"] == serve.model_json["name"]
 
 
 def test_volume_name_derived_from_model_name():

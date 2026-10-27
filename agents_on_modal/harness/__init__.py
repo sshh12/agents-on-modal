@@ -11,6 +11,7 @@ from .base import GoalState, Harness, HarnessSetup, McpServer, ModelAccess, Sand
 HARNESSES = {
     "claude": "agents_on_modal.harness.claude:ClaudeCode",
     "codex": "agents_on_modal.harness.codex:Codex",
+    "dsh": "agents_on_modal.harness.dsh:DeepSeek",
 }
 
 

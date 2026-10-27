@@ -40,14 +40,27 @@ _PLACE = {
 }
 
 
-def _tools_section() -> str:
+def _tools_section(kind: str) -> str:
     """Tool inventory for the batteries image (docker/modal)."""
 
+    if kind == "modal":
+        # Modal sandboxes set no_new_privileges, which neuters setuid sudo -- so sudo/apt do
+        # NOT work here. Python's install targets are agent-owned, so plain sudo-free installs land.
+        header = (
+            "## Preinstalled tools (prefer them). sudo is NOT available here (the sandbox sets "
+            "no-new-privileges), so do not use `sudo`/`apt-get`. Add packages without root: "
+            "`pip install <pkg>` (installs to a writable location -- no sudo, no venv needed), "
+            "`npm i -g <pkg>`, `cargo install <pkg>`, `go install <pkg>`.\n"
+        )
+    else:
+        header = (
+            "## Preinstalled tools (prefer them; install more with "
+            "`sudo apt-get install -y`, `uv pip install`, `npm i -g`, "
+            "`cargo install`, `go install`)\n"
+        )
     return (
-        "## Preinstalled tools (prefer them; install more with "
-        "`sudo apt-get install -y`, `uv pip install`, `npm i -g`, "
-        "`cargo install`, `go install`)\n"
-        "- Languages: python3 3.13 + uv/pip/pipx (PEP 668 disabled), node 24 + "
+        header
+        + "- Languages: python3 3.13 + uv/pip/pipx (PEP 668 disabled), node 24 + "
         "npm/pnpm/tsx, go, rust (cargo), gcc/clang/cmake/ninja.\n"
         "- CLI: git, gh, rg, fd, fzf, jq, yq, bat, tree, sqlite3, psql, mysql, "
         "redis-cli, curl, wget, tmux, vim, shellcheck, ffmpeg, imagemagick, "
@@ -62,17 +75,19 @@ def _browser_section() -> str:
 
     return (
         "## Browser (headless Chromium 156 at /usr/bin/chromium; no display)\n"
-        "- MCP tools `browser_*` (Playwright): call `browser_navigate`, then "
-        "`browser_snapshot` to read the page as text; act with `browser_click` "
-        "/ `browser_type` / `browser_fill_form` using the `[ref=eN]` value as "
-        "`target`. Prefer snapshots over screenshots.\n"
-        "- Shell alternative: `agent-browser open <url>`, "
-        "`agent-browser snapshot -i`, `agent-browser click @e2`, "
-        "`agent-browser fill @e3 \"text\"`, `agent-browser read`.\n"
-        "- Scripts: Python `playwright` / Node `playwright` / `puppeteer-core` "
-        "are installed; launch with `channel=\"chrome\"` (or "
-        "`executable_path=\"/usr/bin/chromium\"`); never run `playwright "
-        "install`.\n"
+        "- To READ a page, this is the reliable path -- use it, do not hand-write a browser "
+        "script: `agent-browser open <url>` then `agent-browser read` (returns the full rendered "
+        "page text, including headings). State persists across invocations, so open once then "
+        "read/act in later calls. The ONLY subcommands are `open <url>`, `snapshot -i`, `read`, "
+        "`click @eN`, `fill @eN \"text\"` -- do NOT guess others (`browse`, `eval`, `js`, `get` "
+        "do not exist).\n"
+        "- Or the `browser_*` MCP tools (Playwright): `browser_navigate`, then `browser_snapshot` "
+        "to read as text; act with `browser_click`/`browser_type`/`browser_fill_form` using the "
+        "`[ref=eN]` value as `target`. Prefer snapshots over screenshots.\n"
+        "- Avoid writing raw Playwright/Puppeteer scripts for simple reads -- they are error-prone "
+        "here (navigation/locator timing) and unnecessary. The libraries exist for genuine custom "
+        "automation only; if you must, launch with `channel=\"chrome\"` (or "
+        "`executable_path=\"/usr/bin/chromium\"`) and never run `playwright install`.\n"
         "- See the `browser` skill for details. To test a local server, bind it "
         "to 127.0.0.1 and browse `http://127.0.0.1:<port>`."
     )
@@ -105,11 +120,12 @@ def build_instructions(
     batteries = kind in ("docker", "modal")
     # $HOME persists only on the host; containers are torn down per session.
     home_persists = "persisted" if kind == "local" else "ephemeral"
-    user = (
-        "your own account"
-        if kind == "local"
-        else "user `agent` with passwordless `sudo`"
-    )
+    if kind == "local":
+        user = "your own account"
+    elif kind == "modal":
+        user = "user `agent` (uid 10001); sudo is NOT available (the sandbox sets no-new-privileges)"
+    else:
+        user = "user `agent` with passwordless `sudo`"
 
     lines: list[str] = []
     lines.append("# Sandbox environment")
@@ -141,7 +157,7 @@ def build_instructions(
 
     # --- Tools + browser (batteries image only)
     if batteries:
-        lines.append(_tools_section())
+        lines.append(_tools_section(kind))
         lines.append("")
         lines.append(_browser_section())
         lines.append("")

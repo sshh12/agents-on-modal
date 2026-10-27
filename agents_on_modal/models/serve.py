@@ -18,6 +18,7 @@ or inside a Modal container; nothing here *calls* Modal at import, so a bare
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -30,6 +31,11 @@ import modal
 from .engines import get as get_engine
 
 AOM_MODEL_JSON_ENV = "AOM_MODEL_JSON"
+#: The model spec is baked into images as base64 under this var, never as raw JSON: a Dockerfile
+#: ``ENV KEY='<value>'`` cannot carry a value with a single quote, and model descriptions contain
+#: apostrophes ("the card's recipe"), which otherwise fail the image build with a Dockerfile parse
+#: error. base64 is [A-Za-z0-9+/=] only, so it is always safe inside the quoted ENV.
+AOM_MODEL_JSON_B64_ENV = "AOM_MODEL_JSON_B64"
 AOM_APP_NAME_ENV = "AOM_APP_NAME"
 
 # Mount points and ports inside the GPU container.
@@ -64,7 +70,14 @@ _STUB_MODEL_JSON: dict[str, Any] = {
 
 
 def _load_model_json() -> dict[str, Any]:
+    # Raw JSON at deploy time (the host sets AOM_MODEL_JSON as a process env); base64 in the
+    # container (the image bakes AOM_MODEL_JSON_B64). Either way yields the identical spec, so the
+    # module-level Modal objects match between deploy and hydration (lesson A1).
     raw = os.environ.get(AOM_MODEL_JSON_ENV)
+    if not raw:
+        encoded = os.environ.get(AOM_MODEL_JSON_B64_ENV)
+        if encoded:
+            raw = base64.b64decode(encoded).decode("utf-8")
     if not raw:
         return dict(_STUB_MODEL_JSON)
     return json.loads(raw)
@@ -100,9 +113,11 @@ if base_volume is not None:
 # which fails hydration with "Function has N dependencies but container got N+1 object ids" (A1,
 # corrected). As image ENV, these are in os.environ before this module is imported in the
 # container, so _load_model_json() returns the real spec identically at deploy and at hydration.
+# The spec is base64 (AOM_MODEL_JSON_B64), never raw JSON: a description with an apostrophe would
+# otherwise break the Dockerfile ``ENV KEY='...'`` the image builder emits.
 # The HF *token* is never put here (model_json carries only hf_token_env); it stays in the Secret.
 _IDENTITY_ENV = {
-    AOM_MODEL_JSON_ENV: json.dumps(model_json),
+    AOM_MODEL_JSON_B64_ENV: base64.b64encode(json.dumps(model_json).encode("utf-8")).decode("ascii"),
     AOM_APP_NAME_ENV: app_name,
 }
 
@@ -314,9 +329,10 @@ def prepare() -> dict[str, Any]:
     cpu=int(model_json.get("cpu", 8)),
     memory=int(model_json.get("memory", 98_304)),
     min_containers=int(_scaling.get("min_containers", 0)),
-    max_containers=int(_scaling.get("max_containers", 1)),
+    max_containers=int(_scaling.get("max_containers", 2)),
     buffer_containers=int(_scaling.get("buffer_containers", 0)),
     scaledown_window=int(_scaling.get("scaledown_window", 900)),
+    scaleup_window=int(_scaling.get("scaleup_window", 60)),
     target_concurrency=int(round(float(_scaling.get("target_concurrency", 32.0)))),
     port=SERVER_PORT,
     routing_region=str(model_json.get("region", "us-west")),

@@ -70,6 +70,7 @@ def test_dockerfile_pins():
         "PW_MCP_VERSION=0.0.83",
         "AGENT_BROWSER_VERSION=0.39.2",
         "PY_PLAYWRIGHT_VERSION=1.64.1",
+        "DSH_SDK_VERSION=0.2.1rc2",
     ):
         assert pin in df, f"missing pin {pin}"
     # npm globals reference the pinned ARGs
@@ -78,6 +79,8 @@ def test_dockerfile_pins():
     assert "@playwright/mcp@${PW_MCP_VERSION}" in df
     assert "agent-browser@${AGENT_BROWSER_VERSION}" in df
     assert "playwright==${PY_PLAYWRIGHT_VERSION}" in df
+    # the DeepSeek Harness SDK (the `dsh` harness) is pip-installed system-wide
+    assert "deepseek-harness-sdk==${DSH_SDK_VERSION}" in df
 
 
 def test_dockerfile_chromium_symlink_and_flag():
