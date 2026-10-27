@@ -32,6 +32,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import os
+import re
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -62,6 +63,52 @@ TERMINAL = ("done", "timeout", "failed", "cancelled", "stopped")
 #: The orchestrator must outlive the whole run; default its cap generously if the form omits one.
 DYNAMIC_ORCHESTRATOR_TIMEOUT = 6 * 3600
 MAX_FILE_BYTES = 200_000
+#: Residential proxy pool: a gitignored ``proxies.csv`` beside this file, one proxy URL per line.
+#: When a spawn sets ``use_proxies``, swarm agents egress browser/web traffic through one of these
+#: (the sandbox relay); model inference ALWAYS stays direct (NO_PROXY), so no model bytes are metered
+#: over the residential link.
+PROXIES_FILE = HERE.parents[1] / "proxies.csv"  # repo root (gitignored, holds residential proxy URLs)
+
+
+def _load_proxies() -> list[str]:
+    """Proxy URLs from proxies.csv (blank lines and ``#`` comments skipped); ``[]`` if none."""
+
+    try:
+        lines = PROXIES_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    return [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+
+
+def _proxy_template() -> str | None:
+    """A residential proxy URL whose sticky-session token is templated to ``{session}`` so each
+    agent sandbox egresses from its own sticky residential IP (``parse_proxy`` substitutes
+    ``{session}`` with the sandbox id per sandbox). ``None`` when no proxies are configured.
+    """
+
+    proxies = _load_proxies()
+    if not proxies:
+        return None
+    # decodo-style sticky session lives in the username (``...-session-<token>:``); template it so
+    # every sandbox gets a distinct sticky session (and thus a distinct residential IP).
+    return re.sub(r"(-session-)[^-:@/\s]+", r"\g<1>{session}", proxies[0], count=1)
+
+
+def _proxy_optin_note() -> str:
+    """A succinct, token-efficient block injected into the task for 'opt-in' mode: the raw SOCKS
+    endpoint(s) + a one-line WHEN + a one-line HOW, so the agent routes through a residential proxy
+    only when it actually needs to (proxy traffic costs money). Browser/web ONLY -- never the model.
+    """
+
+    eps = " , ".join(_load_proxies()[:2])  # a couple of distinct sticky endpoints to choose from
+    return (
+        "## Residential proxies (optional — use for browser/web requests ONLY, never for anything else)\n"
+        f"SOCKS5 endpoints: {eps}\n"
+        "WHEN: use ONLY if a site blocks or rate-limits the sandbox's direct IP — they cost money, so "
+        "the direct IP is the default; do not route traffic through them otherwise.\n"
+        "HOW: `curl --socks5-hostname '<endpoint>' <url>`, or `export ALL_PROXY='<endpoint>'` for a "
+        "shell/tool, or set that ALL_PROXY before launching `agent-browser`."
+    )
 
 # swarm_id -> {"thread": Thread, "stop": Event}. Controllers run here, in the dashboard process.
 _controllers: dict[str, dict] = {}
@@ -71,7 +118,8 @@ _controllers_lock = threading.Lock()
 # --------------------------------------------------------------------------------------------- #
 # controller lifecycle (dynamic swarms)                                                         #
 # --------------------------------------------------------------------------------------------- #
-def _ensure_controller(ds: DynamicSwarm, *, proxy: str | None = None) -> None:
+def _ensure_controller(ds: DynamicSwarm, *, proxy: str | None = None,
+                       proxy_note: str | None = None) -> None:
     """Start a controller thread for ``ds`` if one is not already running in this process."""
 
     with _controllers_lock:
@@ -79,7 +127,7 @@ def _ensure_controller(ds: DynamicSwarm, *, proxy: str | None = None) -> None:
         if entry and entry["thread"].is_alive():
             return
         endpoint = models.endpoint(models.get(ds.model))
-        controller = ds.controller(endpoint, proxy=proxy)
+        controller = ds.controller(endpoint, proxy=proxy, proxy_note=proxy_note)
         stop = threading.Event()
         thread = threading.Thread(
             target=controller.run_forever, kwargs={"stop": stop}, daemon=True,
@@ -337,21 +385,38 @@ def _spawn(body: dict) -> dict:
     model = body.get("model")
     if not model:
         raise AomError("spawn requires a model name.")
+    prompt = body.get("prompt") or ""
     proxy = body.get("proxy") or None
+    proxy_note = None
+    # proxy_mode: off | always | optin (DEFAULT).
+    #   optin  -> (default) egress stays direct, but the raw SOCKS endpoints + a one-line WHEN/HOW are
+    #             injected into the task so the agent routes manually only when a site blocks the
+    #             direct IP -- minimizes proxy cost (proxy traffic is metered).
+    #   always -> relay ALL agent browser/web egress through a residential proxy ({session} gives each
+    #             agent sandbox a distinct sticky IP); the agent never sees the proxy credentials.
+    #   off    -> no proxy at all.
+    # Model inference ALWAYS stays direct in every mode (the relay/NO_PROXY excludes the model host).
+    proxy_mode = (body.get("proxy_mode") or "optin").lower()
+    if not proxy and _load_proxies():
+        if proxy_mode == "always":
+            proxy = _proxy_template()
+        elif proxy_mode == "optin":
+            proxy_note = _proxy_optin_note()
+            prompt = proxy_note + "\n\n---\n\n" + prompt  # orchestrator / naive agents
     effort = body.get("effort") or None
     _apply_max_instances(model, body.get("max_instances"))
 
     if mode == "dynamic":
         timeout = float(body["timeout"]) if body.get("timeout") else DYNAMIC_ORCHESTRATOR_TIMEOUT
         ds = DynamicSwarm.launch(
-            harness, model, body.get("prompt") or "",
+            harness, model, prompt,
             timeout=timeout, effort=effort, proxy=proxy,
         )
-        _ensure_controller(ds, proxy=proxy)
+        _ensure_controller(ds, proxy=proxy, proxy_note=proxy_note)  # subagents get the note too
         return {"swarm": ds.id, "model": ds.model, "mode": "dynamic"}
 
     swarm = Swarm.launch(
-        harness, model, body.get("prompt") or "",
+        harness, model, prompt,
         count=int(body.get("count") or 1),
         goal=bool(body.get("goal")),
         timeout=float(body["timeout"]) if body.get("timeout") else None,
@@ -421,7 +486,8 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/presets":
                 self._send_json(_presets_payload())
             elif parsed.path == "/api/config":
-                self._send_json({"swarm": os.environ.get("AOM_SWARM", "")})
+                self._send_json({"swarm": os.environ.get("AOM_SWARM", ""),
+                                 "proxies_available": len(_load_proxies())})
             else:
                 self._send_json({"error": "not found"}, 404)
         except AomError as error:

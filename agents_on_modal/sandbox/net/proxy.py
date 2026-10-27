@@ -18,6 +18,7 @@ import asyncio
 import base64
 import ipaddress
 import json
+import re
 import socket
 import sys
 import time
@@ -231,10 +232,14 @@ def parse_proxy(url: str | None, *, session: str | None = None) -> UpstreamProxy
     username = unquote(parts.username) if parts.username is not None else None
     password = unquote(parts.password) if parts.password is not None else None
     if session is not None:
+        # Sticky-session ids for residential providers (e.g. decodo) must be alphanumeric; sandbox
+        # ids contain dashes, so strip to [A-Za-z0-9] (and cap length) before substituting so each
+        # sandbox still maps to a stable, provider-valid session (and thus a distinct sticky IP).
+        safe = re.sub(r"[^A-Za-z0-9]", "", session)[:48] or "s"
         if username is not None:
-            username = username.replace("{session}", session)
+            username = username.replace("{session}", safe)
         if password is not None:
-            password = password.replace("{session}", session)
+            password = password.replace("{session}", safe)
     return UpstreamProxy(normalised, parts.hostname, port, username, password)
 
 

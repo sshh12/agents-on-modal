@@ -257,6 +257,26 @@ def test_controller_spawn_one_off(tmp_path):
     assert len(sb.created) == 1 and sb.created[0].started["timeout"] == 60
 
 
+def test_controller_propagates_proxy_and_note_to_subagents(tmp_path):
+    # the swarm's proxy mode must reach EVERY fan-out subagent, not just the orchestrator.
+    PROXY = "socks5h://u-session-{session}:p@gate.decodo.com:10000"
+    NOTE = ("## Residential proxies (optional — browser/web ONLY)\n"
+            "SOCKS5 endpoints: socks5h://u-session-1:p@gate.decodo.com:10000\nWHEN: ...\nHOW: ...")
+    control = LocalDirControlPlane(str(tmp_path))
+    sb = FakeSandboxes()
+    c = Controller(control, "sw", FakeEndpoint(), "aom-shared-sw", "claude",
+                   proxy=PROXY, proxy_note=NOTE, sandboxes=sb)
+    plan = {"name": "wf", "stages": [{"name": "s", "agents": [{"prompt": "fetch a page"}]}]}
+    control.put_json("_swarm/requests/r.json", {"id": "r", "verb": "submit", "payload": plan})
+    c.tick()
+    assert len(sb.created) == 1
+    box = sb.created[0]
+    # always-mode: the subagent sandbox is created WITH the proxy (its relay -> its own sticky IP)
+    assert box.create_opts["proxy"] == PROXY
+    # agent-opt-in mode: the note is injected into the subagent's own prompt
+    assert NOTE in box.started["prompt"] and "fetch a page" in box.started["prompt"]
+
+
 def test_controller_stop_pauses_workflow_and_stops_agent(tmp_path):
     c, control, sb = _controller(tmp_path)
     control.put_json("_swarm/requests/s1.json", {"id": "s1", "verb": "submit", "payload": {

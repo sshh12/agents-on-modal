@@ -427,7 +427,12 @@ def test_proxy_starts_relay_in_sandbox(fake_modal):
     assert relay_call["args"][0:2] == ("bash", "-lc")
     assert "agents_on_modal.sandbox.net.relay" in relay_call["args"][2]
     assert relay_call["env"]["AOM_UPSTREAM_PROXY"] == PROXY          # raw, {session} unsubstituted
-    assert relay_call["env"]["AOM_PROXY_SESSION"] == box.id
+    # the session is sanitized to [A-Za-z0-9] before the relay sees it: residential providers split
+    # the username on '-', so a sandbox id's dashes would corrupt the sticky session. It stays a
+    # deterministic function of box.id (dashes stripped) so each sandbox keeps a stable distinct IP.
+    import re as _re
+    assert relay_call["env"]["AOM_PROXY_SESSION"] == _re.sub(r"[^A-Za-z0-9]", "", box.id)[:48]
+    assert "-" not in relay_call["env"]["AOM_PROXY_SESSION"]
     assert relay_call["env"]["AOM_MODEL_HOST"] == "ws--aom-qwen.us-west.modal.direct"
 
 
