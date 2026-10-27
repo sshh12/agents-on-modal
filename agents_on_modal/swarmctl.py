@@ -221,7 +221,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="verb", required=True)
 
     def ack_arg(p):
-        p.add_argument("--ack-timeout", type=float, default=60.0,
+        p.add_argument("--ack-timeout", type=float, default=120.0,
                        help="seconds to wait for the controller's acknowledgement")
 
     p = sub.add_parser("submit", help="validate and run a plan (waves + pools)")

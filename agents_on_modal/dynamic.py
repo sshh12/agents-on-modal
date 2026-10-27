@@ -1072,7 +1072,8 @@ Run it in your shell. (If `aom-swarm` is not found, use `python3 -m agents_on_mo
 - `aom-swarm trace AGENT_ID [--tail N]` — read a subagent's recent activity.
 - `aom-swarm wait [--all|--any] [--workflow W] [--timeout N]` — block until subagents finish. Use
   this to sequence work: submit a wave, `wait --all`, read results from `/shared`, then spawn the
-  next wave or a final synthesis agent.
+  next wave or a final synthesis agent. Do NOT use `sleep`/`time.sleep` to wait for subagents — the
+  sandbox blocks long foreground sleeps, so `aom-swarm wait` is the ONLY correct way to wait.
 - `aom-swarm stop TARGET` — pause a workflow (by name) or terminate one subagent (by id).
 - `aom-swarm resume --workflow W` — un-pause a workflow.
 
