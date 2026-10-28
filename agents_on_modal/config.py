@@ -12,6 +12,30 @@ class AomError(RuntimeError):
     """Base class for every error the library raises on purpose."""
 
 
+def ensure_utf8_io() -> None:
+    """Make stdout/stderr UTF-8 so printing non-ASCII (``✓``, ``→``) never crashes a command.
+
+    On Windows the console defaults to a legacy code page (cp1252); emitting a non-ASCII character
+    then raises ``UnicodeEncodeError: 'charmap'`` and kills the process mid-output (issue S10). We
+    reconfigure the streams to UTF-8 with ``errors="replace"`` (so a stray byte degrades to ``?``
+    rather than aborting) and also export ``PYTHONIOENCODING`` so child processes inherit it. Called
+    from every CLI entrypoint; cheap and idempotent, and a no-op where the streams are already UTF-8.
+    """
+
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    import sys
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            if (getattr(stream, "encoding", "") or "").lower().replace("-", "") != "utf8":
+                reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 - best effort; never let I/O setup break a command
+            pass
+
+
 def home() -> Path:
     """The aom state directory (``AOM_HOME`` or ``~/.agents-on-modal``), created on demand."""
 

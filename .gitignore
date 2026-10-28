@@ -4,6 +4,8 @@
 .env
 proxies.csv
 *.log
+# Death Star — local-only alternate swarm console (never committed)
+examples/deathstar/
 __pycache__/
 *.py[cod]
 *.egg-info/

@@ -88,6 +88,9 @@ def _browser_section() -> str:
         "here (navigation/locator timing) and unnecessary. The libraries exist for genuine custom "
         "automation only; if you must, launch with `channel=\"chrome\"` (or "
         "`executable_path=\"/usr/bin/chromium\"`) and never run `playwright install`.\n"
+        "- If a click reports `element is not visible`, the target is hidden or the locator matched "
+        "several elements -- re-`snapshot` and click the right `[ref=eN]`, or use `fill` (it works on "
+        "hidden inputs); do not blindly retry the same click or patch a script across turns.\n"
         "- See the `browser` skill for details. To test a local server, bind it "
         "to 127.0.0.1 and browse `http://127.0.0.1:<port>`."
     )

@@ -251,4 +251,4 @@ class Endpoint:
 # functions, so this stays import-cheap and modal-free). They are re-exported here as
 # ``models.deploy`` / ``models.scale`` / ... — the public names callers use. The submodule is
 # named ``lifecycle`` (not ``deploy``) so there is no clash with the ``deploy`` function.
-from .lifecycle import deploy, endpoint, scale, status, stop, wait_ready  # noqa: E402
+from .lifecycle import active_containers, deploy, endpoint, scale, status, stop, wait_ready  # noqa: E402

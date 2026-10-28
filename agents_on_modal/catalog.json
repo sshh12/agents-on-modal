@@ -362,15 +362,84 @@
       }
     },
     "deepseek-v4.1-flash-abliterated-gguf": {
-      "description": "DeepSeek-V4.1-Flash-1017-abliterated (orcarouter), GGUF quant served by llama.cpp on H200:2 - the catalog's first non-SGLang runtime (runtime: llamacpp). GGUF is a llama.cpp container, not safetensors, so SGLang cannot load it; the llamacpp runtime builds llama-server from source instead of pulling an SGLang image. These GGUFs further require an UNMERGED build - llama.cpp PR #30817 at commit b72050d03 (pinned in codex_modal/runtimes.py) - because DeepSeek-V4.1's architecture is in no tagged release; stock llama.cpp, Ollama and LM Studio refuse to load them. serving_image is omitted so the runtime uses its CUDA devel base (nvidia/cuda:12.8.0-devel) and compiles with CMAKE_CUDA_ARCHITECTURES derived from the GPU (90 for H200/Hopper). download_subdir=Mix-256G fetches only the production quant (235.8 GiB in-memory, 346 GiB download, 3.36 bpw, ~93.7% token-agreement with the original) - not the testing-only Mix-128G or the imatrix. Sized to H200:2 per the model card's '2 GPUs with ~250GB total VRAM' (282 GiB total holds the 235.8 GiB weights with headroom); the runtime globs the first shard (\u00e2\u20ac\u00a6-00001-of-\u00e2\u20ac\u00a6) and llama.cpp auto-loads the rest with -ngl 99 splitting layers across both GPUs. server_args mirror the card's known-good command (-c 32768 -np 1 --no-reasoning-preserve); context_window is pinned to 32768 to match the server's KV so Codex never overflows it. NOTE: this GGUF ships no mmproj projector, so it is TEXT-ONLY here (llama.cpp vision needs a separate mmproj) - unlike the safetensors V4.1 entry, which is multimodal. target_inputs=1 matches --parallel 1; raise both together for concurrency once KV headroom is confirmed.",
+      "description": "DeepSeek-V4.1-Flash-1017-abliterated (orcarouter), GGUF quant served by llama.cpp on H200:2 - the catalog's first non-SGLang runtime (runtime: llamacpp). GGUF is a llama.cpp container, not safetensors, so SGLang cannot load it; the llamacpp runtime builds llama-server from source instead of pulling an SGLang image. These GGUFs further require an UNMERGED build - llama.cpp PR #30817 at commit b72050d03 (pinned in codex_modal/runtimes.py) - because DeepSeek-V4.1's architecture is in no tagged release; stock llama.cpp, Ollama and LM Studio refuse to load them. serving_image is omitted so the runtime uses its CUDA devel base (nvidia/cuda:12.8.0-devel) and compiles with CMAKE_CUDA_ARCHITECTURES derived from the GPU (90 for H200/Hopper). download_subdir=Mix-256G fetches only the production quant (235.8 GiB in-memory, 346 GiB download, 3.36 bpw, ~93.7% token-agreement with the original) - not the testing-only Mix-128G or the imatrix. Sized to H200:2 per the model card's '2 GPUs with ~250GB total VRAM' (282 GiB total holds the 235.8 GiB weights with headroom); the runtime globs the first shard (\u00e2\u20ac\u00a6-00001-of-\u00e2\u20ac\u00a6) and llama.cpp auto-loads the rest with -ngl 99 splitting layers across both GPUs. server_args mirror the card's known-good command (-np 1 --no-reasoning-preserve); the runtime ALWAYS adds --jinja (required for llama-server tool calling: without it DeepSeek-V4.1's DSML tool-call tokens leak out as plain assistant text and the agent harness stalls -- fixed in llamacpp.py). context_window raised to 131072 (from 32768): DeepSeek-V4.1-Flash uses MLA (tiny compressed KV), so the server KV holds it easily on H200:2, and the larger window stops Claude Code's big system prompt from forcing premature auto-compaction (which derailed the model into a meta-summary mid-task). harness window == server -c, so auto-compaction never overflows the real KV. NOTE: this GGUF ships no mmproj projector, so it is TEXT-ONLY here (llama.cpp vision needs a separate mmproj) - unlike the safetensors V4.1 entry, which is multimodal. target_inputs=1 matches --parallel 1; raise both together for concurrency once KV headroom is confirmed.",
       "repo": "orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF",
       "engine": "llamacpp",
       "gpu": "H200:2",
-      "context_window": 32768,
+      "context_window": 131072,
       "max_output_tokens": 8192,
       "region": "us-west",
       "hf_token_env": "HF_TOKEN",
       "download_subdir": "Mix-256G",
+      "startup_timeout": 7200,
+      "engine_args": [
+        "--parallel=1",
+        "--no-reasoning-preserve"
+      ],
+      "scaling": {
+        "target_concurrency": 1.0,
+        "max_containers": 1
+      },
+      "reasoning": {
+        "default": "high",
+        "kwarg": "thinking",
+        "efforts": {
+          "none": false,
+          "minimal": "low",
+          "low": "low",
+          "medium": "high",
+          "high": "high",
+          "xhigh": "max",
+          "max": "max"
+        }
+      }
+    },
+    "glm-5.3-uncensored-fp8": {
+      "description": "GLM-5.3 uncensored (dealignai), block-FP8 e4m3 -- the FULL 753B glm_moe_dsa model (NOT the 320B Flash), ~703.7 GiB across 282 shards -- via SGLang on B300:4. Same arch and parsers as the glm-5.3-*-nvfp4 entries: glm45 reasoning + glm47 tool-call are mandatory (auto picks wrong), the template always opens <think>, and reasoning_effort honors low/high only (anything else becomes max), so always send an explicit level. Image lmsysorg/sglang:v0.5.19-cu130 is the proven glm_moe_dsa image (its transformers 5.12.1 already registers glm_moe_dsa; do NOT force 5.16.0 -- it collides with SGLang's qwen3_asr config registration and the server exits 1 before the health check). This is FP8 BLOCK quant, so unlike the NVFP4 entries there is NO --quantization flag: SGLang auto-detects block-FP8 from config.json. SIZING: at 703.7 GiB the weights need 4 GPUs. B300:4 tp4 = ~176 GiB/GPU = ~66% of B300's ~267.7 GiB usable -- comfortable: mem-fraction-static 0.85 leaves ~51 GiB/GPU static + ~40 GiB/GPU non-static for cuda-graph capture. B300:2 (~352 GiB/GPU) does not fit; H200:4 (~176/139 = 127%) does not fit. The card's 8xH200 TP8 vLLM recipe (max-model-len 131072, gpu-mem-util 0.90, enforce-eager) is the Hopper fallback; B300:4 is a cheaper power-of-2 TP that runs FP8 natively on Blackwell. CONTEXT: full 262144 fits because glm_moe_dsa uses DeepSeek Sparse Attention (DSA) -- the KV pool is small (the NVFP4 full-GLM entries already serve 256k on B300:2 with far less KV headroom), so NO fp8 kv-cache is needed (and DSA + fp8-kv is unproven). --chunked-prefill-size=8192 (proven on the NVFP4 GLM entries) keeps long-context prefill throughput up; --ep-size=4 matches tp. MoE/gemm backends are NOT pinned -- SGLang auto-resolves deep_gemm/cutlass on Blackwell; confirm the resolved backends in the startup log. Text-only (no vision). If 256k KV ever refuses to fit at boot, drop context to 131072 (the card's H200 ceiling) rather than pushing mem-fraction past 0.85 (that starves capture -> exit -9).",
+      "repo": "dealignai/GLM-5.3-UNCENSORED-FP8",
+      "engine": "sglang",
+      "gpu": "B300:4",
+      "context_window": 262144,
+      "max_output_tokens": 32768,
+      "region": "us-west",
+      "hf_token_env": "HF_TOKEN",
+      "image": "lmsysorg/sglang:v0.5.19-cu130",
+      "startup_timeout": 7200,
+      "engine_args": [
+        "--reasoning-parser=glm45",
+        "--tool-call-parser=glm47",
+        "--ep-size=4",
+        "--chunked-prefill-size=8192",
+        "--mem-fraction-static=0.85",
+        "--enable-cache-report"
+      ],
+      "scaling": {
+        "target_concurrency": 4.0,
+        "max_containers": 1
+      },
+      "reasoning": {
+        "default": "high",
+        "efforts": {
+          "none": "low",
+          "minimal": "low",
+          "low": "low",
+          "medium": "high",
+          "high": "high",
+          "xhigh": "max",
+          "max": "max"
+        }
+      }
+    },
+    "deepseek-v4.1-flash-huihui-gguf": {
+      "description": "DeepSeek-V4.1-Flash-1017 abliterated by huihui-ai, GGUF (Unsloth Dynamic UD-IQ1_M, ~233.2 GiB across 5 shards) served by llama.cpp on H200:2. Same deepseek41 architecture as the orcarouter deepseek-v4.1-flash-abliterated-gguf entry, so the same UNMERGED llama.cpp PR #30817 (commit b72050d03, pinned in agents_on_modal/models/engines/llamacpp.py) loads it; stock llama.cpp, Ollama and LM Studio refuse it. engine=llamacpp (GGUF is a llama.cpp container, not safetensors, so SGLang cannot load it); the runtime compiles llama-server from that PR on a CUDA-devel base (CMAKE_CUDA_ARCHITECTURES=90 for Hopper). download_subdir=UD-IQ1_M fetches only the higher of huihui's two 1-bit dynamic quants (UD-IQ1_M 233.2 GiB vs UD-IQ1_S 217.0 GiB; the unsloth/Maya/Strata folders are small patch GGUFs, NOT full weights). CAVEAT -- these are 1-bit (IQ1) dynamic quants, far more aggressive than orcarouter's 3.36 bpw Mix-256G (~93.7% token agreement), so expect noticeably lower fidelity: this entry exists to cover the huihui-ai abliteration, not for best quality. ~233 GiB fits H200:2 (282 GiB total) with headroom, matching how Mix-256G (235.8 GiB) was sized; the runtime globs the first shard (...-UD-IQ1_M-00001-of-00005.gguf, a 10 MB index shard) and -ngl 99 splits all layers across both GPUs (shard 5 alone is 103 GiB, but llama.cpp distributes by layer, not by shard). server args mirror the known-good orcarouter command (-np 1 --no-reasoning-preserve); the runtime ALWAYS adds --jinja (required for llama-server tool calling: without it DeepSeek-V4.1's DSML tool-call tokens leak out as plain assistant text and an agent harness stalls on turn 1 -- fixed in llamacpp.py). context_window is 131072: DeepSeek-V4.1-Flash uses MLA (a tiny compressed KV, ~9 GiB at 131072 vs H200:2's ~46 GiB headroom), so the server KV holds far more than 32k, and the bigger window keeps Claude Code's large system prompt + tool defs from triggering premature auto-compaction (which derailed this 1-bit quant into emitting a meta-summary). harness window == server -c, so auto-compaction never overflows the real KV. CAVEAT: even served correctly, this UD-IQ1_M 1-bit quant is too degraded for reliable multi-step agent loops (it narrates steps without calling tools, or repetition-collapses) -- fine for smoke/generation, not for agentic work. TEXT-ONLY: this GGUF ships no mmproj projector (llama.cpp vision needs a separate mmproj). target_concurrency=1 matches --parallel 1; raise both together once KV headroom is confirmed.",
+      "repo": "huihui-ai/Huihui-DeepSeek-V4.1-Flash-1017-abliterated-GGUF",
+      "engine": "llamacpp",
+      "gpu": "H200:2",
+      "context_window": 131072,
+      "max_output_tokens": 8192,
+      "region": "us-west",
+      "hf_token_env": "HF_TOKEN",
+      "download_subdir": "UD-IQ1_M",
       "startup_timeout": 7200,
       "engine_args": [
         "--parallel=1",

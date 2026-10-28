@@ -13,7 +13,11 @@ from __future__ import annotations
 
 __version__ = "0.2.0"
 
-from . import harness, models, sandbox
+from . import dynamic, harness, models, sandbox
 from .config import AomError
+# Re-export the control-plane classes at the top level: they live in ``dynamic`` but the obvious
+# import guesses are ``agents_on_modal.volumes`` / ``.control`` (issue S9), so surface them here.
+from .dynamic import ControlPlane, LocalDirControlPlane, VolumeControlPlane
 
-__all__ = ["AomError", "__version__", "harness", "models", "sandbox"]
+__all__ = ["AomError", "ControlPlane", "LocalDirControlPlane", "VolumeControlPlane",
+           "__version__", "dynamic", "harness", "models", "sandbox"]

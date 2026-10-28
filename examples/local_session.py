@@ -29,8 +29,19 @@ def main() -> int:
 
     model = models.get(args.model)
     endpoint = models.deploy(model) if args.deploy else models.endpoint(model)
-    if args.deploy:
-        models.wait_ready(endpoint)
+
+    # Always wait for the endpoint to be serving before handing off to the harness. Even on the
+    # attach path (no --deploy) the model may be scaled to zero and cold-starting, so the very
+    # first request would otherwise hit 503 "no upstreams available" and the harness would spin on
+    # its own retries (and give up) while the container boots. wait_ready() polls /health, tolerating
+    # the cold-start 503/404, until the model can actually serve.
+    print(
+        f"[local] waiting for '{args.model}' to be ready "
+        "(a cold start can take several minutes)...",
+        flush=True,
+    )
+    models.wait_ready(endpoint)
+    print(f"[local] '{args.model}' is ready; starting {args.harness} session.", flush=True)
 
     # A local sandbox is just this host; the chosen directory is the agent's workspace.
     box = sandbox.create("local", endpoint=endpoint, workdir=args.workdir)

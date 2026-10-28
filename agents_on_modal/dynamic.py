@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -501,10 +502,19 @@ class Controller:
         self._sb = sandboxes
         self._workflows: dict[str, _WorkflowRuntime] = {}
         self._wrote_meta = False
+        #: Request ids already dispatched -- in memory plus a durable marker -- so a request is
+        #: executed at most once even across a controller restart (issue S5).
+        self._handled: set[str] = set()
         # Orchestrator trace tailing (its sandbox is not a subagent; tail it so its trace persists
         # to the volume too and survives teardown).
         self._orch_run: Any = None
         self._orch_offset = 0
+        #: Orchestrator harness session id, discovered from its trace and published to meta.json so a
+        #: resume does not have to scrape the trace (issue S9) -- also what resume_orchestrator reads.
+        self._orch_session: str | None = None
+        #: Opt-in orchestrator supervision bookkeeping (issue S3); see _supervise_orchestrator.
+        self._orch_restarts = 0
+        self._last_restart_at = 0.0
 
     # -- lifecycle ---------------------------------------------------------------------------- #
     def run_forever(self, interval: float = 3.0, stop: Any = None) -> None:
@@ -541,10 +551,17 @@ class Controller:
             if not name.endswith(".json"):
                 continue
             reqid = name[: -len(".json")]
-            if self.control.exists(f"{RESERVED}/ack/{reqid}.json"):
+            # Dedupe: run each request id at most once, even across a controller restart (issue S5).
+            # A durable 'handled' marker is written at DISPATCH (before any work), so a crash mid-
+            # handling never resurfaces the request as a duplicate workflow ('spawn-2').
+            if (reqid in self._handled
+                    or self.control.exists(f"{RESERVED}/ack/{reqid}.json")
+                    or self.control.exists(f"{RESERVED}/handled/{reqid}.json")):
+                self._handled.add(reqid)
                 continue
             request = self.control.get_json(f"{RESERVED}/requests/{name}")
             if isinstance(request, dict):
+                self._claim(reqid, request.get("verb"))
                 self._handle_request(reqid, request)
 
         for wf in list(self._workflows.values()):
@@ -552,6 +569,7 @@ class Controller:
             self._publish_workflow(wf)
 
         self._tail_orchestrator()
+        self._supervise_orchestrator()
 
     # -- request handling --------------------------------------------------------------------- #
     def _ack(self, reqid: str, *, ok: bool, errors=None, warnings=None, result=None) -> None:
@@ -565,6 +583,15 @@ class Controller:
                 "warnings": warnings or [],
                 "result": result or {},
             },
+        )
+
+    def _claim(self, reqid: str, verb: Any) -> None:
+        """Mark a request handled at dispatch (before any work) so it is never executed twice (S5)."""
+
+        self._handled.add(reqid)
+        self.control.put_json(
+            f"{RESERVED}/handled/{reqid}.json",
+            {"id": reqid, "verb": verb, "ts": time.time(), "pid": os.getpid()},
         )
 
     def _handle_request(self, reqid: str, request: dict[str, Any]) -> None:
@@ -765,7 +792,82 @@ class Controller:
             envelopes, self._orch_offset = self._orch_run.read_trace(self._orch_offset)
         except Exception:  # noqa: BLE001 - orchestrator gone / mid-flight read
             return
+        if envelopes and not self._orch_session:
+            self._discover_orchestrator_session(envelopes)
         self._append_events(self.orchestrator_id, self._orch_run, envelopes)
+
+    def _discover_orchestrator_session(self, envelopes: list) -> None:
+        """Find the orchestrator's session id in its trace and publish it to meta.json once (S9)."""
+
+        for env in envelopes:
+            try:
+                for ev in self._orch_run.parse(env):
+                    sid = (ev.data or {}).get("session_id") if ev.kind == "session" else None
+                    if sid:
+                        self._orch_session = sid
+                        meta = self.control.get_json(f"{RESERVED}/meta.json") or {}
+                        if meta.get("orchestrator_session") != sid:
+                            meta["orchestrator_session"] = sid
+                            self.control.put_json(f"{RESERVED}/meta.json", meta)
+                        return
+            except Exception:  # noqa: BLE001 - never let trace parsing break the tail
+                continue
+
+    # -- orchestrator supervision (issue S3) -------------------------------------------------- #
+    def _has_unfinished_workflows(self) -> bool:
+        try:
+            for name in self.control.listdir(f"{RESERVED}/workflows"):
+                if name.endswith(".json"):
+                    wf = self.control.get_json(f"{RESERVED}/workflows/{name}") or {}
+                    if wf.get("status") in ("running", "paused"):
+                        return True
+        except Exception:  # noqa: BLE001
+            return False
+        return False
+
+    def _supervise_orchestrator(self) -> None:
+        """Relaunch a dead orchestrator (issue S3). OPT-IN via ``AOM_SWARM_SUPERVISE`` (default OFF so
+        it can never destabilize an existing run). Only fires when the orchestrator has actually
+        exited AND work remains; bounded by ``AOM_SWARM_MAX_RESTARTS`` with exponential backoff; each
+        attempt is recorded to ``_swarm/supervisor.json``. The relaunch is a FRESH orchestrator
+        session carrying a state snapshot (not a true --resume -- see resume_orchestrator / S9)."""
+
+        if not os.environ.get("AOM_SWARM_SUPERVISE"):
+            return
+        if not self.orchestrator_id or not self.orchestrator_run_id or self._orch_run is None:
+            return
+        try:
+            state = str(self._orch_run.status().get("state"))
+        except Exception:  # noqa: BLE001 - mid-flight read; try again next tick
+            return
+        if state not in TERMINAL_STATES or not self._has_unfinished_workflows():
+            return
+        if self._orch_restarts >= int(os.environ.get("AOM_SWARM_MAX_RESTARTS", "3")):
+            return
+        now = time.time()
+        backoff = min(300.0, 10.0 * (2 ** self._orch_restarts))
+        if now - self._last_restart_at < backoff:
+            return
+        self._last_restart_at = now
+        try:
+            result = resume_orchestrator(
+                self.swarm_id, endpoint=self.endpoint, sandboxes=self._sb, proxy=self.proxy
+            )
+        except Exception as error:  # noqa: BLE001 - record and retry next eligible tick
+            self.control.put_json(f"{RESERVED}/supervisor.json",
+                                   {"ts": now, "error": str(error), "restarts": self._orch_restarts})
+            return
+        self._orch_restarts += 1
+        self.orchestrator_id = result["orchestrator_id"]
+        self.orchestrator_run_id = result["orchestrator_run_id"]
+        self._orch_run = None
+        self._orch_offset = 0
+        self._orch_session = None
+        self.control.put_json(
+            f"{RESERVED}/supervisor.json",
+            {"ts": now, "restarts": self._orch_restarts, "orchestrator_id": self.orchestrator_id,
+             "resumed_from": result.get("resumed_from")},
+        )
 
     def _append_events(self, agent_id: str, run: Any, envelopes: list) -> None:
         """Parse new trace envelopes into events and append them to the agent's durable trace file
@@ -1021,6 +1123,112 @@ class DynamicSwarm:
                 if agent:
                     out.append(agent)
         return out
+
+
+def _state_snapshot(control: ControlPlane) -> str:
+    """A compact, human-readable snapshot of a swarm's control-plane state for a resuming
+    orchestrator: each workflow/stage with its status and done/total agent counts, plus the
+    top-level shared files it should read to recover intent."""
+
+    lines: list[str] = []
+    try:
+        for name in sorted(control.listdir(f"{RESERVED}/workflows")):
+            if not name.endswith(".json"):
+                continue
+            wf = control.get_json(f"{RESERVED}/workflows/{name}") or {}
+            stages = wf.get("stages") or []
+            lines.append(f"- workflow `{wf.get('name', name)}`: {wf.get('status', '?')} "
+                         f"({len(stages)} stage(s))")
+            for st in stages:
+                agents = st.get("agents") or []
+                done = sum(1 for a in agents if a.get("state") in TERMINAL_STATES)
+                lines.append(f"    - stage `{st.get('name', '?')}`: {st.get('status', '?')} "
+                             f"[{done}/{len(agents)} agents done]")
+    except Exception:  # noqa: BLE001 - a snapshot is best-effort
+        pass
+    try:
+        files = [n for n in control.listdir("") if n != RESERVED]
+        if files:
+            lines.append("- shared files to read first: " + ", ".join(sorted(files)[:40]))
+    except Exception:  # noqa: BLE001
+        pass
+    return "\n".join(lines) or "(no workflows recorded yet)"
+
+
+def resume_orchestrator(
+    swarm_id: str,
+    *,
+    endpoint: Any = None,
+    sandboxes: Any = None,
+    proxy: str | None = None,
+    timeout: float | None = None,
+    effort: str | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Relaunch a dynamic swarm's orchestrator after it has exited (issue S3), from the HOST or from
+    the controller's opt-in supervisor.
+
+    The orchestrator is a single point of failure: when it dies nothing restarts it, and there is no
+    control-plane verb that brings it back. This launches a NEW orchestrator sandbox bound to the
+    same swarm id and shared workspace, primed with the standard instructions plus a snapshot of the
+    current control-plane state so it can continue the mission and not restart finished work.
+
+    HONEST LIMITATION: this is a *fresh* orchestrator session, not a true harness ``--resume`` of the
+    old one -- a new sandbox gets an empty harness home, so the old session's files are gone (see
+    Sandbox.start and issue S9). Continuity comes from the shared workspace (PLAN.md, notes, outputs)
+    and the injected snapshot -- exactly the manual recovery the issue describes, now automated.
+    Updates ``meta.json`` and returns ``{swarm, orchestrator_id, orchestrator_run_id, resumed_from}``.
+    """
+
+    from . import models  # noqa: PLC0415 - lazy so the module stays modal-free to import
+    if sandboxes is None:
+        from . import sandbox as sandboxes  # noqa: PLC0415
+
+    shared = f"aom-shared-{swarm_id}"
+    control = VolumeControlPlane(shared)
+    meta = control.get_json(f"{RESERVED}/meta.json") or {}
+    model_name = str(meta.get("model") or "")
+    if not model_name:
+        raise AomError(f"swarm {swarm_id!r} has no meta/model recorded; cannot resume its orchestrator.")
+    harness = str(meta.get("harness") or "claude")
+    model = models.get(model_name)
+    if endpoint is None:
+        endpoint = models.endpoint(model)
+    default_timeout = float(meta.get("default_timeout", DEFAULT_TIMEOUT))
+
+    instructions = build_orchestrator_instructions(
+        default_timeout=default_timeout, model_name=model.name, allowed_efforts=_model_efforts(model),
+    )
+    prior = meta.get("orchestrator_id")
+    task = (
+        f"{instructions}\n\n---\n\n# Resuming an in-flight mission\n\n"
+        + (f"{note}\n\n" if note else "")
+        + "You are a REPLACEMENT orchestrator: the previous orchestrator for this swarm exited. The "
+        "shared workspace under `/shared` is intact — read `PLAN.md` and any notes there FIRST to "
+        "recover the mission's intent and conventions. Do NOT restart work that is already finished. "
+        "Current control-plane state:\n\n"
+        f"{_state_snapshot(control)}\n\n"
+        "Continue from here: resume unfinished workflows/stages, spawn only what is still missing, "
+        "and drive the mission to completion.\n"
+    )
+
+    box = sandboxes.create("modal", endpoint=endpoint, proxy=proxy, swarm=swarm_id, shared_volume=shared)
+    _install_cli_shim(box)
+    run = box.start(
+        harness, endpoint, task, goal=True, timeout=(timeout or default_timeout), effort=effort,
+        meta={"swarm_id": swarm_id, "role": "orchestrator", "resumed_from": prior},
+    )
+    run_id = getattr(run, "run_id", None)
+    meta.update({
+        "orchestrator_id": box.id,
+        "orchestrator_run_id": run_id,
+        "orchestrator_session": None,  # fresh session; the controller's tail rediscovers it
+        "resumed_from": prior,
+        "resumed_at": time.time(),
+    })
+    control.put_json(f"{RESERVED}/meta.json", meta)
+    return {"swarm": swarm_id, "orchestrator_id": box.id,
+            "orchestrator_run_id": run_id, "resumed_from": prior}
 
 
 def _model_efforts(model: Any) -> list[str]:

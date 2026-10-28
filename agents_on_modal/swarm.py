@@ -19,6 +19,7 @@ Only ``cli.py`` prints; this module raises :class:`~agents_on_modal.config.AomEr
 
 from __future__ import annotations
 
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -37,6 +38,31 @@ from .sandbox.base import Run, Sandbox, SandboxError
 MAX_CONCURRENCY = 16
 CREATE_RETRIES = 5
 RETRY_BACKOFF = 2.0
+
+# Hydrated Volume handles are cached per name for the life of the process. ``modal.Volume.from_name``
+# yields a fresh, unhydrated handle each call; the dashboard news up a new ``Swarm`` per ``/api/file``
+# and ``/api/files`` request, so without this cache every read re-resolves the volume over the network
+# before the (often tiny) file even starts transferring -- that resolve, not the bytes, is what made
+# small-file reads feel slow. Reads still hit the server, so a cached handle observes fresh commits;
+# it only skips the repeated lookup. (``dynamic.py``'s VolumeControlPlane already caches the same way.)
+_VOLUME_CACHE: dict[str, Any] = {}
+_VOLUME_CACHE_LOCK = threading.Lock()
+
+
+def _shared_volume(name: str) -> Any:
+    """A process-cached, reusable handle to the named shared Volume (hydrated on first use)."""
+
+    cached = _VOLUME_CACHE.get(name)
+    if cached is not None:
+        return cached
+    import modal
+
+    with _VOLUME_CACHE_LOCK:
+        cached = _VOLUME_CACHE.get(name)
+        if cached is None:
+            cached = modal.Volume.from_name(name, version=2)
+            _VOLUME_CACHE[name] = cached
+        return cached
 
 
 @dataclass
@@ -146,9 +172,7 @@ class Swarm:
 
     # ---- shared volume (read from outside Modal) --------------------------------------------
     def _volume(self) -> Any:
-        import modal
-
-        return modal.Volume.from_name(self.shared_volume, version=2)
+        return _shared_volume(self.shared_volume)
 
     def list_shared(self, path: str = "/", *, recursive: bool = True) -> list[str]:
         """Paths committed to the shared Volume (read from outside, no container)."""

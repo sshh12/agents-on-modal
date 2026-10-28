@@ -119,6 +119,13 @@ class LlamaCppEngine(Engine):
             "99",
             "--ctx-size",
             str(int(model_json["context_window"])),
+            # Tool calling is OFF in llama-server unless --jinja is set: only then does it render the
+            # request's OpenAI `tools` into the prompt via the GGUF's embedded chat template AND parse
+            # the model's reply back into structured `tool_calls`. Without it the model free-forms its
+            # native tool-call markup (DeepSeek V4.1's DSML tokens) as plain assistant TEXT, so the
+            # harness sees garbled text instead of a tool call and the agent stalls on turn 1. Every
+            # GGUF we serve is driven by an agent harness, so this is always wanted.
+            "--jinja",
         ]
         # llama.cpp's parser wants space-separated values (``--parallel 1``); it rejects the
         # ``--parallel=1`` form SGLang accepts ("error: invalid argument: --parallel=1"). The

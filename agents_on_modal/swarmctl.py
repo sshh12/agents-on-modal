@@ -58,7 +58,10 @@ def _await_ack(control: LocalDirControlPlane, reqid: str, *, timeout: float, out
                 print(f"error: {e}", file=out)
             return 1
         time.sleep(1.0)
-    print(f"timed out after {timeout:g}s waiting for the controller to ack {reqid}", file=out)
+    print(f"timed out after {timeout:g}s waiting for the controller to ack {reqid}; it may still be "
+          f"queued behind other work (ack latency climbs under load) -- check 'status'/'trace' before "
+          f"resubmitting. A timeout is NOT a failure, and resubmitting creates a NEW request id (the "
+          f"controller only dedupes the same id), so a resubmit can double-run the work.", file=out)
     return 2
 
 
@@ -213,6 +216,22 @@ def _cmd_resume(args, control, out) -> int:
     return _await_ack(control, reqid, timeout=args.ack_timeout, out=out)
 
 
+def _cmd_resume_orchestrator(args, control, out) -> int:
+    # HOST-side recovery (issue S3): unlike the other verbs this does not go through the control plane
+    # -- there is no controller verb that can relaunch the orchestrator, and when it has died there may
+    # be nothing driving the swarm at all. It talks to Modal directly (lazy import), so it needs Modal
+    # creds; it is meant to run on the host, not from inside a sandbox.
+    from .dynamic import resume_orchestrator
+
+    try:
+        result = resume_orchestrator(args.swarm, timeout=args.timeout, effort=args.effort, note=args.note)
+    except Exception as error:  # noqa: BLE001
+        print(f"error: {type(error).__name__}: {error}", file=out)
+        return 1
+    print("ok: " + json.dumps(result), file=out)
+    return 0
+
+
 # --------------------------------------------------------------------------------------------- #
 # argparse                                                                                      #
 # --------------------------------------------------------------------------------------------- #
@@ -221,8 +240,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="verb", required=True)
 
     def ack_arg(p):
-        p.add_argument("--ack-timeout", type=float, default=120.0,
-                       help="seconds to wait for the controller's acknowledgement")
+        # Default raised well past observed controller ack latency under load (~12 min seen) so a
+        # slow ack is not mistaken for failure (issue S4). Override with AOM_SWARM_ACK_TIMEOUT.
+        p.add_argument("--ack-timeout", type=float,
+                       default=float(os.environ.get("AOM_SWARM_ACK_TIMEOUT", "900")),
+                       help="seconds to wait for the controller's ack (env AOM_SWARM_ACK_TIMEOUT, default 900)")
 
     p = sub.add_parser("submit", help="validate and run a plan (waves + pools)")
     p.add_argument("--file", required=True, help="plan JSON file, or - for stdin")
@@ -268,10 +290,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workflow", required=True)
     ack_arg(p)
     p.set_defaults(func=_cmd_resume)
+
+    p = sub.add_parser("resume-orchestrator",
+                       help="HOST-side: relaunch a swarm's orchestrator after it exited (issue S3)")
+    p.add_argument("--swarm", required=True, help="swarm id (e.g. swarm-YYYYMMDD-xxxxxx)")
+    p.add_argument("--timeout", type=float, default=None, help="orchestrator deadline seconds")
+    p.add_argument("--effort", default=None)
+    p.add_argument("--note", default=None, help="extra guidance prepended to the resume prompt")
+    p.set_defaults(func=_cmd_resume_orchestrator)
     return parser
 
 
 def main(argv: list[str] | None = None, *, out=None) -> int:
+    from .config import ensure_utf8_io
+
+    ensure_utf8_io()  # S10: non-ASCII output must not crash on a cp1252 console
     out = out or sys.stdout
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     # 'spawn' default timeout: fall back here (argparse default None) so the message is friendly.

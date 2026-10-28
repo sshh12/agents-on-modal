@@ -49,6 +49,38 @@ POLL_INTERVAL = float(os.environ.get("AOM_RUNNER_POLL", "0.1"))
 #: Consecutive goal iterations with no new distinct action before we give up.
 MAX_NO_PROGRESS = 3
 
+#: A failed auto-compaction (an image block in older history, or a transient "prompt too long")
+#: yields an attempt with no new distinct action. Counting that as a stall ends a healthy goal run
+#: prematurely (issue S2). Retry such an attempt (bounded) instead; S1 stops the image case from
+#: recurring, so the resume clears it.
+MAX_COMPACTION_RETRIES = 3
+
+#: Error substrings that mark a prompt-size / compaction failure (not a genuine stall).
+_COMPACTION_SIGNATURES = (
+    "prompt is too long",
+    "prompt too long",
+    "validate_thinking_parts_role",
+    "content should be a valid string",
+    "context length",
+    "maximum context",
+    "context_length_exceeded",
+    "exceeds the maximum",
+    "too many tokens",
+)
+
+
+def _looks_like_compaction_failure(events: list) -> bool:
+    """True if this attempt's events carry a prompt-too-long / compaction-failure signature."""
+
+    for event in events:
+        if getattr(event, "kind", None) not in ("error", "turn_end", "log", "text"):
+            continue
+        data = getattr(event, "data", None) or {}
+        blob = " ".join(str(data.get(k, "")) for k in ("message", "result", "text", "subtype")).lower()
+        if any(sig in blob for sig in _COMPACTION_SIGNATURES):
+            return True
+    return False
+
 
 def _distinct_actions(events: list) -> int:
     """How many *distinct* tool calls the agent has made so far.
@@ -309,6 +341,7 @@ def _drive(spec: dict[str, Any], harness: Harness, setup: HarnessSetup,
     session_id: str | None = None
     goal_state: GoalState = "none"
     no_progress = 0
+    compaction_retries = 0
     attempt = 0
 
     sink.emit_runner({"event": "start", "harness": harness.name, "goal": goal, "deadline": deadline})
@@ -353,6 +386,7 @@ def _drive(spec: dict[str, Any], harness: Harness, setup: HarnessSetup,
             return 1
 
         # Parse this invocation's envelopes; never let one bad line crash the runner.
+        events_before = len(all_events)
         for env_obj in envelopes:
             try:
                 all_events.extend(harness.parse(env_obj))
@@ -404,9 +438,26 @@ def _drive(spec: dict[str, Any], harness: Harness, setup: HarnessSetup,
             sink.emit_runner({"event": "done", "state": final})
             return 0 if final == "done" else 1
 
+        # A failed compaction is restartable, not a stall (S2): don't let it trip the no-progress
+        # guard. S1 prevents the image case from recurring, so a bounded resume clears it; an
+        # unbounded loop is avoided by the retry cap (after which it falls through to normal
+        # accounting and the guard can still end a genuinely wedged run).
+        if exit_code != 0 and _looks_like_compaction_failure(all_events[events_before:]):
+            if compaction_retries < MAX_COMPACTION_RETRIES:
+                compaction_retries += 1
+                sink.emit_runner({"event": "compaction_retry", "attempt": attempt,
+                                  "count": compaction_retries})
+                status.set(state="running", turns=attempt, session_id=session_id, goal_state=goal_state)
+                continue  # resume the session without counting this attempt toward no-progress
+            sink.emit_runner({"event": "compaction_retry_exhausted", "attempt": attempt})
+
         # No-progress guard (the deadline may be None for an open-ended goal).
         progress_after = _distinct_actions(all_events)
-        no_progress = no_progress + 1 if progress_after <= progress_before else 0
+        if progress_after > progress_before:
+            no_progress = 0
+            compaction_retries = 0  # real progress clears the compaction-retry budget
+        else:
+            no_progress += 1
         if no_progress >= MAX_NO_PROGRESS:
             status.set(state="done", goal_state=goal_state)
             sink.emit_runner({"event": "done", "state": "done", "reason": "no-progress"})
@@ -415,6 +466,9 @@ def _drive(spec: dict[str, Any], harness: Harness, setup: HarnessSetup,
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .config import ensure_utf8_io
+
+    ensure_utf8_io()  # S10: and export PYTHONIOENCODING so the harness subprocess inherits UTF-8
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
         sys.stderr.write("usage: python -m agents_on_modal.runner <run_dir>\n")

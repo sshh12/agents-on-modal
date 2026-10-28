@@ -19,7 +19,7 @@ import aiohttp
 from aiohttp import web
 
 from . import anthropic, chat, responses
-from .ir import clamp_max_tokens, estimate_tokens
+from .ir import clamp_max_tokens, drop_images_for_text_model, estimate_tokens
 from .reasoning import chat_reasoning_fields
 
 _SSE_HEADERS = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"}
@@ -49,6 +49,9 @@ def build_app(model: dict, engine_url: str) -> web.Application:
     name = model["name"]
     context_window = int(model["context_window"])
     max_output = int(model["max_output_tokens"])
+    #: Text-only models choke on image blocks (issue S1). When false, strip images to a placeholder
+    #: just before the engine -- covers pasted screenshots, browser tool results, and compaction.
+    vision = bool(model.get("vision"))
     reasoning_cfg = model.get("reasoning") or {}
     sampling_defaults = dict(model.get("sampling") or {})
     engine = engine_url.rstrip("/")
@@ -114,6 +117,8 @@ def build_app(model: dict, engine_url: str) -> web.Application:
                 await asyncio.sleep(2)
 
     def build_chat_body(parsed, *, stream: bool) -> dict[str, Any]:
+        if not vision:
+            drop_images_for_text_model(parsed.messages)  # S1: never send image blocks to a text model
         body: dict[str, Any] = {"model": name, "messages": parsed.messages, "stream": stream}
         if stream:
             body["stream_options"] = {"include_usage": True, "continuous_usage_stats": True}
@@ -209,6 +214,8 @@ def build_app(model: dict, engine_url: str) -> web.Application:
         if not await _ensure_engine_ready(session):
             return web.json_response({"error": {"message": "engine not ready", "type": "api_error"}}, status=503)
         body["model"] = name
+        if not vision:
+            drop_images_for_text_model(body.get("messages") or [])  # S1 (chat pass-through path too)
         _apply_reasoning(body, chat_reasoning_fields(body.get("reasoning_effort"), reasoning_cfg))
         prompt_estimate = estimate_tokens(json.dumps(body.get("messages") or [], ensure_ascii=False))
         body["max_tokens"] = clamp_max_tokens(

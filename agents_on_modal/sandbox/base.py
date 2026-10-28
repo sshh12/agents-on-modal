@@ -152,7 +152,14 @@ class Sandbox(ABC):
     def start(self, harness: str | Harness, endpoint: Any, prompt: str, *, goal: bool = False,
               timeout: float | None = None, effort: str | None = None, run_id: str | None = None,
               meta: Mapping[str, Any] | None = None) -> "Run":
-        """Start a headless run in the background and return its handle immediately."""
+        """Start a headless run in the background and return its handle immediately.
+
+        Resume note (issue S9): the harness home (where a harness keeps its session files) lives under
+        this run's ``run_dir/harness``. A fresh ``run_id`` therefore gets an empty home, so a harness
+        ``--resume <session-id>`` started that way finds no session to resume. To continue a prior
+        session you must reuse that session's ``run_dir`` -- pass its ``run_id`` here (same sandbox),
+        or persist/restore the home. There is no cross-sandbox session resume today.
+        """
 
         run_id = run_id or new_id("run-")
         run_dir = self.join(self.runs_root, run_id)

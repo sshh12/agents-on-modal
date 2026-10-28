@@ -105,10 +105,14 @@
   /* active model endpoints panel */
   .eprow { display: flex; gap: 10px; align-items: center; font-family: var(--mono); font-size: 12px;
     padding: 3px 2px; }
+  /* dot: gray = not deployed, amber = deployed but idle (scaled to zero, no GPU cost),
+     green = active (>=1 container serving now, warm/billing). */
   .eprow .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); flex: 0 0 auto; }
-  .eprow.on .dot { background: var(--ok); }
+  .eprow.deployed .dot { background: var(--warn); }
+  .eprow.active .dot { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
   .eprow .nm { color: var(--text); min-width: 220px; }
-  .eprow.on .nm { color: var(--ok); }
+  .eprow.deployed .nm { color: var(--text); }
+  .eprow.active .nm { color: var(--ok); }
   .eprow .gp { color: var(--muted); } .eprow .cap { color: var(--accent); }
   .eprow .repo { color: var(--muted); overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
   option.active { color: var(--ok); }
@@ -165,8 +169,8 @@
       <select id="model"><option value="">loading models…</option></select></div>
     <div id="countWrap"><label for="count">count</label>
       <input id="count" type="number" min="1" value="4" /></div>
-    <div><label for="timeout" id="timeoutLabel">timeout (s)</label>
-      <input id="timeout" type="number" min="0" placeholder="none" /></div>
+    <div><label for="timeout" id="timeoutLabel">timeout (hours)</label>
+      <input id="timeout" type="number" min="0" step="any" placeholder="none" /></div>
     <div><label for="effort">effort</label>
       <select id="effort"><option value="">default</option><option>low</option>
         <option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></div>
@@ -199,7 +203,7 @@
   </form>
 
   <details class="injected" id="endpointsPanel" open>
-    <summary>active model endpoints <span class="muted" id="epCount"></span>
+    <summary>model endpoints <span class="muted" id="epCount"></span>
       <button type="button" id="epRefresh" class="ghost"
         style="width:auto; padding:2px 8px; font-size:11px; margin-left:8px;">refresh</button></summary>
     <div id="endpointsBody"><div class="loading"><span class="spinner"></span> querying endpoints…</div></div>
@@ -247,6 +251,9 @@ let swarmId = qs.get("swarm") || "";
 let mode = "naive";
 let selected = null;                 // selected agent id
 let openFile = null;
+let fileReq = 0;                     // bumped per user file-click, to ignore superseded loads
+let filesBusy = false, readBusy = false, lastFilesAt = 0;  // throttle/gate the expensive file poll
+const FILES_MIN_MS = 6000;           // recursive listdir is ~1s+; don't re-list more often than this
 const expanded = new Set();          // expanded workflow names
 const runIds = new Map();            // agentId -> run_id
 const traces = new Map();            // agentId -> {events, offset, done, runId}
@@ -456,6 +463,10 @@ async function refresh() {
 // --------------------------------------------------------------------------- file explorer
 async function refreshFiles() {
   if (!swarmId) return;
+  // The recursive listdir is ~1s+ on a large shared volume and the Modal client serializes RPCs,
+  // so throttle it and never let it run while a file read is in flight (it would delay a click).
+  if (readBusy || filesBusy || Date.now() - lastFilesAt < FILES_MIN_MS) return;
+  filesBusy = true; lastFilesAt = Date.now();
   const ft = $("ftree");
   if (!ft.children.length)  // first load: spinner instead of a blank panel
     ft.innerHTML = '<div class="loading"><span class="spinner"></span> loading files…</div>';
@@ -476,19 +487,32 @@ async function refreshFiles() {
     if (!paths.length) tree.innerHTML = '<div class="empty">no shared files yet</div>';
     if (openFile) viewFile(openFile);
   } catch (e) { /* no volume yet */ }
+  finally { filesBusy = false; }
 }
 
 async function viewFile(path, click) {
   openFile = path;
+  // A user click pops the fullscreen viewer immediately with a spinner so the UI feels responsive
+  // even on a big file or a cold volume; it fills in when the fetch returns. Background refreshes
+  // (no click) just update the inline panel silently and never touch the modal or the token.
+  const token = click ? ++fileReq : fileReq;
+  if (click) openFullscreenLoading(path);
+  readBusy = true;   // pause the files poll while a read is in flight (the Modal client serializes RPCs)
   try {
     const data = await getJSON("/api/file?swarm=" + encodeURIComponent(swarmId)
       + "&path=" + encodeURIComponent(path));
+    if (click && token !== fileReq) return;   // a newer click superseded this load
     $("fview").style.display = "";
     $("fpath").textContent = data.path + (data.truncated ? "  (truncated)" : "");
     $("fbody").textContent = data.text || "(empty)";
     // a click opens the file full-screen with rich rendering (.json pretty-printed, .md rendered)
     if (click) openFullscreen(data.path, data.text || "");
-  } catch (e) { setError(String(e.message || e)); }
+  } catch (e) {
+    if (click && token !== fileReq) return;
+    if (click) $("fsBody").innerHTML = '<pre class="raw" style="color:var(--err)">could not read file — '
+      + esc(e.message || e) + '</pre>';
+    else setError(String(e.message || e));
+  } finally { readBusy = false; }
 }
 
 // --------------------------------------------------------------------------- form + endpoints
@@ -498,13 +522,18 @@ async function viewFile(path, click) {
 const endpoints = new Map();
 
 function decorateModelOptions() {
-  // mark deployed models in the dropdown (● + their current global max) so the active ones stand out.
+  // mark deployed models in the dropdown: green ● = active (containers up now), ○ = deployed but
+  // idle (attachable, will cold-start), plain = not deployed. Green stays "running right now".
   for (const o of $("model").options) {
     const base = o.dataset.base || o.value; o.dataset.base = base;
     const ep = endpoints.get(o.value);
-    if (ep && ep.deployed) {
+    const cap = ep && ep.max_containers != null ? "  [max " + ep.max_containers + "]" : "";
+    if (ep && ep.active) {
       o.classList.add("active");
-      o.textContent = "● " + base + (ep.max_containers != null ? "  [max " + ep.max_containers + "]" : "");
+      o.textContent = "● " + base + cap;
+    } else if (ep && ep.deployed) {
+      o.classList.remove("active");
+      o.textContent = "○ " + base + cap;
     } else {
       o.classList.remove("active");
       o.textContent = base;
@@ -558,16 +587,29 @@ async function loadEndpoints() {
 
 function renderEndpoints(list) {
   const body = $("endpointsBody");
-  const nActive = list.filter((e) => e.deployed).length;
-  $("epCount").textContent = "(" + nActive + " deployed / " + list.length + ")";
+  // Three distinct states: active (containers up now) / deployed-but-idle / not deployed.
+  const nActive = list.filter((e) => e.active).length;
+  const nDeployed = list.filter((e) => e.deployed).length;
+  $("epCount").textContent = "(" + nActive + " active / " + nDeployed + " deployed / " + list.length + ")";
   body.innerHTML = "";
-  const sorted = [...list].sort((a, b) => (b.deployed ? 1 : 0) - (a.deployed ? 1 : 0)
-    || a.name.localeCompare(b.name));
+  const rank = (e) => (e.active ? 0 : e.deployed ? 1 : 2);  // active first, then idle, then not deployed
+  const sorted = [...list].sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
   for (const e of sorted) {
     const row = document.createElement("div");
-    row.className = "eprow" + (e.deployed ? " on" : "");
-    const cap = e.deployed ? ("max " + (e.max_containers != null ? e.max_containers : "?")
-      + (e.min_containers ? " · min " + e.min_containers : "")) : "not deployed";
+    row.className = "eprow" + (e.active ? " active" : e.deployed ? " deployed" : "");
+    const limits = "max " + (e.max_containers != null ? e.max_containers : "?")
+      + (e.min_containers ? " · min " + e.min_containers : "");
+    let cap, tip;
+    if (!e.deployed) {
+      cap = "not deployed"; tip = "not deployed (no Modal app)";
+    } else if (e.active) {
+      cap = (e.active_containers != null ? e.active_containers + " up · " : "") + limits;
+      tip = (e.active_containers || "?") + " container(s) serving now — warm, billing";
+    } else {
+      cap = "idle · " + limits;
+      tip = "deployed but scaled to zero — cold, no GPU cost until the first request";
+    }
+    row.title = tip;
     for (const [cls, txt] of [["dot", ""], ["nm", e.name], ["gp", e.gpu || ""],
                               ["cap", cap], ["repo", e.repo || ""]]) {
       const s = document.createElement("span"); s.className = cls; s.textContent = txt; row.appendChild(s);
@@ -590,19 +632,19 @@ function applyMode() {
   const dyn = $("mode").value === "dynamic";
   $("countWrap").style.display = dyn ? "none" : "";
   $("goalWrap").style.display = dyn ? "none" : "";
-  // timeout is explicit in BOTH modes: dynamic prefills its real default (21600s); naive states
-  // plainly that blank means no limit. The number stays editable either way.
+  // timeout is in fractional HOURS in BOTH modes (converted to seconds on submit): dynamic prefills
+  // its real default (6h); naive states plainly that blank means no limit. Editable either way.
   const to = $("timeout");
   if (dyn) {
-    $("timeoutLabel").textContent = "orchestrator timeout (s)";
-    to.placeholder = "default 21600 (6h)";
-    to.title = "Dynamic: max seconds the orchestrator may run. Blank = default 21600 (6h).";
-    if (!to.value) to.value = "21600";
+    $("timeoutLabel").textContent = "orchestrator timeout (hours)";
+    to.placeholder = "default 6";
+    to.title = "Dynamic: max hours the orchestrator may run (fractional ok, e.g. 0.5). Blank = default 6h.";
+    if (!to.value) to.value = "6";
   } else {
-    $("timeoutLabel").textContent = "timeout / agent (s)";
+    $("timeoutLabel").textContent = "timeout / agent (hours)";
     to.placeholder = "blank = no limit";
-    to.title = "Naive: max seconds EACH agent may run. Blank = no limit (runs until done or crash).";
-    if (to.value === "21600") to.value = "";
+    to.title = "Naive: max hours EACH agent may run (fractional ok, e.g. 0.5). Blank = no limit (runs until done or crash).";
+    if (to.value === "6") to.value = "";
   }
   $("spawnBtn").textContent = dyn ? "spawn dynamic swarm" : "spawn swarm";
   if (dyn) loadInjected(); else $("injectedPanel").style.display = "none";
@@ -670,7 +712,8 @@ $("spawn").addEventListener("submit", async (e) => {
     const body = {
       mode: $("mode").value, harness: $("harness").value, model: $("model").value.trim(),
       count: Number($("count").value) || 1, prompt: $("prompt").value,
-      goal: $("goal").checked, timeout: $("timeout").value || null,
+      goal: $("goal").checked,
+      timeout: $("timeout").value ? Number($("timeout").value) * 3600 : null,  // hours -> seconds
       effort: $("effort").value || null,
       max_instances: $("maxInst").value === "" ? null : Number($("maxInst").value),
       proxy_mode: $("proxyMode").value,
@@ -680,7 +723,7 @@ $("spawn").addEventListener("submit", async (e) => {
     });
     swarmId = data.swarm; mode = data.mode || "naive";
     history.replaceState(null, "", "?swarm=" + encodeURIComponent(swarmId));
-    selected = null; openFile = null; expanded.clear(); traces.clear(); runIds.clear();
+    selected = null; openFile = null; expanded.clear(); traces.clear(); runIds.clear(); lastFilesAt = 0;
     $("tree").innerHTML = ""; $("dtrace").innerHTML = '<div class="empty">select an agent…</div>';
     $("dtitle").textContent = "no agent selected"; $("dstate").textContent = "";
     setError(""); refresh();
@@ -776,6 +819,13 @@ function renderInto(el, path, text) {
   } else {
     el.innerHTML = '<pre class="raw">' + esc(text || "(empty)") + "</pre>";
   }
+}
+function openFullscreenLoading(path) {
+  fsPathCur = path;
+  $("fsPath").textContent = path;
+  $("fsBody").innerHTML = '<div class="loading"><span class="spinner"></span> reading '
+    + esc((path || "").split("/").pop()) + ' …</div>';
+  $("fsModal").style.display = "flex";
 }
 function openFullscreen(path, text) {
   fsPathCur = path;

@@ -139,8 +139,16 @@ The GLM NVFP4 entry hit the **identical** capture OOM when `mem-fraction-static`
 | deepseek-v4-flash-abliterated | — | **H200:2** | 256k |
 | glm-5.3-flash-uncensored (FP8) | — | **B300:2** | 256k |
 | glm-5.3-abliterated (NVFP4) | — | **B300:2** | 256k |
+| glm-5.3-uncensored (FP8, full 753B) | 703.7 GiB | **B300:4** | 256k |
 | deepseek-v4.1-flash-uncensored (FP8) | 475 GiB | **B300:4** | 256k |
-| deepseek-v4.1-flash-abliterated (GGUF) | 235.8 GiB in-mem | **H200:2** | 32k (server KV) |
+| deepseek-v4.1-flash-abliterated (GGUF, 3.36 bpw) | 235.8 GiB in-mem | **H200:2** | 131k |
+| deepseek-v4.1-flash-huihui (GGUF, 1-bit IQ1) | 233.2 GiB in-mem | **H200:2** | 131k (quality-limited) |
+
+> Measured on bring-up: the full **GLM-5.3 FP8 (753B `glm_moe_dsa`)** loads **175.9 GiB/GPU on B300:4**
+> (≈66% of usable), leaving **~89.6 GiB/GPU** for KV + capture; SGLang auto-resolves
+> `moe_runner_backend=flashinfer_trtllm` (the right Blackwell FP8 MoE kernel — do **not** pin it), cuda
+> graphs capture fine at `mem-fraction-static=0.85`, and because the arch is DSA (sparse attention) the
+> KV pool holds **~1M tokens**, so 256k is trivially in budget.
 
 **Other sizing knobs:**
 
@@ -241,6 +249,51 @@ ones you want to keep into `tests/e2e/`). Run against the new model name.
       (not just "min=0"). A force-killed sandbox can leave a stale record — confirm the GPU is gone.
 - [ ] Secrets stayed out of git: `.env`, `proxies.csv` are gitignored; nothing residential-proxy was
       written to `/shared`; subagents never used real keys or touched the user's real `~/.claude`/`~/.codex`.
+
+---
+
+## Logbook: per-model breakages discovered
+
+Newest first. Add to this when a bring-up teaches you something (see the note at the top).
+
+**GGUF / llama.cpp path (both `deepseek-v4.1-flash-*-gguf` entries) — 2026-10:**
+
+- **`--jinja` is mandatory for tool calling, and is now auto-injected in `llamacpp.py:launch_argv`.**
+  llama-server only renders the request's `tools` into the prompt (via the GGUF chat template) and
+  parses tool-calls back into structured `tool_calls` when `--jinja` is set. Without it, the model
+  free-forms its native tool-call markup (DeepSeek-V4.1's `<｜DSML｜…｜>` tokens) as **plain assistant
+  text**, the harness sees no tool call, and the agent stalls on turn 1. Reasoning (`<think>`) is
+  extracted regardless, so the **smoke completion passes but every agent run fails** — a confusing
+  split. If you add a new GGUF family and tool calls come back as text, this is why.
+- **Pin GGUF `context_window` well above the harness's base cost, not to a token-minimal server `-c`.**
+  The first GGUF entries used `-c 32768`; Claude Code's system prompt + tool/skill defs nearly fill
+  32k on their own, so the harness hit **premature auto-compaction**, and the model then misread the
+  injected compaction summary as a "write a conversation summary" task and derailed. Raising both GGUF
+  entries to **131072** fixed it (orcarouter 3.36 bpw then PASSed the full claude e2e). It fits because
+  DeepSeek-V4.1-Flash is **MLA** (a tiny compressed KV): ~9 GiB at 131072 vs H200:2's ~46 GiB headroom.
+- **codex is not usable on the `deepseek41` GGUF yet; claude is.** The unmerged llama.cpp PR #30817
+  emits **invalid tool-call-argument JSON** for this arch (duplicate `workdir` fields, runaway
+  single-line output) that codex's strict parser rejects → reconnect loop → context exhaustion. claude
+  tolerates/recovers from the occasional malformed arg; codex does not. Treat `deepseek41` GGUF as
+  **claude-first** until the PR merges with a proper args grammar.
+- **1-bit (IQ1) dynamic quants are below the agentic quality floor.** `huihui UD-IQ1_M` serves,
+  generates, and (post-`--jinja`) parses tool calls correctly, but it **narrates steps without calling
+  the tool** or **repetition-collapses** mid-task. Fine for a smoke/generation check; not for agent
+  work. Prefer a ≥3–4 bpw quant (e.g. orcarouter `Mix-256G`, 3.36 bpw) when a GGUF must drive a harness.
+
+**SGLang path:**
+
+- **GLM-5.3 FP8 (full 753B `glm_moe_dsa`) on B300:4 is comfortable and self-tunes.** See the sizing
+  callout in §2: 175.9 GiB/GPU weights, flashinfer_trtllm auto-selected, ~1M-token KV pool. codex
+  PASSes clean; claude completes all deliverables (occasional single truncated-tool-arg friction, but
+  recovers — a model hiccup, not a pipeline bug).
+
+**Windows tooling (bring-up/monitoring):**
+
+- `modal app logs <app>` **crashes** on the Windows console codec (`'charmap' codec can't encode …`)
+  because engine logs contain non-ASCII. Prefix every invocation with `PYTHONUTF8=1
+  PYTHONIOENCODING=utf-8`. (It is also a snapshot, not a reliable follow — use the harness's own
+  `wait_ready`/`READY` line as the readiness signal and `modal app logs` for a point-in-time look.)
 
 ---
 

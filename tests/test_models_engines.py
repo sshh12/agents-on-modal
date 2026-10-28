@@ -135,6 +135,10 @@ def test_llamacpp_launch_argv_picks_first_shard(tmp_path):
     assert flag("--port") == "8001"
     assert flag("--n-gpu-layers") == "99"
     assert flag("--ctx-size") == "131072"
+    # --jinja must always be injected: it is what turns on llama-server tool calling (rendering the
+    # request's `tools` via the GGUF chat template and parsing tool_calls back out). Without it an
+    # agent harness sees the model's raw tool-call markup as text and stalls on turn 1.
+    assert "--jinja" in argv
     # llama.cpp needs space-separated values, so "--parallel=4" is split into two tokens
     assert "--parallel=4" not in argv
     assert flag("--parallel") == "4"

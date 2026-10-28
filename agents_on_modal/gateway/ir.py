@@ -324,6 +324,46 @@ def to_chat_messages(system: str, messages: list[Message]) -> list[dict[str, Any
     return out
 
 
+#: Placeholder that replaces an image block when the served model is text-only (``vision: false``).
+IMAGE_OMITTED = "[image omitted: this model is text-only]"
+
+
+def drop_images_for_text_model(messages: list[dict[str, Any]]) -> int:
+    """Replace image blocks with a text placeholder in already-rendered chat ``messages`` (in place).
+
+    A text-only model (``vision: false``) cannot accept image content. The harnesses still put image
+    blocks in a request -- a pasted screenshot, a browser tool result, or, most insidiously, an older
+    turn that auto-compaction folds back in -- and the engine then rejects the *whole* request
+    (``content should be a valid string`` / ``validate_thinking_parts_role``), killing the run deep
+    into a long context (issue S1). Stripping them here, at the gateway right before the engine, fixes
+    it regardless of how the image got into the history. Idempotent (a second pass is a no-op, since
+    the content is a plain string by then). Returns how many messages had an image replaced.
+    """
+
+    changed = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        if not any(isinstance(b, dict) and b.get("type") in ("image", "image_url") for b in content):
+            continue
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") in ("image", "image_url"):
+                parts.append(IMAGE_OMITTED)
+            elif isinstance(block, dict):
+                text = block.get("text")
+                if text:
+                    parts.append(str(text))
+            elif block:
+                parts.append(str(block))
+        msg["content"] = "\n".join(p for p in parts if p) or IMAGE_OMITTED
+        changed += 1
+    return changed
+
+
 def estimate_tokens(text: str) -> int:
     """A cheap, deterministic prompt-size estimate (~4 chars/token) for ``max_tokens`` clamping."""
 

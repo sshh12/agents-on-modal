@@ -198,6 +198,7 @@ def _endpoint_status(model) -> dict:
 
     info = {"name": model.name, "repo": model.repo, "gpu": model.gpu,
             "context_window": model.context_window, "deployed": False,
+            "active": False, "active_containers": None,
             "max_containers": None, "min_containers": None}
     try:
         st = models.status(model)
@@ -209,6 +210,11 @@ def _endpoint_status(model) -> dict:
             info["deployed"] = True
             info["max_containers"] = asg.get("max_containers")
             info["min_containers"] = asg.get("min_containers")
+            # Deployed != running. Query the live container count so the UI can tell a cold,
+            # scaled-to-zero app (no GPU cost) apart from one that's actually serving (warm, billing).
+            n = models.active_containers(model)
+            info["active_containers"] = n
+            info["active"] = bool(n)  # n >= 1 -> containers are up right now
     except Exception as error:  # noqa: BLE001 - not deployed / unreachable
         info["error"] = f"{type(error).__name__}: {error}"
     return info
@@ -325,12 +331,22 @@ def _files_payload(swarm_id: str, path: str) -> dict:
     return {"paths": sorted(paths)}
 
 
-def _file_payload(swarm_id: str, path: str) -> dict:
+def _file_payload(swarm_id: str, path: str, offset: int = 0) -> dict:
+    """One shared file, as a byte-offset window so a large file can be paged instead of silently cut
+    mid-content (issue S7). ``offset`` is a byte offset; the reply carries ``size``/``next_offset``/
+    ``eof`` so a client can fetch the rest and reassemble. ``truncated`` is kept for back-compat
+    (true when the whole file exceeds one window)."""
+
     swarm = Swarm(id=swarm_id, model="", shared_volume=f"aom-shared-{swarm_id}")
     data = swarm.read_shared(path)
-    truncated = len(data) > MAX_FILE_BYTES
-    text = data[:MAX_FILE_BYTES].decode("utf-8", "replace")
-    return {"path": path, "text": text, "truncated": truncated}
+    total = len(data)
+    offset = max(0, min(offset, total))
+    chunk = data[offset:offset + MAX_FILE_BYTES]
+    next_offset = offset + len(chunk)
+    text = chunk.decode("utf-8", "replace")
+    return {"path": path, "text": text, "size": total, "offset": offset,
+            "next_offset": next_offset, "eof": next_offset >= total,
+            "truncated": total > MAX_FILE_BYTES}
 
 
 def _presets_payload() -> dict:
@@ -476,7 +492,8 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/files":
                 self._send_json(_files_payload(one("swarm", os.environ.get("AOM_SWARM", "")), one("path", "/")))
             elif parsed.path == "/api/file":
-                self._send_json(_file_payload(one("swarm", os.environ.get("AOM_SWARM", "")), one("path")))
+                self._send_json(_file_payload(one("swarm", os.environ.get("AOM_SWARM", "")),
+                                              one("path"), int(one("offset", "0") or 0)))
             elif parsed.path == "/api/injected":
                 self._send_json(_injected_payload(one("harness"), one("model")))
             elif parsed.path == "/api/models":

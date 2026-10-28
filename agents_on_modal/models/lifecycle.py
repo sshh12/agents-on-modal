@@ -259,6 +259,31 @@ def wait_ready(endpoint: "Endpoint", *, timeout: float = 1800) -> None:
     raise AomError(f"{health_url} did not become ready within {timeout:g}s (last: {last}).")
 
 
+def active_containers(model: "Model") -> int | None:
+    """Point-in-time count of containers currently serving this model's endpoint.
+
+    This is the *active* signal, distinct from *deployed*: a deployed app that is scaled to zero
+    returns ``0`` (cold -- no GPU cost until the first request), while ``>= 1`` means live containers
+    are up (warm, billing). Returns ``None`` when the app isn't deployed/reachable, or if Modal's
+    experimental listing API is unavailable -- callers then fall back to the deployed-only view.
+    """
+
+    import modal
+
+    try:
+        workspace = _workspace_slug()
+        app_name = deployed_app_name(model, workspace)
+        server = modal.Server.from_name(app_name, "Server")
+        # ``_experimental_list_containers`` returns the containers registered to serve requests right
+        # now; its length is the live replica count. It's experimental, so guard against it vanishing.
+        lister = getattr(server, "_experimental_list_containers", None)
+        if lister is None:
+            return None
+        return len(lister())
+    except Exception:  # noqa: BLE001 - not deployed / unreachable / experimental API drift
+        return None
+
+
 def scale(model: "Model", **settings: Any) -> None:
     """Update the server's autoscaler live (no redeploy), e.g. ``scale(m, min_containers=4)``."""
 
