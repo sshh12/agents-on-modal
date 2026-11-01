@@ -4,8 +4,8 @@ Run agent coding CLIs — **Claude Code**, **Codex**, and more to come — insid
 choice, against **open-weight models you serve on [Modal](https://modal.com)** GPUs. Three
 independent axes you mix freely:
 
-- **model** — any entry in the catalog (Qwen3, GPT-OSS, DeepSeek-V4, GLM-5.3, …), served by SGLang or
-  llama.cpp on a Modal GPU that scales to zero when idle.
+- **model** — any entry in the **[model catalog](agents_on_modal/catalog.json)** (Qwen3, GPT-OSS,
+  DeepSeek-V4, GLM-5.3, …), served by SGLang or llama.cpp on a Modal GPU that scales to zero when idle.
 - **harness** — the agent CLI: `claude` (Claude Code) or `codex` (Codex CLI).
 - **sandbox** — where the harness runs: `local` (directly on your machine, no container), `docker`
   (a throwaway local container with full internet but no access to your LAN or host), or `modal`
@@ -40,17 +40,24 @@ Requires Python 3.10+ and a Modal account. For the `docker` sandbox you also nee
 
 ## Choose and deploy a model
 
+Every servable model is one entry in **[`agents_on_modal/catalog.json`](agents_on_modal/catalog.json)**
+— browse it for the names, GPUs, context windows and engine settings; each entry's `description` is
+its sizing logbook (why that GPU, what failed). `aom models list` prints the same catalog.
+
 ```sh
 aom models list
 aom models deploy qwen3.8-27b --max 1             # --max: GPU container cap (a redeploy restarts it)
 aom models scale qwen3.8-27b --min 2 --max 32     # live, no redeploy — for a fan-out
 ```
 
-Adding a model is one entry in `agents_on_modal/catalog.json` (repo, engine, GPU, parsers, context,
-and the per-model reasoning-effort map), not new code.
+Adding a model is one entry in the [catalog](agents_on_modal/catalog.json) (repo, engine, GPU,
+parsers, context, and the per-model reasoning-effort map), not new code. Follow
+**[`docs/ADDING_A_MODEL.md`](docs/ADDING_A_MODEL.md)**: the sizing rules, the bring-up and
+pressure-test checklist, and the recurring gotchas every new model has hit so far.
 
-The container cap isn't in the catalog. The apps using an endpoint choose it: every command and
-example asks for 1 by default (`--max-containers N` to ask for more). The first app to need the model
+The container cap isn't in the [catalog](agents_on_modal/catalog.json). The apps using an endpoint
+choose it: every command and example asks for 1 by default (`--max-containers N` to ask for more).
+The first app to need the model
 deploys it at that cap. Later ones attach to it as-is and only ever raise the cap, so they never
 restart it under a session or swarm already using it. Only `aom models scale --max` lowers it. The
 cap is a ceiling, not a reservation: Modal adds a container only when one is saturated past the
@@ -103,8 +110,9 @@ re-launches on the repo `.venv` (creating it and `pip install -e .`-ing on first
 Modal login / `aom setup` if they haven't been done, so any `python` on your PATH works. A spawn
 asks for a cap of 1 like every other app. To give a second, parallel swarm its own GPU once the first
 one saturates the endpoint, raise the model's max instances live in the dashboard's model endpoints
-panel; that's also where you lower it again. To roll out a catalog change to a deployed model, run
-`aom models deploy <name> --max N`, which does replace its running containers.
+panel; that's also where you lower it again. To roll out a [catalog](agents_on_modal/catalog.json)
+change to a deployed model, run `aom models deploy <name> --max N`, which does replace its running
+containers.
 
 An impossible `/goal` keeps running (auto-compacting) until the timeout, then you read whatever the
 agents left in `/shared`.
