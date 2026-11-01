@@ -715,3 +715,32 @@ def test_plan_warns_when_agents_are_told_to_append_to_a_shared_file():
         {"prompt": "write /shared/board/<id>.md"}]}]})
     assert not errors
     assert len(warnings) == 1 and "(2 agents)" in warnings[0] and "last writer wins" in warnings[0]
+
+
+def test_controller_delivers_acks_before_spawning_the_wave(tmp_path):
+    # The ack used to reach the orchestrator only after the whole wave spawned (84.6 s of 90 s).
+    order: list[str] = []
+
+    class Boxes(FakeSandboxes):
+        def create(self, name, **opts):
+            order.append("spawn")
+            return super().create(name, **opts)
+
+    sb = Boxes()
+    orch = sb.create("modal")
+    order.clear()
+    orch.reload_volumes = lambda: order.append("reload")
+    control = LocalDirControlPlane(str(tmp_path))
+    c = Controller(control, "sw", FakeEndpoint(), "aom-shared-sw", "claude",
+                   orchestrator_id=orch.id, orchestrator_run_id="r", sandboxes=sb)
+    _submit(control, {"name": "wf", "stages": [{"name": "w", "agents": [{"prompt": "a"}, {"prompt": "b"}]}]})
+    c.tick()
+    assert order[0] == "reload" and order.count("spawn") == 2
+
+
+def test_cli_status_reports_an_unreadable_workflow_instead_of_dropping_it(tmp_path, monkeypatch):
+    swarm_dir = tmp_path / "_swarm"
+    (swarm_dir / "workflows").mkdir(parents=True)
+    (swarm_dir / "workflows" / "wf.json").write_text("{ half-written", encoding="utf-8")
+    code, text = _run_cli(["status", "--json"], swarm_dir, monkeypatch)
+    assert '"unreadable"' in text

@@ -154,7 +154,12 @@ def _load_workflows(control, only: str | None) -> list[dict]:
         if not name.endswith(".json"):
             continue
         wf = control.get_json(f"workflows/{name}")
-        if wf and (only is None or wf.get("name") == only):
+        if not wf:
+            # Caught mid-update (the volume syncs files in place): report it instead of silently
+            # dropping it -- a vanished workflow made `status` print [] and watch loops exit early,
+            # and `wait --all` must not count it as done.
+            wf = {"name": name[: -len(".json")], "status": "unreadable", "stages": []}
+        if only is None or wf.get("name") == only:
             out.append(wf)
     return out
 

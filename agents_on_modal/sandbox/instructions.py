@@ -148,7 +148,10 @@ def build_instructions(
     if shared_dir:
         lines.append(
             f"- Shared workspace (the user and sibling agents see it): "
-            f"`{shared_dir}`. Coordinate through it. Your cwd is `{workdir}`."
+            f"`{shared_dir}`. Coordinate through it. Your cwd is `{workdir}`. After `cd "
+            f"{shared_dir}`, `pwd` may print a `/__modal/volumes/...` path: it is the same "
+            f"directory; always write paths for others as `{shared_dir}/...`. Others' new files "
+            "can take a minute or two to appear."
         )
         lines.append(
             "- Never append to or edit a shared file other agents also write: concurrent writers to "

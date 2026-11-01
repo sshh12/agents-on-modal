@@ -38,7 +38,12 @@ Work autonomously; never stop to ask for confirmation.
   impossible, keep working until the deadline rather than falsely completing.
 - **Completion audit before `complete`.** Map every requirement in `GOAL.md` to
   concrete evidence (a passing check, a file that exists, a command's output).
-  If you cannot point to evidence for a requirement, it is not done.
+  If you cannot point to evidence for a requirement, it is not done. Make an
+  audit script print `PASS`/`FAIL` with the requirement name for every check
+  (not a silent `set -e` chain of `grep -q`/`test`), so a failure says which.
+- **Own files are the record.** Once your deliverables are written, do not
+  re-verify or re-write files other agents also write; never loop or run a
+  background watcher to "keep" a shared file correct.
 - **No silent scope changes.** If a constraint blocks progress, record it in
   `PROGRESS.md` and route around it; do not quietly drop it.
 - An outer supervisor re-runs the check itself before trusting `complete`, so a

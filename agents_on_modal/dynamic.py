@@ -644,6 +644,7 @@ class Controller:
             )
             self._wrote_meta = True
 
+        acked = False
         for name in self.control.listdir(f"{RESERVED}/requests"):
             if not name.endswith(".json"):
                 continue
@@ -660,6 +661,12 @@ class Controller:
             if isinstance(request, dict):
                 self._claim(reqid, request.get("verb"))
                 self._handle_request(reqid, request)
+                acked = True
+
+        if acked:
+            # Deliver acks NOW, before this tick spawns a wave: reloading only at the end of the
+            # tick put a 100-agent spawn between the ack and its delivery (84.6 s of a 90 s wait).
+            self._reload_orchestrator(force=True)
 
         for wf in list(self._workflows.values()):
             self._advance(wf)
@@ -900,8 +907,10 @@ class Controller:
             return
         self._append_events(ar.id, ar.run, envelopes)
 
-    def _reload_orchestrator(self) -> None:
-        if not self.orchestrator_id or time.time() - self._orch_reloaded < ORCHESTRATOR_RELOAD_INTERVAL:
+    def _reload_orchestrator(self, *, force: bool = False) -> None:
+        if not self.orchestrator_id:
+            return
+        if not force and time.time() - self._orch_reloaded < ORCHESTRATOR_RELOAD_INTERVAL:
             return
         self._orch_reloaded = time.time()
         try:
