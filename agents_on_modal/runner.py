@@ -43,6 +43,10 @@ from .harness.base import GoalState, Harness, HarnessSetup
 #: States that mean the run is over (mirrors ``sandbox.base.TERMINAL_STATES``).
 TERMINAL_STATES = ("done", "timeout", "failed", "cancelled")
 
+#: A goal run whose agent recorded ``.goal/STATUS`` complete and then printed nothing for this long
+#: (seconds) is finished: what is still running is leftovers (a background loop it started).
+GOAL_DONE_QUIET = float(os.environ.get("AOM_RUNNER_GOAL_DONE_QUIET", "120"))
+
 #: Env var carrying the run's hard deadline (epoch seconds) to the harness and its tools.
 DEADLINE_ENV = "AOM_RUN_DEADLINE"
 
@@ -251,7 +255,7 @@ def _install_signal_handlers() -> None:
 # --------------------------------------------------------------------------------------------------
 def _run_subprocess(
     cmd: list[str], env: dict[str, str], cwd: str, sink: TraceSink,
-    deadline: float | None, cancel_path: Path,
+    deadline: float | None, cancel_path: Path, goal: bool = False,
 ) -> tuple[int, str | None, list[dict[str, Any]]]:
     """Launch ``cmd``, tee stdout+stderr into the trace, and watch for deadline/cancel.
 
@@ -309,6 +313,11 @@ def _run_subprocess(
             reason = "cancelled"
             break
         silent = now - last_output[0]
+        if goal and silent >= GOAL_DONE_QUIET and _declared_complete(cwd):
+            # Done and gone quiet, but still running: a background loop the agent left behind
+            # (one sat in its own "watchdog" for 470 s) keeps the harness alive. End it.
+            reason = "goal-complete"
+            break
         if silent >= HEARTBEAT_INTERVAL and now - last_beat >= HEARTBEAT_INTERVAL:
             sink.emit_runner({"event": "heartbeat", "silent_s": int(silent)})
             last_beat = now
@@ -465,7 +474,7 @@ def _drive(spec: dict[str, Any], harness: Harness, setup: HarnessSetup,
         # while an impossible one (new actions each turn) runs until the deadline.
         progress_before = _distinct_actions(all_events)
         try:
-            exit_code, reason, envelopes = _run_subprocess(cmd, env, cwd, sink, deadline, cancel_path)
+            exit_code, reason, envelopes = _run_subprocess(cmd, env, cwd, sink, deadline, cancel_path, goal)
         except _SpawnError as exc:
             status.set(state="failed", error=f"could not start harness: {exc}", exit_code=None)
             sink.emit_runner({"event": "done", "state": "failed", "error": str(exc)})
@@ -491,6 +500,12 @@ def _drive(spec: dict[str, Any], harness: Harness, setup: HarnessSetup,
         # The child was killed by us -> terminal immediately.
         if reason == "timeout":
             _finish_at_deadline(goal, cwd, status, sink, goal_state, session_id)
+            return 0
+        if reason == "goal-complete":
+            status.set(state="done", goal_state="complete")
+            sink.emit_runner({"event": "done", "state": "done", "goal_state": "complete",
+                              "reason": "goal recorded complete in .goal/STATUS and the agent went "
+                                        "quiet; ended its leftover processes"})
             return 0
         if reason == "cancelled":
             status.set(state="cancelled")

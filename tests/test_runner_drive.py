@@ -429,3 +429,17 @@ def test_the_harness_and_goal_file_know_the_deadline(tmp_path, monkeypatch):
     runner.main([str(run_dir)])
     seen = [e.get("text", "") for e in _read_envelopes(run_dir) if e.get("src") == "harness"]
     assert any(f"DL={int(deadline)}" in line for line in seen)
+
+
+def test_a_completed_goal_that_lingers_quietly_is_ended(tmp_path, monkeypatch):
+    # The agent wrote STATUS=complete, then a background loop kept its harness alive, silent.
+    monkeypatch.setattr(runner, "GOAL_DONE_QUIET", 0.5)
+    run_dir = tmp_path / "run-linger"
+    lingers = ("import pathlib, time; pathlib.Path('.goal/STATUS').write_text('complete'); time.sleep(30)")
+    _install(monkeypatch, FakeHarness(script=lingers, goal_active_calls=99))
+    _write_spec(run_dir, goal=True, deadline=time.time() + 60)
+    start = time.time()
+    runner.main([str(run_dir)])
+    assert time.time() - start < 15  # ended long before the 30 s sleep or the 60 s deadline
+    status = _read_status(run_dir)
+    assert status["state"] == "done" and status["goal_state"] == "complete"

@@ -409,6 +409,10 @@ class ModalSandbox(Sandbox):
         """
 
         self._sb.reload_volumes()
+        if self._shared:
+            # The reload can hand /shared back root-owned, so the agent briefly got EACCES on mkdir
+            # under it (seen in a 100-agent run); re-open it, as at create time.
+            self._prepare_shared()
 
     def stop(self) -> None:
         """Terminate the sandbox and delete its run-scoped proxy token (idempotent)."""

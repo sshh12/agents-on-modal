@@ -33,6 +33,12 @@ Prefer snapshots over screenshots. `browser_take_screenshot` is configured to
 omit the image for non-vision models and just save a file; only use it when a
 pixel-level view is required.
 
+Files: the MCP server saves its output (a navigate's page snapshot shows up as
+a `[Snapshot](…/tmp/playwright-mcp/page-….yml)` link) under
+`/tmp/playwright-mcp/`, and only accepts filenames there — read that file, or
+call `browser_snapshot` to get the tree inline. To pull plain page text,
+`browser_evaluate` with `() => document.body.innerText` works well.
+
 ## Fallback: the `agent-browser` CLI (for shell-driven work)
 
 Keep one named session and avoid close/reopen churn (reopening right after a

@@ -61,10 +61,13 @@ TERMINAL_STATES = ("done", "timeout", "failed", "cancelled")
 #: acks, workflow state, the orchestrator's trace tail.
 CONTROLLER_CONCURRENCY = 16
 
-#: How often (seconds) the controller reloads each live subagent's ``/shared`` mount so it sees what
-#: the others wrote. A Modal sandbox's volume mount never shows outside writes until reloaded. The
-#: orchestrator is reloaded every tick instead: its acks and workflow state live there.
-SUBAGENT_RELOAD_INTERVAL = 30.0
+#: How often (seconds) the controller reloads a sandbox's ``/shared`` mount so it sees what others
+#: wrote (a Modal sandbox's volume mount never shows outside writes until reloaded). The
+#: orchestrator needs it most -- its acks and workflow state live there -- so it is reloaded far
+#: more often. A reload briefly disturbs file access in the sandbox, so subagents, who mostly write
+#: their own files, get it rarely.
+ORCHESTRATOR_RELOAD_INTERVAL = 10.0
+SUBAGENT_RELOAD_INTERVAL = 120.0
 
 
 class PlanError(AomError):
@@ -138,6 +141,11 @@ class Plan:
         return plan
 
 
+#: "append ... to /shared/board.md": in a 100-agent run the task text won over the instructions, and
+#: 62 agents' lines were lost. Flagged at submit time (a warning; the plan still runs).
+_SHARED_APPEND = re.compile(r"\bappend\b[^\n]{0,80}?/shared/(?!_swarm/)[\w./-]+\.\w+", re.I)
+
+
 def _parse_agent(
     data: Any, where: str, errors: list[str], warnings: list[str], default_timeout: float
 ) -> AgentSpec | None:
@@ -179,6 +187,12 @@ def _parse_agent(
         errors.append(f"{where}: 'schema' must be a JSON object (inline, or a path to a JSON file "
                       "that `aom-swarm submit` can read)")
         schema = None
+
+    if _SHARED_APPEND.search(prompt):
+        warnings.append(
+            f"{where}: the prompt has agents append to a shared /shared file -- concurrent writers "
+            "overwrite each other (last writer wins); give each agent its own file and merge them"
+        )
 
     harness = data.get("harness")
     if harness is not None and harness not in HARNESSES:
@@ -590,6 +604,7 @@ class Controller:
         # to the volume too and survives teardown).
         self._orch_run: Any = None
         self._orch_box: Any = None
+        self._orch_reloaded = 0.0
         self._orch_offset = 0
         #: Orchestrator harness session id, discovered from its trace and published to meta.json so a
         #: resume does not have to scrape the trace (issue S9) -- also what resume_orchestrator reads.
@@ -650,7 +665,7 @@ class Controller:
             self._advance(wf)
             self._publish_workflow(wf)
 
-        self._reload_orchestrator()  # so its `aom-swarm` sees the acks + state just written
+        self._reload_orchestrator()  # so its `aom-swarm` sees the acks + state written (throttled)
         self._tail_orchestrator()
         self._supervise_orchestrator()
 
@@ -886,8 +901,9 @@ class Controller:
         self._append_events(ar.id, ar.run, envelopes)
 
     def _reload_orchestrator(self) -> None:
-        if not self.orchestrator_id:
+        if not self.orchestrator_id or time.time() - self._orch_reloaded < ORCHESTRATOR_RELOAD_INTERVAL:
             return
+        self._orch_reloaded = time.time()
         try:
             if self._orch_box is None:
                 self._orch_box = self._sb.get("modal", self.orchestrator_id)

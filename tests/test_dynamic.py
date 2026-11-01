@@ -705,3 +705,13 @@ def test_cli_wait_blocks_under_the_shell_timeout_and_reports_progress(tmp_path, 
     cp.put_json("agents/a2.json", {"id": "a2", "workflow": "wf", "state": "running"})
     code, text = _run_cli(["wait", "--timeout", "0"], swarm_dir, monkeypatch)
     assert code == 2 and "1/2 agents finished" in text and "run `aom-swarm wait` again" in text
+
+
+def test_plan_warns_when_agents_are_told_to_append_to_a_shared_file():
+    # The task text beat the instructions: 62 of 100 agents' board lines were lost.
+    _, errors, warnings = parse_plan({"stages": [{"agents": [
+        {"prompt": "Append one line to /shared/board.md with your result"},
+        {"prompt": "Append one line to /shared/board.md with your result"},
+        {"prompt": "write /shared/board/<id>.md"}]}]})
+    assert not errors
+    assert len(warnings) == 1 and "(2 agents)" in warnings[0] and "last writer wins" in warnings[0]
