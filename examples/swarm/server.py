@@ -11,7 +11,11 @@ Two modes:
     ``aom-swarm`` CLI; a local :class:`~agents_on_modal.dynamic.Controller` (started here in a
     thread) executes its plans against Modal and publishes state to ``/shared/_swarm``.
 
-    AOM_SWARM=swarm-20261025-abc123 python examples/swarm/server.py   # then open :8787
+    python examples/swarm/server.py                       # any python; opens the dashboard
+    python examples/swarm/server.py --swarm swarm-...     # reopen a specific swarm
+
+Setup is automatic (see ``bootstrap.py``): it loads the repo ``.env``, re-launches on the repo
+``.venv`` (creating it on first run), and runs the Modal login / proxy-token mint if missing.
 
 Endpoints
 ---------
@@ -24,22 +28,30 @@ Endpoints
     GET  /api/injected?harness=&model=          -> {text}                   (orchestrator context)
     GET  /api/models                            -> {models:[{name,description,gpu,context_window}]}
     GET  /api/presets                           -> {presets:[{name,label,mode,prompt?,locked}]}
-    POST /api/spawn  {mode,harness,model,...}   -> {swarm, mode}            (launches; hits Modal)
+    POST /api/spawn  {mode,harness,model,max_instances?,...} -> {swarm, mode}  (launches; hits Modal)
+    POST /api/scale  {model,max_instances}      -> {model, max_containers}  (live endpoint cap)
 """
 
 from __future__ import annotations
 
+import argparse
 import concurrent.futures
 import json
 import os
 import re
 import sys
 import threading
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+import bootstrap  # noqa: E402 - stdlib-only local module beside this file
+
+if __name__ == "__main__":
+    bootstrap.prepare()  # .env, interpreter/.venv, Modal login -- must precede the aom imports below
 
 from agents_on_modal import models, sandbox  # noqa: E402
 from agents_on_modal.config import AomError  # noqa: E402
@@ -62,6 +74,11 @@ PORT = int(os.environ.get("AOM_DASHBOARD_PORT", "8787"))
 TERMINAL = ("done", "timeout", "failed", "cancelled", "stopped")
 #: The orchestrator must outlive the whole run; default its cap generously if the form omits one.
 DYNAMIC_ORCHESTRATOR_TIMEOUT = 6 * 3600
+#: The model-endpoint GPU container cap a spawn asks for (``max_instances`` in the spawn body
+#: overrides it). The first spawn deploys the endpoint at it; on a live endpoint it only ever
+#: raises the cap (models.ensure_deployed), so bumping a busy endpoint to 2 for a second, parallel
+#: swarm is the endpoints panel's "set" (POST /api/scale), which can also lower it.
+SPAWN_MAX_INSTANCES = 1
 MAX_FILE_BYTES = 200_000
 #: Residential proxy pool: a gitignored ``proxies.csv`` beside this file, one proxy URL per line.
 #: When a spawn sets ``use_proxies``, swarm agents egress browser/web traffic through one of these
@@ -199,7 +216,8 @@ def _endpoint_status(model) -> dict:
     info = {"name": model.name, "repo": model.repo, "gpu": model.gpu,
             "context_window": model.context_window, "deployed": False,
             "active": False, "active_containers": None,
-            "max_containers": None, "min_containers": None}
+            "max_containers": None, "min_containers": None,
+            "spawn_max_instances": SPAWN_MAX_INSTANCES}  # the cap a spawn asks for
     try:
         st = models.status(model)
         info["url"] = st.get("url")
@@ -229,6 +247,16 @@ def _endpoints_payload() -> dict:
     return {"endpoints": out}
 
 
+def _max_instances(raw) -> int:
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        raise AomError(f"invalid max_instances: {raw!r}") from None
+    if n < 1:
+        raise AomError(f"max_instances must be >= 1, got {n}.")
+    return n
+
+
 def _scale(body: dict) -> dict:
     """Set a model endpoint's global ``max_containers`` live (shared by all swarms on that model)."""
 
@@ -238,10 +266,7 @@ def _scale(body: dict) -> dict:
     raw = body.get("max_instances")
     if raw in (None, "", "unbounded"):
         raise AomError("scale requires a positive integer max_instances.")
-    try:
-        n = max(1, int(raw))
-    except (TypeError, ValueError):
-        raise AomError(f"invalid max_instances: {raw!r}") from None
+    n = _max_instances(raw)
     models.scale(models.get(model), max_containers=n)
     return {"model": model, "max_containers": n}
 
@@ -369,30 +394,9 @@ def _injected_payload(harness: str, model: str) -> dict:
     if m is None:
         return {"text": "", "model": "", "harness": harness or "claude"}
     text = build_orchestrator_instructions(
-        default_timeout=DEFAULT_TIMEOUT, model_name=m.name, allowed_efforts=_model_efforts(m)
+        default_timeout=DEFAULT_TIMEOUT, allowed_efforts=_model_efforts(m)
     )
     return {"text": text, "model": m.name, "harness": harness or "claude"}
-
-
-def _apply_max_instances(model_name: str, max_instances) -> None:
-    """Apply the dashboard's max-instances cap to the (shared) endpoint's live autoscaler.
-
-    ``1`` (the default) caps the endpoint at one GPU container so it throttles gracefully instead of
-    fanning out GPUs; ``0`` / ``None`` / blank means "unbounded" -- leave the endpoint at its catalog
-    autoscaler policy. Best-effort: the model is a shared account-level resource and a spawn must not
-    fail just because the live autoscaler update hiccuped.
-    """
-
-    if max_instances in (None, "", 0, "0", "unbounded"):
-        return  # unbounded -> leave the catalog autoscaler policy untouched
-    try:
-        n = max(1, int(max_instances))
-    except (TypeError, ValueError):
-        return
-    try:
-        models.scale(models.get(model_name), max_containers=n)
-    except Exception:  # noqa: BLE001 - shared resource; never fail a spawn on a scaling hiccup
-        pass
 
 
 def _spawn(body: dict) -> dict:
@@ -420,13 +424,15 @@ def _spawn(body: dict) -> dict:
             proxy_note = _proxy_optin_note()
             prompt = proxy_note + "\n\n---\n\n" + prompt  # orchestrator / naive agents
     effort = body.get("effort") or None
-    _apply_max_instances(model, body.get("max_instances"))
+    # The endpoint cap this spawn asks for: it deploys an undeployed model at it, or raises a live
+    # one to it -- never lowers it or restarts the endpoint under anyone else using it.
+    max_instances = _max_instances(body.get("max_instances") or SPAWN_MAX_INSTANCES)
 
     if mode == "dynamic":
         timeout = float(body["timeout"]) if body.get("timeout") else DYNAMIC_ORCHESTRATOR_TIMEOUT
         ds = DynamicSwarm.launch(
             harness, model, prompt,
-            timeout=timeout, effort=effort, proxy=proxy,
+            timeout=timeout, max_containers=max_instances, effort=effort, proxy=proxy,
         )
         _ensure_controller(ds, proxy=proxy, proxy_note=proxy_note)  # subagents get the note too
         return {"swarm": ds.id, "model": ds.model, "mode": "dynamic"}
@@ -434,6 +440,7 @@ def _spawn(body: dict) -> dict:
     swarm = Swarm.launch(
         harness, model, prompt,
         count=int(body.get("count") or 1),
+        max_containers=max_instances,
         goal=bool(body.get("goal")),
         timeout=float(body["timeout"]) if body.get("timeout") else None,
         proxy=proxy, effort=effort,
@@ -535,17 +542,48 @@ class _QuietServer(ThreadingHTTPServer):
     on Windows that is ConnectionAbortedError. These are client-side and benign, so we drop
     them silently instead of printing a traceback per aborted poll (which drowned the log)."""
 
+    # On Windows SO_REUSEADDR lets a second server bind a port that is still in use, so a stale
+    # dashboard and a new one would silently share :8787. Without it, a busy port fails to bind and
+    # main() moves on to the next one.
+    allow_reuse_address = os.name != "nt"
+
     def handle_error(self, request: object, client_address: object) -> None:  # type: ignore[override]
         if isinstance(sys.exc_info()[1], ConnectionError):
             return
         super().handle_error(request, client_address)
 
 
-def main() -> int:
-    server = _QuietServer((HOST, PORT), Handler)
-    swarm_id = os.environ.get("AOM_SWARM", "")
-    print(f"aom swarm dashboard on http://{HOST}:{PORT}"
-          + (f"  (swarm {swarm_id})" if swarm_id else "  (set AOM_SWARM or spawn one in the UI)"))
+def _bind(host: str, port: int, tries: int = 20) -> _QuietServer:
+    """A server on ``port``, or on the next free port after it if that one is taken."""
+
+    for candidate in range(port, port + tries):
+        try:
+            return _QuietServer((host, candidate), Handler)
+        except OSError as error:
+            last = error
+    raise last
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="aom swarm dashboard")
+    parser.add_argument("--swarm", default=os.environ.get("AOM_SWARM", ""),
+                        help="swarm id to open (default: $AOM_SWARM, else spawn one in the UI)")
+    parser.add_argument("--host", default=HOST)
+    parser.add_argument("--port", type=int, default=PORT,
+                        help="port to serve on; the next free one is used if it is taken")
+    parser.add_argument("--no-browser", action="store_true", help="do not open a browser tab")
+    args = parser.parse_args(argv)
+    if args.swarm:
+        os.environ["AOM_SWARM"] = args.swarm  # the handlers' default swarm (/api/config etc.)
+
+    server = _bind(args.host, args.port)
+    url = f"http://{args.host}:{server.server_address[1]}/"
+    if args.swarm:
+        url += f"?swarm={quote(args.swarm)}"
+    print(f"aom swarm dashboard on {url}"
+          + ("" if args.swarm else "  (spawn a swarm in the UI, or pass --swarm <id>)"), flush=True)
+    if not args.no_browser:
+        webbrowser.open(url)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

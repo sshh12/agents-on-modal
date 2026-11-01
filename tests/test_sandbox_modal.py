@@ -90,9 +90,11 @@ class FakeSandbox:
 
 
 class FakeImage:
-    def __init__(self, ref: str | None = None, dockerfile: str | None = None) -> None:
+    def __init__(self, ref: str | None = None, dockerfile: str | None = None,
+                 missing: bool = False) -> None:
         self.ref = ref
         self.dockerfile = dockerfile
+        self.missing = missing  # a lazy from_name of an unpublished tag (fails at Sandbox.create)
         self.added: list[tuple] = []
         self.built = False
         self.published: str | None = None
@@ -142,9 +144,8 @@ def build_fake_modal(*, image_present: bool = True):
 
     # ---- Image
     def image_from_name(ref):
-        if not state.image_present:
-            raise _NotFoundError(ref)
-        return FakeImage(ref=ref)
+        # Lazy like the real SDK: an unpublished tag only fails when a Sandbox.create loads it.
+        return FakeImage(ref=ref, missing=not state.image_present)
 
     def image_from_dockerfile(path, *, context_dir=None, **_):
         state.from_dockerfile.append(path)
@@ -155,6 +156,9 @@ def build_fake_modal(*, image_present: bool = True):
 
     # ---- Sandbox
     def sandbox_create(*args, **kwargs):
+        image = kwargs.get("image")
+        if getattr(image, "missing", False):
+            raise _NotFoundError(f"Image {image.ref!r} not found in environment 'main'")
         state.created.append((args, kwargs))
         sb = FakeSandbox(
             name=kwargs.get("name"),
@@ -241,6 +245,12 @@ def make_endpoint():
         url="https://ws--aom-qwen.us-west.modal.direct",
         token="wk-user.ws-usersecret",
     )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_image_cache(monkeypatch):
+    # The backend caches resolved images per process; every test starts from an empty cache.
+    monkeypatch.setattr(modal_backend, "_IMAGES", {})
 
 
 @pytest.fixture
@@ -534,11 +544,13 @@ def test_ensure_image_hot_path_no_build(fake_modal):
     assert fake_modal.images_built == []
 
 
-def test_ensure_image_builds_when_missing(monkeypatch):
+def test_create_builds_the_image_when_its_tag_is_missing(monkeypatch):
+    # The lookup is lazy, so the miss surfaces at Sandbox.create: build once, then create on it.
     modal, state = build_fake_modal(image_present=False)
     monkeypatch.setitem(sys.modules, "modal", modal)
-    image = ModalSandbox.ensure_image()
+    ModalSandbox.create(make_endpoint())
     assert len(state.from_dockerfile) == 1
+    assert len(state.created) == 1 and state.created[0][1]["image"] is state.images_built[-1]
     built = state.images_built[-1]
     assert built.built is True
     assert built.published is not None
@@ -555,3 +567,58 @@ def test_ensure_image_build_flag_forces_build(fake_modal):
 def test_app_lookup_creates_if_missing(fake_modal):
     ModalSandbox.create(make_endpoint())
     assert (APP_NAME, True) in fake_modal.app_lookups
+
+
+def test_image_tag_tracks_the_package_source(monkeypatch, tmp_path):
+    # The image bakes agents_on_modal in, so a source change must mean a new tag (and a rebuild);
+    # bytecode caches must not.
+    real_files = modal_backend.files
+    monkeypatch.setattr(modal_backend, "files",
+                        lambda pkg: tmp_path if pkg == "agents_on_modal" else real_files(pkg))
+    (tmp_path / "runner.py").write_text("v1", encoding="utf-8")
+
+    def tag():
+        modal_backend._image_tag.cache_clear()
+        return modal_backend._image_tag()
+
+    first = tag()
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__" / "runner.cpython-312.pyc").write_bytes(b"\0")
+    assert tag() == first
+    (tmp_path / "runner.py").write_text("v2", encoding="utf-8")
+    assert tag() != first
+    modal_backend._image_tag.cache_clear()
+
+
+def test_concurrent_creates_build_a_missing_image_once(monkeypatch):
+    import threading
+
+    modal, state = build_fake_modal(image_present=False)
+    monkeypatch.setitem(sys.modules, "modal", modal)
+    threads = [threading.Thread(target=ModalSandbox.create, args=(make_endpoint(),)) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert len(state.from_dockerfile) == 1
+    assert len(state.created) == 6
+
+
+def test_runs_start_as_an_attached_exec_so_the_sandbox_stays_active(fake_modal):
+    # A detached runner does not count as activity, so idle_timeout reaped sandboxes mid-run.
+    box = ModalSandbox.create(make_endpoint())
+    box._sb.exec_calls.clear()
+    box.spawn_run(["python3", "-m", "agents_on_modal.runner", "/run/x"], cwd="/work")
+    call = box._sb.exec_calls[-1]
+    assert call["args"][0:2] == ("bash", "-lc")
+    cmd = call["args"][2]
+    assert cmd.startswith("exec gosu agent python3 -m agents_on_modal.runner /run/x")
+    assert "nohup" not in cmd and not cmd.rstrip().endswith("&")
+    assert call["workdir"] == "/work"
+
+
+def test_advertised_playwright_mcp_command_is_the_one_the_image_installs():
+    # @playwright/mcp's bin is `playwright-mcp`; a wrong name means no agent gets browser_* tools.
+    dockerfile = modal_backend._IMAGE_RESOURCES.joinpath("Dockerfile").read_text(encoding="utf-8")
+    assert "@playwright/mcp@" in dockerfile
+    assert modal_backend.PLAYWRIGHT_MCP.command == "playwright-mcp"

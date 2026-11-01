@@ -36,12 +36,16 @@ pixel-level view is required.
 ## Fallback: the `agent-browser` CLI (for shell-driven work)
 
 Keep one named session and avoid close/reopen churn (reopening right after a
-close can error). Refs are short (`@e2`):
+close can error). There is one shared page, so run commands one at a time: two
+in parallel read each other's page. `read` prints the WHOLE page, nav and menus
+first (often 20-200 KB), so save it and search it rather than paging with
+`head`/`sed`. `open` reports success even for a 429 / bot-wall page, so check
+the text before using it. Refs are short (`@e2`):
 
 ```sh
 agent-browser open https://example.com
 agent-browser snapshot -i          # interactive elements only, compact
-agent-browser read                 # page text
+agent-browser read > /tmp/page.txt # page text: save it, then grep -n 'keyword' /tmp/page.txt
 agent-browser click @e2
 agent-browser fill @e3 "some text"
 agent-browser skills get core --full   # full, version-matched usage docs

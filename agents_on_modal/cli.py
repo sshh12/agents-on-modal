@@ -102,11 +102,11 @@ def _stream_run(run: Any) -> int:
 # shared helpers                                                                                #
 # --------------------------------------------------------------------------------------------- #
 def _resolve_endpoint(args: argparse.Namespace) -> Any:
-    """Attach to the model (default) or deploy it first when ``--deploy`` is given."""
+    """Attach to the model (default), or with ``--deploy`` deploy it first if it isn't yet."""
 
     model = models.get(args.model)
     if getattr(args, "deploy", False):
-        endpoint = model_ops.deploy(model)
+        endpoint = model_ops.ensure_deployed(model, max_containers=args.max_containers)
         model_ops.wait_ready(endpoint)
         return endpoint
     return model_ops.endpoint(model)
@@ -158,8 +158,8 @@ def _cmd_models_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_models_deploy(args: argparse.Namespace) -> int:
-    endpoint = model_ops.deploy(models.get(args.name))
-    print(f"deployed {endpoint.model.name} -> {endpoint.url}")
+    endpoint = model_ops.deploy(models.get(args.name), max_containers=args.max)
+    print(f"deployed {endpoint.model.name} (max {args.max} containers) -> {endpoint.url}")
     return 0
 
 
@@ -209,18 +209,31 @@ def _cmd_shell(args: argparse.Namespace) -> int:
 def _cmd_swarm(args: argparse.Namespace) -> int:
     result = swarm.Swarm.launch(
         args.harness, args.model, args.prompt, count=args.count,
+        max_containers=args.max_containers,
         goal=args.goal, timeout=args.timeout, proxy=args.proxy, effort=args.effort,
     )
     print(f"swarm {result.id}: launched {len(result.agents())} agents on model {result.model}")
     print("Open the dashboard:")
-    print(f"  AOM_SWARM={result.id} python examples/swarm/server.py")
-    print("  then browse http://127.0.0.1:8787")
+    print(f"  python examples/swarm/server.py --swarm {result.id}")
     return 0
 
 
 # --------------------------------------------------------------------------------------------- #
 # argument parsing                                                                              #
 # --------------------------------------------------------------------------------------------- #
+#: The model endpoint's GPU container cap the CLI asks for unless told otherwise. A first deploy
+#: uses it; a live endpoint is only ever raised to it (models.ensure_deployed), never lowered.
+DEFAULT_MAX_CONTAINERS = 1
+
+
+def _add_max_containers_arg(parser: argparse.ArgumentParser, *, scope: str = "") -> None:
+    parser.add_argument(
+        "--max-containers", type=int, default=DEFAULT_MAX_CONTAINERS,
+        help=f"{scope}GPU containers the model endpoint may run: a first deploy uses it, a live "
+             f"endpoint is only raised to it, never restarted (default: {DEFAULT_MAX_CONTAINERS})",
+    )
+
+
 def _add_model_run_args(parser: argparse.ArgumentParser, *, workdir: bool = True) -> None:
     parser.add_argument("--sandbox", choices=SANDBOX_KINDS, default="local",
                         help="where the harness runs (default: local)")
@@ -229,7 +242,9 @@ def _add_model_run_args(parser: argparse.ArgumentParser, *, workdir: bool = True
     parser.add_argument("--proxy", help="upstream proxy URL (socks5h/http, {session} supported)")
     parser.add_argument("--effort", help="reasoning effort (none..max)")
     parser.add_argument("--deploy", action="store_true",
-                        help="deploy + prepare the model first (default: attach to an existing one)")
+                        help="deploy + prepare the model first if it isn't deployed "
+                             "(default: attach to an existing one)")
+    _add_max_containers_arg(parser, scope="with --deploy: ")
     if workdir:
         parser.add_argument("--workdir", help="working directory for the agent")
 
@@ -246,8 +261,12 @@ def build_parser() -> argparse.ArgumentParser:
     mp = sub.add_parser("models", help="manage model deployments")
     msub = mp.add_subparsers(dest="models_command", required=True)
     msub.add_parser("list", help="list catalog models").set_defaults(func=_cmd_models_list)
-    deploy = msub.add_parser("deploy", help="deploy a model (idempotent)")
+    deploy = msub.add_parser(
+        "deploy", help="deploy or redeploy a model (a redeploy restarts a live endpoint)"
+    )
     deploy.add_argument("name")
+    deploy.add_argument("--max", type=int, required=True,
+                        help="max_containers: the endpoint's GPU container cap (set exactly)")
     deploy.set_defaults(func=_cmd_models_deploy)
     scale = msub.add_parser("scale", help="change a model's autoscaler live")
     scale.add_argument("name")
@@ -277,6 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
     swarm_cmd.add_argument("--harness", choices=HARNESSES, required=True)
     swarm_cmd.add_argument("--model", required=True)
     swarm_cmd.add_argument("--count", type=int, required=True)
+    _add_max_containers_arg(swarm_cmd)
     swarm_cmd.add_argument("--goal", action="store_true")
     swarm_cmd.add_argument("--timeout", type=float)
     swarm_cmd.add_argument("--proxy")

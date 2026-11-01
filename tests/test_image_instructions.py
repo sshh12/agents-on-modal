@@ -75,7 +75,9 @@ def test_workdir_and_home_rendered():
     docker = _docker()
     assert "`/work` (your cwd)" in docker
     assert "`$HOME` = `/home/agent` is ephemeral" in docker
-    assert "/work/.goal/GOAL.md" in docker
+    # every run gets these instructions, goal or not: no goal-file pointer (it sent non-goal agents
+    # looking for one); goal runs get the `goal` skill instead
+    assert "GOAL.md" not in docker
     local = _local()
     assert "`$HOME` = `/home/me` is persisted" in local
 
@@ -86,8 +88,10 @@ def test_shared_dir_changes_workspace_line():
         shared_dir="/shared", network="full", proxy=False,
     )
     assert "`/shared`" in text
-    assert "sibling agents see it live" in text
+    assert "sibling agents see it" in text
     assert "Your cwd is `/work`" in text
+    # concurrent writers to one volume file clobber each other: agents must keep to their own files
+    assert "last writer wins" in text
 
 
 def test_proxy_flag_adds_upstream_line():

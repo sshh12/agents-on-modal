@@ -53,13 +53,22 @@ catalog entry fully describes a deployment; adding a model is a catalog edit.
   missing/changed files, verify sizes, write manifest) before any GPU is requested, then return.
   Scale-to-zero (`min_containers=0`) is the cost control; there are no per-run ephemeral deployments,
   no watchdogs, no ownership records.
-* **Scaling** (`Scaling`): `min_containers`, `max_containers`, `buffer_containers`,
-  `scaledown_window`, `target_concurrency`. Defaults: one container max, scale to zero after 15 min.
-  Overridable at deploy, and live via `Server.autoscaler.update(...)` (no redeploy) for fan-outs:
-  `models.scale(model, min_containers=4, max_containers=32)`.
+* **Scaling** (`Scaling`): `min_containers`, `buffer_containers`, `scaledown_window`,
+  `scaleup_window`, `target_concurrency` -- how the model packs requests onto a container. Defaults:
+  scale to zero after 15 min. Overridable at deploy, and live via `Server.autoscaler.update(...)` (no
+  redeploy): `models.scale(model, min_containers=4, max_containers=32)`.
+* **Container cap** (`max_containers`): deliberately not in the catalog or `Scaling`. The apps using
+  an endpoint choose it, and the library has no default. `deploy(model, max_containers=n)` sets it
+  exactly. `ensure_deployed(model, max_containers=n)` deploys at `n` if needed, or raises a live
+  endpoint to `n` and never lowers it, so two apps asking for 1 share one endpoint at 1, and a third
+  asking for 2 bumps it live without disturbing them. Only `scale` lowers it. It is a ceiling, not a
+  reservation: idle containers still scale to zero.
 * **Endpoint**: `Endpoint(model, url, token)`; `url` = `https://<ws>--aom-<name>-server.<region>.modal.direct`.
-  `models.endpoint(model)` attaches, `models.deploy(model)` deploys, `models.wait_ready(endpoint)` polls
-  the gateway's `/health` (which is 200 only when the engine answers a real generation).
+  `models.endpoint(model)` attaches, `models.deploy(model, max_containers=n)` deploys or redeploys,
+  `models.ensure_deployed(model, max_containers=n)` attaches if deployed and deploys otherwise (what
+  every app uses: a redeploy that changes the app replaces its running containers, cutting every
+  other consumer's in-flight requests), `models.wait_ready(endpoint)` polls the gateway's `/health`
+  (which is 200 only when the engine answers a real generation).
 * **Reasoning** (`Reasoning`): harness efforts are normalized to `EFFORTS = (none, minimal, low,
   medium, high, xhigh, max)` (`ultra` -> `max`). Each model maps every normalized effort to an engine
   value: a string -> send `reasoning_effort=<value>` and `chat_template_kwargs[<kwarg>]=true`; `true` ->
@@ -116,7 +125,9 @@ Model inference never goes through it. The Modal relay and the Docker egress sha
 `agents_on_modal/sandbox/net/` (upstream connector, SOCKS5/HTTP servers, destination policy).
 
 **Runs**: `sandbox.start(harness, model_access?, prompt, goal=False, timeout=None) -> Run` starts the
-in-sandbox runner (`python -m agents_on_modal.runner <run_dir>`) detached. The runner launches the
+in-sandbox runner (`python -m agents_on_modal.runner <run_dir>`) in the background and returns (on
+Modal as an attached-but-unwaited exec, so a live run counts as sandbox activity and `idle_timeout`
+only reaps the sandbox after the run ends; a detached process did not count). The runner launches the
 harness headless, tees its JSON stream into `<run_dir>/trace.jsonl` (envelope per line: `{"ts",
 "src": "harness"|"runner", "data"}`), drives goal continuation, enforces the deadline, and writes
 `<run_dir>/status.json`. Everything a reader needs is on disk inside the sandbox, so any process can

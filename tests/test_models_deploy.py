@@ -22,14 +22,20 @@ def _model() -> Model:
 # conservative shared scaling policy                                           #
 # --------------------------------------------------------------------------- #
 def test_scaling_defaults_are_conservative_and_shared():
-    # The catalog policy packs before spawning: scale to zero when idle, a small ceiling, a long
-    # scale-up window, and a high per-GPU concurrency (the sharing unit). No per-caller fan-out.
+    # The catalog policy packs before spawning: scale to zero when idle, a long scale-up window, and
+    # a high per-GPU concurrency (the sharing unit). No per-caller fan-out.
     s = Scaling()
     assert s.min_containers == 0          # idle -> zero (gateway holds the next cold start)
-    assert s.max_containers == 2          # small ceiling, not a GPU per caller
     assert s.buffer_containers == 0
     assert s.scaleup_window >= 30         # bursts queue instead of cold-starting a GPU
     assert s.target_concurrency >= 32.0   # many requests share one GPU
+
+
+def test_container_cap_is_not_a_model_setting():
+    # The cap is the apps' call (ensure_deployed / deploy max_containers=), never a catalog default.
+    assert not hasattr(Scaling(), "max_containers")
+    with pytest.raises(AomError, match="max_containers is not a catalog setting"):
+        Model.from_json({**_model().to_json(), "scaling": {"max_containers": 1}})
 
 
 def test_scaling_round_trips_through_model_json():
@@ -39,7 +45,7 @@ def test_scaling_round_trips_through_model_json():
     assert m.scaling == Model.from_json(m.to_json()).scaling
     over = Model.from_json({**m.to_json(), "scaling": {"target_concurrency": 4.0}})
     assert over.scaling.target_concurrency == 4.0
-    assert over.scaling.max_containers == Scaling().max_containers  # inherits the conservative default
+    assert over.scaling.scaledown_window == Scaling().scaledown_window  # inherits the default
 
 
 # --------------------------------------------------------------------------- #
@@ -92,24 +98,39 @@ def test_endpoint_url_round_trips_into_openai_base_url():
 # --------------------------------------------------------------------------- #
 # deploy() wiring (SDK seams mocked)                                           #
 # --------------------------------------------------------------------------- #
-def test_deploy_calls_seams_with_right_args(monkeypatch):
-    model = _model()
+@pytest.fixture
+def seams(monkeypatch):
+    """Mock every Modal seam of deploy/ensure_deployed; ``calls`` records them in order."""
+
     calls: list[tuple] = []
-
+    state = {"deployed": True, "live_max": 1, "env": None}
     monkeypatch.setattr(deploy, "_workspace_slug", lambda: "myws")
-    monkeypatch.setattr(deploy, "_modal_deploy", lambda name, env: calls.append(("deploy", name, env)))
+
+    def fake_modal_deploy(name, env):
+        state["env"] = env
+        calls.append(("deploy", name))
+
+    monkeypatch.setattr(deploy, "_modal_deploy", fake_modal_deploy)
     monkeypatch.setattr(deploy, "_run_prepare", lambda name: calls.append(("prepare", name)))
+    monkeypatch.setattr(deploy, "_server_deployed", lambda name: state["deployed"])
+    monkeypatch.setattr(deploy, "_live_max_containers", lambda name: state["live_max"])
+    monkeypatch.setattr(deploy, "_set_max_containers", lambda name, n: calls.append(("cap", n)))
+    return calls, state
 
-    endpoint = deploy.deploy(model, token=TOKEN)
 
-    # weights prepared AFTER the app is deployed
-    assert [c[0] for c in calls] == ["deploy", "prepare"]
-    _, app_name, env = calls[0]
-    assert app_name == "aom-qwen3-8-27b"
-    assert calls[1] == ("prepare", "aom-qwen3-8-27b")
+def test_deploy_calls_seams_with_right_args(seams):
+    calls, state = seams
+    model = _model()
 
-    # env carries a round-trippable model spec + the pinned builder version
+    endpoint = deploy.deploy(model, max_containers=3, token=TOKEN)
+
+    # the cap is pinned live right after the deploy; weights prepared AFTER the app is deployed
+    assert calls == [("deploy", "aom-qwen3-8-27b"), ("cap", 3), ("prepare", "aom-qwen3-8-27b")]
+    env = state["env"]
+
+    # env carries a round-trippable model spec, the cap, + the pinned builder version
     assert env[deploy.AOM_APP_NAME_ENV] == "aom-qwen3-8-27b"
+    assert env[deploy.AOM_MAX_CONTAINERS_ENV] == "3"
     assert env["MODAL_IMAGE_BUILDER_VERSION"] == deploy.MODAL_IMAGE_BUILDER_VERSION
     round_tripped = Model.from_json(json.loads(env[deploy.AOM_MODEL_JSON_ENV]))
     assert round_tripped.name == model.name
@@ -121,18 +142,24 @@ def test_deploy_calls_seams_with_right_args(monkeypatch):
     assert endpoint.model is model
 
 
-def test_deploy_scaling_override_reaches_env(monkeypatch):
-    model = _model()
-    captured: dict = {}
-    monkeypatch.setattr(deploy, "_workspace_slug", lambda: "myws")
-    monkeypatch.setattr(deploy, "_modal_deploy", lambda name, env: captured.update(env))
-    monkeypatch.setattr(deploy, "_run_prepare", lambda name: None)
+def test_deploy_scaling_override_reaches_env(seams):
+    _, state = seams
 
-    deploy.deploy(model, scaling=Scaling(min_containers=4, max_containers=16), token=TOKEN)
+    deploy.deploy(_model(), max_containers=16, scaling=Scaling(min_containers=4), token=TOKEN)
 
-    scaling = json.loads(captured[deploy.AOM_MODEL_JSON_ENV])["scaling"]
+    scaling = json.loads(state["env"][deploy.AOM_MODEL_JSON_ENV])["scaling"]
     assert scaling["min_containers"] == 4
-    assert scaling["max_containers"] == 16
+    assert "max_containers" not in scaling  # the cap travels on its own, not in the model spec
+    assert state["env"][deploy.AOM_MAX_CONTAINERS_ENV] == "16"
+
+
+@pytest.mark.parametrize("bad", [0, -1, None, "2", 1.5, True])
+def test_deploy_and_ensure_reject_a_bad_cap(seams, bad):
+    calls, _ = seams
+    for fn in (deploy.deploy, deploy.ensure_deployed):
+        with pytest.raises(AomError, match="max_containers must be a positive integer"):
+            fn(_model(), max_containers=bad, token=TOKEN)
+    assert calls == []
 
 
 def test_endpoint_attaches_without_deploying(monkeypatch):
@@ -144,6 +171,84 @@ def test_endpoint_attaches_without_deploying(monkeypatch):
     endpoint = deploy.endpoint(model, token=TOKEN)
     assert endpoint.url == "https://myws--aom-qwen3-8-27b-server.us-west.modal.direct"
     assert endpoint.token == TOKEN.bearer
+
+
+def test_ensure_deployed_attaches_to_a_live_app_without_redeploying(seams):
+    # A redeploy would replace the running containers under every other app on the endpoint, so a
+    # deployed app at (or above) the asked-for cap is attached as-is; only the resumable prepare runs.
+    calls, _ = seams
+
+    endpoint = deploy.ensure_deployed(_model(), max_containers=1, token=TOKEN)
+
+    assert calls == [("prepare", "aom-qwen3-8-27b")]
+    assert endpoint.url == "https://myws--aom-qwen3-8-27b-server.us-west.modal.direct"
+    assert endpoint.token == TOKEN.bearer
+
+
+def test_ensure_deployed_raises_a_live_cap_without_redeploying(seams):
+    # The n=1 swarm is running; a second app asks for 2 -> the cap goes up live, nothing restarts.
+    calls, state = seams
+    state["live_max"] = 1
+
+    deploy.ensure_deployed(_model(), max_containers=2, token=TOKEN)
+
+    assert calls == [("prepare", "aom-qwen3-8-27b"), ("cap", 2)]
+
+
+def test_ensure_deployed_never_lowers_a_live_cap(seams):
+    # Another app asked for 3; an app asking for 1 must not take that away (only scale() lowers).
+    calls, state = seams
+    state["live_max"] = 3
+
+    deploy.ensure_deployed(_model(), max_containers=1, token=TOKEN)
+
+    assert ("cap", 1) not in calls
+
+
+def test_ensure_deployed_caps_an_endpoint_reporting_no_cap(seams):
+    # Modal reports None when no Server-level cap is in effect: establish the asked-for one.
+    calls, state = seams
+    state["live_max"] = None
+
+    deploy.ensure_deployed(_model(), max_containers=1, token=TOKEN)
+
+    assert ("cap", 1) in calls
+
+
+def test_ensure_deployed_deploys_at_the_asked_cap_when_not_deployed(seams):
+    calls, state = seams
+    state["deployed"] = False
+
+    endpoint = deploy.ensure_deployed(_model(), max_containers=2, token=TOKEN)
+
+    assert calls == [("deploy", "aom-qwen3-8-27b"), ("cap", 2), ("prepare", "aom-qwen3-8-27b")]
+    assert state["env"][deploy.AOM_MAX_CONTAINERS_ENV] == "2"
+    assert endpoint.url == "https://myws--aom-qwen3-8-27b-server.us-west.modal.direct"
+
+
+def test_ensure_deployed_serializes_concurrent_callers_per_app(seams, monkeypatch):
+    # Two apps in one process racing on an undeployed model: exactly one deploys, the other attaches.
+    import threading
+
+    calls, state = seams
+    state["deployed"] = False
+    gate = threading.Event()
+
+    def slow_deploy(name, env):
+        gate.wait(5)
+        calls.append(("deploy", name))
+        state["deployed"] = True
+
+    monkeypatch.setattr(deploy, "_modal_deploy", slow_deploy)
+    threads = [threading.Thread(target=deploy.ensure_deployed, args=(_model(),),
+                                kwargs={"max_containers": 1, "token": TOKEN}) for _ in range(2)]
+    for t in threads:
+        t.start()
+    gate.set()
+    for t in threads:
+        t.join(10)
+
+    assert [c for c in calls if c[0] == "deploy"] == [("deploy", "aom-qwen3-8-27b")]
 
 
 # --------------------------------------------------------------------------- #

@@ -38,7 +38,7 @@ def _profile() -> SandboxProfile:
         instructions="# Sandbox environment\nWork autonomously.\n",
         posix=True,
         skills={"browser": "---\nname: browser\n---\nUse agent-browser."},
-        mcp_servers={"playwright": McpServer(command="mcp-server-playwright")},
+        mcp_servers={"playwright": McpServer(command="playwright-mcp")},
         env={"PATH_EXTRA": "/opt/bin"},
     )
 

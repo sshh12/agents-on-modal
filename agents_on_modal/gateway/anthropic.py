@@ -239,12 +239,19 @@ async def stream_sse(
     keepalive: float = 10.0,
 ) -> AsyncIterator[bytes]:
     msg_id = _rand("msg_")
+    # Claude Code records every content block with the usage known at message_start, so a 0 here
+    # made each per-block usage line zero. Report the prompt size up front like the real API does
+    # (an estimate: the engine's exact counts only arrive with message_delta, at the end).
+    prompt_estimate = ir.estimate_tokens(
+        json.dumps(body.get("messages") or [], ensure_ascii=False)
+        + json.dumps(body.get("tools") or [], ensure_ascii=False)
+    )
     start = {
         "type": "message_start",
         "message": {
             "id": msg_id, "type": "message", "role": "assistant", "model": model_id,
             "content": [], "stop_reason": None, "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "usage": {"input_tokens": prompt_estimate, "output_tokens": 0},
         },
     }
     yield _frame("message_start", start)
@@ -281,6 +288,8 @@ async def stream_sse(
     finish_reason: str | None = None
     stop_matched: str | None = None
     usage = ir.Usage()
+    #: Whitespace-only text not yet worth a text block (see ``ir.hold_whitespace``).
+    pending_ws = ""
 
     source = chat.stream_events(session, engine_url, body)
     try:
@@ -295,11 +304,15 @@ async def stream_sse(
                 yield _frame("content_block_delta", {"type": "content_block_delta", "index": idx,
                                                       "delta": {"type": "thinking_delta", "thinking": item.text}})
             elif isinstance(item, ir.TextDelta):
+                in_text = bool(state["open"] and state["open"][0] == "text")
+                text, pending_ws = ir.hold_whitespace(pending_ws, item.text, in_text)
+                if not text:
+                    continue
                 idx, frames = ensure("text")
                 for f in frames:
                     yield f
                 yield _frame("content_block_delta", {"type": "content_block_delta", "index": idx,
-                                                      "delta": {"type": "text_delta", "text": item.text}})
+                                                      "delta": {"type": "text_delta", "text": text}})
             elif isinstance(item, ir.ToolCallStart):
                 tool_order.append(item.index)
                 tool_info[item.index] = (item.id, item.name)
@@ -374,7 +387,7 @@ async def response_json(
     content: list[dict[str, Any]] = []
     if result.reasoning:
         content.append({"type": "thinking", "thinking": result.reasoning, "signature": ""})
-    if result.text:
+    if result.text.strip():  # a bare "\n\n" before a tool call is not a text block (ir.hold_whitespace)
         content.append({"type": "text", "text": result.text})
     for call in result.tool_calls:
         try:

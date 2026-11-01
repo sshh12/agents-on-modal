@@ -80,7 +80,10 @@ def _browser_section() -> str:
         "page text, including headings). State persists across invocations, so open once then "
         "read/act in later calls. The ONLY subcommands are `open <url>`, `snapshot -i`, `read`, "
         "`click @eN`, `fill @eN \"text\"` -- do NOT guess others (`browse`, `eval`, `js`, `get` "
-        "do not exist).\n"
+        "do not exist). There is ONE shared page: run browser commands one at a time, never two in "
+        "parallel (they read each other's page). `read` prints the whole page, menus first, "
+        "often 20-200 KB: `agent-browser read > /tmp/page.txt`, then grep it. Check the text for "
+        "a block page (429, 'Access Denied', 'Just a moment') before using it.\n"
         "- Or the `browser_*` MCP tools (Playwright): `browser_navigate`, then `browser_snapshot` "
         "to read as text; act with `browser_click`/`browser_type`/`browser_fill_form` using the "
         "`[ref=eN]` value as `target`. Prefer snapshots over screenshots.\n"
@@ -110,7 +113,7 @@ def build_instructions(
     ``kind`` is ``local`` | ``docker`` | ``modal``; ``network`` is one of
     :data:`_NETWORK` (``host`` | ``internet`` | ``full``). ``workdir`` is the
     agent cwd and ``home`` its ``$HOME``. When ``shared_dir`` is set the
-    workspace is shared live (swarms); when ``proxy`` is true all agent TCP is
+    workspace is shared (swarms); when ``proxy`` is true all agent TCP is
     routed through an upstream proxy. Facts the agent cannot cheaply discover,
     stated as imperative one-liners, most important first.
     """
@@ -144,8 +147,13 @@ def build_instructions(
     lines.append("## Files")
     if shared_dir:
         lines.append(
-            f"- Shared workspace (the user and sibling agents see it live): "
+            f"- Shared workspace (the user and sibling agents see it): "
             f"`{shared_dir}`. Coordinate through it. Your cwd is `{workdir}`."
+        )
+        lines.append(
+            "- Never append to or edit a shared file other agents also write: concurrent writers to "
+            "one file overwrite each other (last writer wins). Write your own file instead, even "
+            "when told to append to a shared one (e.g. `board/<your sandbox id>.md` for `board.md`)."
         )
     else:
         lines.append(
@@ -193,9 +201,12 @@ def build_instructions(
         "the output."
     )
     lines.append(
-        f"- If a goal file exists at `{workdir}/.goal/GOAL.md`, keep working "
-        "until its checks pass (use the `goal` skill)."
+        "- If `$AOM_RUN_DEADLINE` is set, it is this run's hard deadline (epoch seconds; "
+        "compare `date +%s`). You cannot feel time passing and model turns can take a minute "
+        "each: deliver everything required before optional polish."
     )
+    # No pointer to the goal file here: these instructions go to every run, goal or not, and the
+    # mention made non-goal agents go looking for one. Goal runs get the `goal` skill instead.
 
     return "\n".join(lines) + "\n"
 

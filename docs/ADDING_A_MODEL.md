@@ -17,13 +17,51 @@ Two phases, cheap-before-expensive:
 - **Author + deploy** — editing the catalog and `aom models deploy` are **CPU-only** (image build +
   weight download on a `prepare` function). No GPU is billed. Do all the static validation here.
 - **Bring up + pressure-test** — the GPU cold-starts on the **first real request**; that is where
-  billing begins. Keep `max_containers=1` throughout, watch the run so a broken boot doesn't idle a
-  GPU, and scale to zero the moment you're done.
+  billing begins. Keep the endpoint at 1 container throughout (`aom models deploy <name> --max 1`),
+  watch the run so a broken boot doesn't idle a GPU, and scale to zero the moment you're done.
 
 Rule of thumb for this whole doc: **the GPU endpoint is the cost, not the agents.** One warm,
 capped-at-1 endpoint can serve every pressure-test concurrently (they batch/queue through the single
 container — which is itself a real throttle test). Never fire an agent until a cheap smoke completion
 proves the endpoint generates.
+
+---
+
+## Recurring themes (read these first — every bring-up so far hit at least one)
+
+The per-model logbook at the bottom is the evidence; these are the patterns it keeps repeating.
+
+1. **The architecture decides the image before anything else.** A new arch (`deepseek_v41`,
+   `glm_moe_dsa`) loads on no stock engine release — it needs a preview image or an unmerged commit,
+   and a quant-specific build can need a different one again. Check `config.json`'s
+   `architectures`/`model_type` against the engine's release notes before sizing anything.
+2. **Fit is weights + KV + cuda-graph capture, never weights alone.** Model-card recipes are often for
+   a different (smaller) artifact. Size from GiB on disk with the §2 rule; when boot says "no memory
+   for the KV cache", add GPU, don't raise `mem-fraction-static`.
+3. **The attention type sets how many agents one box can serve.** MLA / DSA (sparse) archs keep a tiny
+   KV per token — DeepSeek-V4.1 on B300:4 holds ~68M tokens, GLM-5.3 ~1M+ — so memory never limits
+   the running batch and a low `--max-running-requests` only leaves requests queued. Dense-attention
+   models are the opposite: KV is the limit and the batch cap protects you. Read the KV capacity off
+   the engine (`/get_server_info` → `max_total_num_tokens`) before choosing batch flags.
+4. **The engine is the queue; nothing throttles above it.** The gateway forwards every request (no
+   concurrency limit, 503 only while the engine is down), the engine queues what doesn't fit in its
+   running batch, and the harnesses wait patiently (`API_TIMEOUT_MS` = 2h). Batch flags therefore
+   trade per-request latency against throughput — they never turn load into 429s. Prove it on a
+   pressure test: zero 429/503/overloaded lines and zero harness API retries in the raw traces.
+5. **Every catalog byte is baked into the deployed image.** Any edit — engine args, scaling, even the
+   `description` — changes the image, so the next `aom models deploy` *restarts* the endpoint and cuts
+   every in-flight request. Apps never redeploy (`ensure_deployed` attaches to a live endpoint), so a
+   catalog change only goes live when you deploy it, deliberately, while the endpoint is idle.
+6. **Harnesses differ in strictness — test both.** Codex rejects malformed tool-call JSON that Claude
+   Code shrugs off, and an engine/parser bug that only one harness trips over looks like a model bug.
+7. **Respect the harness's base cost.** Claude Code's system prompt + tool/skill definitions are ~30k
+   tokens before any work; a `context_window` near that compacts immediately and derails. Floor it at
+   ~128k unless the engine truly can't.
+8. **Measure inside the box, not from outside.** `nvidia-smi` and the engine's own load endpoints
+   (§4) answer "is it saturated / queued / idle" in seconds; guessing from agent latency does not.
+9. **Keep the `description` true to the live config.** It is the sizing logbook — and a description
+   that disagrees with `scaling`/`engine_args` (we found one claiming `target_concurrency=20` on an
+   endpoint running 4) sends the next person down the wrong path.
 
 ---
 
@@ -73,7 +111,8 @@ Fields (see `Model` / `Scaling` / `Reasoning` in `agents_on_modal/models/__init_
       -a --n-gpu-layers -ngl --ctx-size -c`. (`tests/test_catalog.py::test_no_reserved_engine_args_in_catalog`.)
 - [ ] **`download_subdir`** — **required for llamacpp** (the GGUF quant folder, e.g. `Mix-256G`); fetches
       only that quant, not the whole repo.
-- [ ] **`scaling`** — `{"max_containers": 1, ...}` to start (see §2 for `target_concurrency`).
+- [ ] **`scaling`** — `{"target_concurrency": ...}` (see §2). **No `max_containers`**: the catalog
+      rejects it. The container cap belongs to the apps using the endpoint (`--max` on deploy).
 - [ ] **`reasoning`** — `default` effort + the full `efforts` map onto `(none minimal low medium high
       xhigh max)` + `kwarg` (thinking switch). `none` → `false` (thinking off).
 - [ ] **`startup_timeout`** — bump to `7200` for big models (download + compile + cuda-graph capture can
@@ -152,12 +191,23 @@ The GLM NVFP4 entry hit the **identical** capture OOM when `mem-fraction-static`
 
 **Other sizing knobs:**
 
-- [ ] **`target_concurrency`** — requests one container batches before Modal adds another. Default 32
-      (small models). **Lower it for big/slow models** so you don't over-batch a saturated GPU: FP8 used
-      `4.0`, GGUF `1.0`. Pair with SGLang `--max-running-requests` / llama.cpp `--parallel`.
-- [ ] **`max_containers: 1`** — hard ceiling = graceful throttle under load (never a GPU-per-agent
-      fan-out). This is the default policy and the cost guardrail; raise it deliberately, live
-      (`aom models scale … --max-containers N`), only when a fan-out genuinely needs it.
+- [ ] **`target_concurrency`** — in-flight requests per container before Modal adds another (only
+      matters once the endpoint's container cap is above 1). Default 32. Set it to what one container
+      can actually serve, not a guess: its `--cuda-graph-max-bs-decode` when the entry sets one (the
+      H200:2 DeepSeek-V4 entries: 16; GLM-flash: 32), a pressure-tested number once you have one, else
+      the 32 default. GGUF uses `1.0` (llama.cpp `--parallel 1`). Lower values don't protect a GPU —
+      the engine queues regardless (theme 4) — they only add a second GPU early.
+- [ ] **Metrics on** — every entry carries `--enable-metrics` (SGLang) / `--metrics` (llama.cpp), so
+      the engine's own Prometheus `/metrics` is there when a run needs inspecting (§4).
+- [ ] **Engine batch cap** (SGLang `--max-running-requests`, llama.cpp `--parallel`) — see theme 3.
+      For MLA/DSA archs leave SGLang's cap unset (it sizes the batch from KV capacity): a 100-agent
+      test of DeepSeek-V4.1 at `--max-running-requests=20` kept 80 requests queued behind 20 (logbook).
+      Set it only for dense-attention models where KV is the limit. Add `--enable-metrics` so the
+      engine exports `sglang:*` Prometheus metrics.
+- [ ] **Container cap 1** — hard ceiling = graceful throttle under load (never a GPU-per-agent
+      fan-out). Not a catalog field: deploy with `--max 1`; apps ask for 1 by default and only ever
+      raise it. Raise it deliberately, live (`aom models scale … --max N`), only when a fan-out
+      genuinely needs it.
 - [ ] **`min_containers: 0`** — scale to zero when idle (the gateway holds requests through the next
       cold start, so this costs latency, not 503s). `scaledown_window` (default 900s) keeps a container
       warm so back-to-back use isn't punished by repeated cold starts.
@@ -171,14 +221,16 @@ The GLM NVFP4 entry hit the **identical** capture OOM when `mem-fraction-static`
 ## 3. Deploy (CPU only — cheap)
 
 ```bash
-aom models deploy <name>                      # idempotent: image + CPU `prepare` downloads/verifies weights
+aom models deploy <name> --max 1              # image + CPU `prepare` downloads/verifies weights
 # or: python scratchpad/deploy_model.py <name>
 ```
 
 - [ ] `prepare` downloaded all shards and wrote its manifest (no GPU allocated yet).
-- [ ] If you changed the **sandbox Dockerfile**, rebuild+publish the image first:
-      `python scratchpad/build_image.py` (CPU build; tag is a content hash, so only changed layers
-      rebuild).
+- [ ] **A redeploy of a live endpoint restarts it** (theme 5) — check nothing is using it first.
+- [ ] The **sandbox image** rebuilds itself: its tag hashes the Dockerfile, `init.sh` *and* the
+      `agents_on_modal` source baked into it, so the first sandbox created after any code change
+      builds it (seconds — the Dockerfile layers are cached). `python scratchpad/build_image.py` still
+      forces one.
 
 ---
 
@@ -197,6 +249,18 @@ python -c "from agents_on_modal import models as M; e=M.endpoint(M.get('<name>')
 - [ ] **Watch for deploy churn:** two near-simultaneous `modal deploy` calls SIGTERM a cold-starting
       container → `"no upstreams available"` 503. Don't race deploys. **Recover without re-deploying**:
       autoscaler `max→0` then `→1` + `wait_ready` (`python scratchpad/reset_fp8.py <name>`).
+- [ ] **Look inside the live container** (theme 8) — the engine listens on `127.0.0.1:8001` in it:
+
+      ```bash
+      PYTHONUTF8=1 modal container list                                   # the ta-… id
+      PYTHONUTF8=1 modal container exec <id> -- nvidia-smi --query-gpu=utilization.gpu,memory.used,power.draw --format=csv
+      PYTHONUTF8=1 modal container exec <id> -- curl -s localhost:8001/get_load        # running vs waiting reqs
+      PYTHONUTF8=1 modal container exec <id> -- curl -s localhost:8001/get_server_info # KV capacity, batch cap, gen throughput
+      PYTHONUTF8=1 modal container exec <id> -- curl -s localhost:8001/metrics         # with --enable-metrics
+      ```
+
+      On Windows the exec's output stream can die mid-print ("detached sandbox"); redirect it to a file
+      and read that instead.
 
 ---
 
@@ -234,6 +298,15 @@ ones you want to keep into `tests/e2e/`). Run against the new model name.
       through to fan-out subagents; **model inference stays direct in every mode** (`NO_PROXY` carries
       the model host — no model bytes metered over the residential link).
       `python scratchpad/proxy_e2e.py`
+- [ ] **Swarm pressure test: one wave of ~100 agents against the single container** — a dynamic swarm
+      whose orchestrator submits ONE stage with `max_concurrent` = the agent count (all at once, not a
+      pool), a mixed harness split (`"harness": "codex"` on every third agent), browser + shell + file
+      + a script per agent, a ~15-min deadline, and a per-agent feedback note. Record: dispatch spread
+      (first→last agent start), time-to-first-token, done-vs-timeout per harness, engine `get_load`
+      and `nvidia-smi` mid-run, sandbox deaths, and API errors/retries in the raw traces (should be
+      zero — theme 4). Then have reviewers read individual traces and the feedback notes for friction.
+      This is what found the batch-cap queueing, the shared-file clobbering, and the idle-timeout kills
+      in the logbook below.
 - [ ] **Reasoning efforts map** — spot-check that `none` turns thinking off and that `low/high/max`
       reach the engine (reflected in the trace / token behavior).
 - [ ] **Vision** (only if `vision: true`) — one image prompt round-trips.
@@ -242,7 +315,7 @@ ones you want to keep into `tests/e2e/`). Run against the new model name.
 
 ## 6. Cost control + teardown
 
-- [ ] Endpoint ran capped at `max_containers=1` the whole time; no runaway fan-out.
+- [ ] Endpoint ran capped at 1 container the whole time; no runaway fan-out.
 - [ ] **Stop everything when done — don't rely on idle scaledown alone:**
       `python scratchpad/stop_all.py <name>`  (or `aom models stop <name>`).
 - [ ] **Verify it's actually off:** `aom models status <name>` shows the app stopped / autoscaler cleared
@@ -255,6 +328,29 @@ ones you want to keep into `tests/e2e/`). Run against the new model name.
 ## Logbook: per-model breakages discovered
 
 Newest first. Add to this when a bring-up teaches you something (see the note at the top).
+
+**DeepSeek-V4.1 FP8 (B300:4) — 100-agent swarm pressure test — 2026-11:**
+
+- **`--max-running-requests=20` was the bottleneck, not memory.** 100 agents (66 claude, 34 codex)
+  dispatched in 64 s; the engine ran 20 and queued 80 (~2M prompt tokens pending), GPUs at 98–99%
+  util / ~900 W each / 270 of 275 GB, decode 384–743 tok/s. TTFT p50 18 s / p90 35 s; only 21/100
+  finished a 15-min task (claude 12/66, codex 9/34), the rest hit their deadline mid-work. KV pool
+  ~68M tokens, so the cap protected nothing. Removed it (and added `--enable-metrics`); see theme 3.
+  **Re-run uncapped** (SGLang auto-picked 256): 0 queued, ~1.5k decode tok/s, 99% prefix-cache hit,
+  ~10% of KV in use, and **100/100 agents finished** (median 342 s, TTFT p50 9.5 s) — with the
+  platform fixes below landed too, so not all of that gain is the cap.
+- **The gateway was its own hidden throttle:** aiohttp's default connector capped it at 100 concurrent
+  engine connections (lifted), and a stale pooled connection surfaced as a 503 that Codex reports as
+  "Selected model is at capacity" and fails the turn on (now retried before any 503).
+- **Zero throttling end to end.** No 429/503/overloaded, no harness API retries across all 100 raw
+  traces — requests waited in the engine queue (theme 4).
+- **Platform lessons the same run surfaced** (fixed in code; listed so a future bring-up doesn't
+  misread them as model problems): Modal's sandbox `idle_timeout` reaps a sandbox whose only work is a
+  *detached* process, so agents waiting on a busy model were killed silently — runs now start as an
+  attached exec. Concurrent appends to one file on the shared Volume clobber each other (100 appends →
+  1 line) — agents are told to keep to their own files. Claude Code reset `cd /shared` back to the
+  workdir — `/shared` and `/tmp` are now working directories. The sandbox image used to bake in a stale
+  `agents_on_modal` — its tag now hashes the source.
 
 **GGUF / llama.cpp path (both `deepseek-v4.1-flash-*-gguf` entries) — 2026-10:**
 

@@ -28,12 +28,15 @@ packet filter.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import os
 import re
 import shlex
+import threading
 from collections.abc import Mapping, Sequence
 from importlib.resources import files
+from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import urlsplit
 
@@ -44,9 +47,10 @@ from .net import parse_proxy, relay
 
 #: Persistent, deployed App that owns every aom Modal sandbox (so they are rediscoverable).
 APP_NAME = "aom-sandboxes"
-#: Published image name; the tag is a content hash of the Dockerfile + init.sh + this version.
+#: Published image name; the tag is a content hash of the Dockerfile + init.sh + the
+#: ``agents_on_modal`` source baked into it + this version.
 IMAGE_NAME = "aom-sandbox"
-#: Bump to force a new image tag even when the Dockerfile/init.sh bytes are unchanged.
+#: Bump to force a new image tag even when none of the hashed inputs changed.
 IMAGE_VERSION = "1"
 #: Modern Modal image builder (matches the deploy path). The legacy builder injects a
 #: ``pip install --upgrade pip`` layer that fails on this Debian base's apt-managed pip
@@ -59,18 +63,36 @@ AGENT_UID_GID = "10001:10001"
 #: The one browser MCP server every batteries sandbox advertises. All of its configuration
 #: (headless, isolated, the system Chromium path, the output dir) is baked into the image env, so no
 #: args are needed here; this matches the docker backend's browser recipe.
-PLAYWRIGHT_MCP = McpServer(command="mcp-server-playwright")
+#: ``playwright-mcp`` is the bin ``@playwright/mcp`` installs (the docker backend uses the same).
+#: It was ``mcp-server-playwright``, which does not exist in the image, so every harness silently
+#: dropped the server and no agent ever got the browser_* tools.
+PLAYWRIGHT_MCP = McpServer(command="playwright-mcp")
 
 _IMAGE_RESOURCES = files("agents_on_modal.sandbox").joinpath("image")
+#: Resolved image handles by ref, and the lock that makes resolving/building one happen once.
+_IMAGES: dict[str, Any] = {}
+_IMAGE_LOCK = threading.Lock()
 
 
+@functools.lru_cache(maxsize=1)
 def _image_tag() -> str:
-    """Short content hash of the image inputs. Offline (reads packaged bytes only)."""
+    """Short content hash of the image inputs. Offline (reads packaged bytes only).
+
+    The package source is part of it: the image bakes ``agents_on_modal`` in at /opt/aom, and the
+    runner and ``aom-swarm`` run from that copy inside every sandbox. Hashing only the Dockerfile
+    left sandboxes on whatever package was current when the image was first built.
+    """
 
     digest = hashlib.sha256()
     digest.update(IMAGE_VERSION.encode("utf-8"))
     for name in ("Dockerfile", "init.sh"):
         digest.update(_IMAGE_RESOURCES.joinpath(name).read_bytes())
+    package = Path(str(files("agents_on_modal")))
+    for path in sorted(p for p in package.rglob("*") if p.is_file()):
+        if "__pycache__" in path.parts or path.suffix in (".pyc", ".pyo"):
+            continue
+        digest.update(path.relative_to(package).as_posix().encode("utf-8") + b"\0")
+        digest.update(path.read_bytes())
     return digest.hexdigest()[:12]
 
 
@@ -139,22 +161,40 @@ class ModalSandbox(Sandbox):
 
     @classmethod
     def ensure_image(cls, build: bool = False) -> Any:
-        """Return the published sandbox image, building+publishing it only on a miss or ``build``.
+        """Return the published sandbox image, building+publishing it only when ``build``.
 
-        Hot path is a pure ``Image.from_name`` lookup (never triggers a build). A build requires
-        network and output streaming; this method performs it as ``image.build(app)`` under
-        ``modal.enable_output()`` and then publishes it under :data:`IMAGE_NAME`.
+        Hot path is a pure ``Image.from_name`` lookup (never triggers a build). That lookup is lazy
+        -- Modal offers no on-demand image hydrate -- so a tag that was never published surfaces at
+        ``Sandbox.create``, which then builds it via :meth:`_image_after_miss`. A build requires
+        network and output streaming; it runs as ``image.build(app)`` under
+        ``modal.enable_output()`` and is then published under :data:`IMAGE_NAME`.
         """
 
+        # One lookup/build at a time per process: concurrent creates (a swarm fan-out, the dynamic
+        # controller) after a source change would otherwise each start the same image build.
+        with _IMAGE_LOCK:
+            return cls._ensure_image_locked(build)
+
+    @classmethod
+    def _image_after_miss(cls, missing: Any) -> Any:
+        """``missing`` (a lazy lookup) named an unpublished tag: build it, once, however many
+        concurrent creates hit the same miss."""
+
+        with _IMAGE_LOCK:
+            current = _IMAGES.get(_image_ref())
+            if current is not None and current is not missing:
+                return current  # another create already built it
+            return cls._ensure_image_locked(build=True)
+
+    @classmethod
+    def _ensure_image_locked(cls, build: bool) -> Any:
         import modal
 
         ref = _image_ref()
         if not build:
-            try:
-                return modal.Image.from_name(ref)
-            except Exception as error:  # noqa: BLE001 - re-raise anything that is not "not found"
-                if not _is_not_found(modal, error):
-                    raise
+            if ref not in _IMAGES:
+                _IMAGES[ref] = modal.Image.from_name(ref)
+            return _IMAGES[ref]
         # Force the modern image builder for the build below (the account default may be legacy,
         # which cannot build this Debian-based Dockerfile; see MODAL_IMAGE_BUILDER_VERSION).
         os.environ.setdefault("MODAL_IMAGE_BUILDER_VERSION", MODAL_IMAGE_BUILDER_VERSION)
@@ -169,6 +209,7 @@ class ModalSandbox(Sandbox):
         image.publish(ref)
         # The built handle is usable as ``image=`` directly; it is now also published under ``ref``
         # so subsequent (and concurrent) creates take the pure ``Image.from_name`` hot path above.
+        _IMAGES[ref] = image
         return image
 
     # ---- lifecycle --------------------------------------------------------------------------
@@ -246,12 +287,12 @@ class ModalSandbox(Sandbox):
             "proxy_token_id": token_id,
         }
 
-        try:
-            sb = modal.Sandbox.create(
+        def create_on(img: Any) -> Any:
+            return modal.Sandbox.create(
                 "sleep",
                 "infinity",
                 app=app,
-                image=image,
+                image=img,
                 name=sid,
                 tags=tags,
                 timeout=int(timeout),
@@ -265,6 +306,14 @@ class ModalSandbox(Sandbox):
                 region=region,
                 verbose=False,
             )
+
+        try:
+            try:
+                sb = create_on(image)
+            except Exception as error:  # noqa: BLE001 - only an unpublished image tag is retried
+                if build or not (_is_not_found(modal, error) and "Image" in str(error)):
+                    raise
+                sb = create_on(cls._image_after_miss(image))  # this source's image: build it once
         except Exception as error:  # noqa: BLE001 - on failure, do not leak the token we just made
             if token_id:
                 try:
@@ -345,6 +394,22 @@ class ModalSandbox(Sandbox):
                 raise SandboxError(f"no Modal sandbox named or identified by {sandbox_id!r}") from error
         return cls._reconstruct(sb)
 
+    def alive(self) -> bool:
+        """False once the Modal sandbox has exited (its timeout or idle timeout, OOM, a stop)."""
+
+        return self._sb.poll() is None
+
+    def reload_volumes(self) -> None:
+        """Pull other writers' changes into this sandbox's ``/shared`` (~2 s round trip).
+
+        A running sandbox's Volume mount only ever shows its own writes plus what was there at
+        mount time; files the controller or sibling sandboxes write stay invisible until a reload
+        (its own recent writes survive one). Without it an orchestrator never saw its acks,
+        workflow state or subagents' reports.
+        """
+
+        self._sb.reload_volumes()
+
     def stop(self) -> None:
         """Terminate the sandbox and delete its run-scoped proxy token (idempotent)."""
 
@@ -422,6 +487,20 @@ class ModalSandbox(Sandbox):
             workdir=cwd or self.workdir,
         )
 
+    def spawn_run(self, argv: Sequence[str], *, cwd: str | None = None) -> None:
+        """Start a runner as an ATTACHED exec that is never waited on, unlike :meth:`spawn`.
+
+        Modal reaps a sandbox after ``idle_timeout`` with no client activity and no running exec,
+        and a detached process does not count: a run waiting on a busy model was killed mid-flight,
+        with no final status, whenever nothing polled it for 15 min. A live exec keeps the sandbox
+        active for exactly as long as the runner runs -- it outlives the client that started it --
+        and the idle timeout still reaps the sandbox once the run is over.
+        """
+
+        wrapped = self._as_agent(argv, root=False)
+        command = "exec " + " ".join(shlex.quote(part) for part in wrapped) + " >>/tmp/aom-spawn.log 2>&1"
+        self._sb.exec("bash", "-lc", command, workdir=cwd or self.workdir)
+
     def write_file(self, path: str, data: str | bytes) -> None:
         raw = data.encode("utf-8") if isinstance(data, str) else bytes(data)
         self._sb.filesystem.write_bytes(raw, path)
@@ -497,6 +576,7 @@ class ModalSandbox(Sandbox):
             # As harness env (setup.env) it overrides the container's os.environ for the harness and
             # every tool subprocess it spawns -- fixing sudo-free `pip install` on the Modal backend.
             env={"PYTHONPATH": "/opt/aom", **self._relay_env},
+            extra_dirs=("/shared", "/tmp") if self._shared else ("/tmp",),
         )
 
     # ---- internals --------------------------------------------------------------------------

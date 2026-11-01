@@ -2,12 +2,12 @@
 
     from agents_on_modal import models
     model = models.get("qwen3.8-27b")
-    endpoint = models.deploy(model)          # idempotent; weights prepared on CPU first
+    endpoint = models.ensure_deployed(model, max_containers=1)   # deploys only if not yet deployed
     models.wait_ready(endpoint)
     models.scale(model, min_containers=2, max_containers=16)   # live, no redeploy
 
-``deploy``/``endpoint``/``wait_ready``/``scale``/``stop``/``status`` live in ``deploy.py`` and are
-re-exported here lazily so importing the catalog never imports Modal.
+``deploy``/``ensure_deployed``/``endpoint``/``wait_ready``/``scale``/``stop``/``status`` live in
+``lifecycle.py`` and are re-exported here lazily so importing the catalog never imports Modal.
 """
 
 from __future__ import annotations
@@ -65,14 +65,19 @@ class Reasoning:
 
 @dataclass(frozen=True)
 class Scaling:
-    """Modal autoscaler settings for the model's GPU server -- the one place a model's capacity
-    policy lives, applied once at deploy.
+    """Modal autoscaler settings for the model's GPU server -- how the model packs requests onto
+    its containers, applied at deploy.
 
     A deployed model is a SHARED, account-level resource: every swarm/app that uses the same model
-    id hits the same Modal app (the app name derives from the model id and ``deploy`` is
-    idempotent), and Modal's concurrency autoscaler sizes it from the AGGREGATE request load across
-    all of them. Callers therefore never scale per launch -- they just ``deploy`` (idempotent) and
-    send requests; this policy is what governs the GPU pool.
+    id hits the same Modal app (the app name derives from the model id), and Modal's concurrency
+    autoscaler sizes it from the AGGREGATE request load across all of them. Callers therefore never
+    scale per launch -- they ``ensure_deployed`` and send requests; this policy plus the endpoint's
+    container cap is what governs the GPU pool.
+
+    There is deliberately no ``max_containers`` here: how many GPU containers an endpoint may run is
+    the call of the apps using it, not a property of the model. Each app asks for a cap
+    (``ensure_deployed(model, max_containers=n)``); the endpoint keeps the largest any of them
+    asked for, and only an explicit ``scale`` lowers it.
 
     It is deliberately conservative -- pack requests onto a GPU before spawning another, because GPU
     compute is expensive and agents tolerate mild queueing better than a fleet wants to pay for idle
@@ -81,20 +86,19 @@ class Scaling:
     * ``target_concurrency`` -- the sharing unit: how many requests one container serves at once
       (continuous batching) before Modal considers adding a container. Kept high, so many agents
       share one GPU (an agent spends most of its wall-clock running tools, not awaiting tokens).
-    * ``max_containers`` -- a small ceiling: under genuine sustained saturation Modal may add a
-      container or two, never a GPU-per-caller fan-out.
     * ``scaleup_window`` -- how long load must stay above target before a new container spawns;
       long, so brief bursts queue (slightly slower agents) rather than cold-start another GPU.
     * ``min_containers`` 0 -- scale to zero when idle (the gateway holds requests through the next
       cold start); ``scaledown_window`` keeps a container warm a while so back-to-back use is not
       punished by repeated cold starts.
 
-    Bigger/slower models override ``target_concurrency`` in the catalog (fewer concurrent requests
-    per GPU); everything else inherits these defaults.
+    A catalog entry overrides ``target_concurrency`` with the batch its box runs at full speed --
+    its ``--cuda-graph-max-bs-decode`` when it sets one, a pressure-tested number once it has one,
+    1 for a single-slot llama.cpp server -- and inherits these defaults otherwise. A value below
+    what the box serves only adds GPUs early, once an endpoint's container cap is raised above 1.
     """
 
     min_containers: int = 0
-    max_containers: int = 2
     buffer_containers: int = 0
     scaledown_window: int = 900
     scaleup_window: int = 60
@@ -165,6 +169,11 @@ class Model:
     def from_json(cls, data: dict[str, Any]) -> "Model":
         values = dict(data)
         values["reasoning"] = Reasoning(**values.get("reasoning", {}))
+        if "max_containers" in (values.get("scaling") or {}):
+            raise AomError(
+                f"Model {values.get('name')!r}: max_containers is not a catalog setting -- the app "
+                "using the endpoint picks it (models.ensure_deployed(model, max_containers=n))."
+            )
         values["scaling"] = Scaling(**values.get("scaling", {}))
         values["engine_args"] = tuple(values.get("engine_args", ()))
         values["serving_pip"] = tuple(values.get("serving_pip", ()))
@@ -251,4 +260,6 @@ class Endpoint:
 # functions, so this stays import-cheap and modal-free). They are re-exported here as
 # ``models.deploy`` / ``models.scale`` / ... — the public names callers use. The submodule is
 # named ``lifecycle`` (not ``deploy``) so there is no clash with the ``deploy`` function.
-from .lifecycle import active_containers, deploy, endpoint, scale, status, stop, wait_ready  # noqa: E402
+from .lifecycle import (  # noqa: E402
+    active_containers, deploy, endpoint, ensure_deployed, scale, status, stop, wait_ready,
+)

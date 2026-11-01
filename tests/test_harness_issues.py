@@ -290,7 +290,9 @@ def test_s4_ack_timeout_default_and_env(monkeypatch):
 
     monkeypatch.delenv("AOM_SWARM_ACK_TIMEOUT", raising=False)
     args = swarmctl.build_parser().parse_args(["spawn", "--prompt", "x", "--timeout", "1"])
-    assert args.ack_timeout == 900.0  # was 120 -- past the ~12 min observed latency
+    # 90: under the harness's 120 s shell timeout. The ~12 min acks once observed were the
+    # orchestrator's /shared mount never reloading, which the controller now does every tick.
+    assert args.ack_timeout == 90.0
 
     monkeypatch.setenv("AOM_SWARM_ACK_TIMEOUT", "77")
     args = swarmctl.build_parser().parse_args(["submit", "--file", "-"])

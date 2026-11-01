@@ -211,6 +211,15 @@ class Codex(Harness):
         etype = data.get("type")
         if etype == "thread.started":
             return [Event("session", {"session_id": data.get("thread_id")}, ts=ts)]
+        if etype == "item.started":
+            # Record the call when it starts, so call -> result spans the tool's own runtime
+            # (everything else in a gap is model wait). Completion then only adds the result.
+            item = data.get("item") or {}
+            call = self._tool_call(item, ts)
+            if call is not None:
+                self.__dict__.setdefault("_started", set()).add(item.get("id"))
+                return [call]
+            return []
         if etype in ("item.completed", "item.updated"):
             return self._parse_item(data.get("item") or {}, ts)
         if etype == "turn.completed":
@@ -238,53 +247,9 @@ class Codex(Harness):
             return [Event("text", {"text": item.get("text", "")}, ts=ts)]
         if itype == "reasoning":
             return [Event("thinking", {"text": item.get("text", "")}, ts=ts)]
-        if itype == "command_execution":
-            exit_code = item.get("exit_code")
-            return [
-                Event(
-                    "tool_call",
-                    {"id": item.get("id"), "name": "exec_command", "input": {"command": item.get("command")}},
-                    ts=ts,
-                ),
-                Event(
-                    "tool_result",
-                    {
-                        "id": item.get("id"),
-                        "output": item.get("aggregated_output"),
-                        "is_error": bool(exit_code) if exit_code is not None else False,
-                    },
-                    ts=ts,
-                ),
-            ]
-        if itype == "file_change":
-            return [
-                Event(
-                    "tool_result",
-                    {"id": item.get("id"), "output": item.get("changes"), "is_error": False},
-                    ts=ts,
-                )
-            ]
-        if itype == "mcp_tool_call":
-            return [
-                Event(
-                    "tool_call",
-                    {
-                        "id": item.get("id"),
-                        "name": f"{item.get('server')}__{item.get('tool')}",
-                        "input": item.get("arguments") or {},
-                    },
-                    ts=ts,
-                ),
-                Event(
-                    "tool_result",
-                    {
-                        "id": item.get("id"),
-                        "output": item.get("result"),
-                        "is_error": item.get("status") == "failed" or bool(item.get("error")),
-                    },
-                    ts=ts,
-                ),
-            ]
+        if itype in ("command_execution", "file_change", "mcp_tool_call"):
+            events = [] if self._consume_started(item.get("id")) else [self._tool_call(item, ts)]
+            return events + [self._tool_result(item, ts)]
         if itype == "collab_tool_call":
             events: list[Event] = []
             states = item.get("agents_states") or {}
@@ -306,7 +271,43 @@ class Codex(Harness):
             return events
         if itype == "error":
             return [Event("error", {"message": item.get("message")}, ts=ts)]
+        if itype:  # todo_list, web_search, ...: keep a trace of it instead of silently dropping it
+            return [Event("log", {"text": f"[codex {itype}] {json.dumps(item, default=str)[:500]}"}, ts=ts)]
         return []
+
+    def _tool_call(self, item: dict[str, Any], ts: float) -> Event | None:
+        itype, item_id = item.get("type"), item.get("id")
+        if itype == "command_execution":
+            return Event("tool_call", {"id": item_id, "name": "exec_command",
+                                       "input": {"command": item.get("command")}}, ts=ts)
+        if itype == "file_change":  # an apply_patch: record it as a call, not only its result
+            return Event("tool_call", {"id": item_id, "name": "apply_patch",
+                                       "input": {"changes": item.get("changes")}}, ts=ts)
+        if itype == "mcp_tool_call":
+            return Event("tool_call", {"id": item_id, "name": f"{item.get('server')}__{item.get('tool')}",
+                                       "input": item.get("arguments") or {}}, ts=ts)
+        return None
+
+    def _tool_result(self, item: dict[str, Any], ts: float) -> Event:
+        itype, status = item.get("type"), item.get("status")
+        failed = status in ("failed", "declined") or bool(item.get("error"))
+        if itype == "command_execution":
+            exit_code = item.get("exit_code")
+            output, is_error = item.get("aggregated_output"), failed or bool(exit_code)
+        elif itype == "file_change":
+            output, is_error = item.get("changes"), failed
+        else:
+            output, is_error = item.get("result") if item.get("error") is None else item.get("error"), failed
+        return Event("tool_result", {"id": item.get("id"), "output": output, "is_error": is_error}, ts=ts)
+
+    def _consume_started(self, item_id: Any) -> bool:
+        """True (once) if this item's call was already emitted at ``item.started``."""
+
+        started = self.__dict__.get("_started")
+        if started and item_id in started:
+            started.discard(item_id)
+            return True
+        return False
 
     def _goal_event(self, item: dict[str, Any], ts: float) -> Event | None:
         """Detect a goal tool call in an exec item and map it to a normalized ``goal`` event."""

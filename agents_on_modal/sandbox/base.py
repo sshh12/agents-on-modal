@@ -92,6 +92,16 @@ class Sandbox(ABC):
     def stop(self) -> None:
         """Destroy the sandbox and everything it owns (idempotent)."""
 
+    def alive(self) -> bool:
+        """False once the sandbox itself is gone (so its runs can never finish). Backends that can
+        tell override this; the default assumes alive."""
+
+        return True
+
+    def reload_volumes(self) -> None:
+        """Make writes others made to this sandbox's mounted volumes visible inside it. A no-op where
+        mounts are live (local dirs, Docker binds); Modal snapshots them until reloaded."""
+
     def labels(self) -> dict[str, str]:
         """Metadata recorded at creation (tags / labels / meta.json)."""
 
@@ -106,6 +116,12 @@ class Sandbox(ABC):
     @abstractmethod
     def spawn(self, argv: Sequence[str], *, env: Mapping[str, str] | None = None, cwd: str | None = None) -> None:
         """Start a detached background process as the agent user; returns immediately."""
+
+    def spawn_run(self, argv: Sequence[str], *, cwd: str | None = None) -> None:
+        """Start a run's runner in the background; returns immediately. Backends whose sandbox
+        lifetime depends on activity override this so a live run counts as activity."""
+
+        self.spawn(argv, cwd=cwd)
 
     @abstractmethod
     def write_file(self, path: str, data: str | bytes) -> None:
@@ -177,7 +193,7 @@ class Sandbox(ABC):
             "meta": dict(meta or {}),
         }
         self.write_file(self.join(run_dir, "spec.json"), json.dumps(spec, indent=2))
-        self.spawn([*self.python, "-m", "agents_on_modal.runner", run_dir], cwd=setup.workdir)
+        self.spawn_run([*self.python, "-m", "agents_on_modal.runner", run_dir], cwd=setup.workdir)
         return Run(self, run_id)
 
     def runs(self) -> list["Run"]:

@@ -9,6 +9,8 @@ Everything flows over the shared Modal Volume mounted at ``/shared`` in every ag
 reserved namespace, ``/shared/_swarm/``, is the control plane:
 
     _swarm/meta.json              {swarm_id, model, harness, orchestrator_id, default_timeout}
+    _swarm/launch.json            launch settings + the raw task, for tracking and reproduction
+    _swarm/orchestrator_prompt.md the exact prompt the orchestrator got (instructions + task)
     _swarm/requests/<reqid>.json  CLI -> controller commands   {id, ts, verb, payload}
     _swarm/ack/<reqid>.json       controller -> CLI replies    {id, ok, errors, warnings, result}
     _swarm/workflows/<name>.json  controller-published plan + live stage/agent state
@@ -30,12 +32,15 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
 from .config import AomError
+from .harness import HARNESSES
 from .models import EFFORTS, normalize_effort
 
 #: Every subagent needs an explicit deadline (Modal sandboxes always take a timeout); this is the
@@ -44,8 +49,22 @@ DEFAULT_TIMEOUT = 3600.0
 
 #: The one reserved directory under ``/shared``. Everything else there is free-form.
 RESERVED = "_swarm"
+#: Written once at launch under RESERVED: the orchestrator's exact prompt, and the launch settings.
+ORCHESTRATOR_PROMPT_FILE = "orchestrator_prompt.md"
+LAUNCH_FILE = "launch.json"
 
 TERMINAL_STATES = ("done", "timeout", "failed", "cancelled")
+
+#: Subagent sandboxes the controller creates / polls at once. A create+start is ~10 s of Modal round
+#: trips and a refresh a few more, so one at a time made a 100-agent wave take ~20 min to fill (each
+#: agent's deadline ticking from its own late start) and stalled the rest of the tick behind it --
+#: acks, workflow state, the orchestrator's trace tail.
+CONTROLLER_CONCURRENCY = 16
+
+#: How often (seconds) the controller reloads each live subagent's ``/shared`` mount so it sees what
+#: the others wrote. A Modal sandbox's volume mount never shows outside writes until reloaded. The
+#: orchestrator is reloaded every tick instead: its acks and workflow state live there.
+SUBAGENT_RELOAD_INTERVAL = 30.0
 
 
 class PlanError(AomError):
@@ -64,6 +83,8 @@ class AgentSpec:
     timeout: float = DEFAULT_TIMEOUT
     effort: str | None = None
     schema: dict[str, Any] | None = None
+    #: The agent CLI to run it under; ``None`` -> the swarm's (the orchestrator's) harness.
+    harness: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         data: dict[str, Any] = {"prompt": self.prompt, "goal": self.goal, "timeout": self.timeout}
@@ -71,6 +92,8 @@ class AgentSpec:
             data["effort"] = self.effort
         if self.schema is not None:
             data["schema"] = self.schema
+        if self.harness:
+            data["harness"] = self.harness
         return data
 
 
@@ -153,14 +176,21 @@ def _parse_agent(
 
     schema = data.get("schema")
     if schema is not None and not isinstance(schema, dict):
-        errors.append(f"{where}: 'schema' must be a JSON object")
+        errors.append(f"{where}: 'schema' must be a JSON object (inline, or a path to a JSON file "
+                      "that `aom-swarm submit` can read)")
         schema = None
 
+    harness = data.get("harness")
+    if harness is not None and harness not in HARNESSES:
+        errors.append(f"{where}: unknown harness {harness!r} (known: {', '.join(HARNESSES)})")
+        harness = None
+
     for key in data:
-        if key not in ("prompt", "goal", "timeout", "effort", "schema"):
+        if key not in ("prompt", "goal", "timeout", "effort", "schema", "harness"):
             warnings.append(f"{where}: unknown field {key!r} ignored")
 
-    return AgentSpec(prompt=prompt, goal=goal, timeout=timeout, effort=effort, schema=schema)
+    return AgentSpec(prompt=prompt, goal=goal, timeout=timeout, effort=effort, schema=schema,
+                     harness=harness)
 
 
 def parse_plan(
@@ -219,8 +249,51 @@ def parse_plan(
             stages.append(Stage(name=name, agents=agents, max_concurrent=max_concurrent))
 
     if errors:
-        return None, errors, warnings
-    return Plan(stages=stages), errors, warnings
+        return None, _collapse_repeats(errors), _collapse_repeats(warnings)
+    return Plan(stages=stages), errors, _collapse_repeats(warnings)
+
+
+_PER_AGENT = re.compile(r"(?P<stage>stages\[\d+\]\.agents)\[(?P<idx>\d+)\]: (?P<msg>.*)", re.S)
+
+
+def _collapse_repeats(messages: list[str]) -> list[str]:
+    """Fold a per-agent message repeated across a stage into one line, in first-seen order:
+    ``stages[0].agents[0-111] (112 agents): ...``. One shared mistake in a 112-agent wave
+    otherwise prints 112 identical lines, and a caller's ``tail`` hides where they start."""
+
+    groups: dict[tuple[str, str], list[int]] = {}
+    order: list[Any] = []
+    for message in messages:
+        hit = _PER_AGENT.fullmatch(message)
+        if not hit:
+            order.append(message)
+            continue
+        key = (hit["stage"], hit["msg"])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(int(hit["idx"]))
+    out = []
+    for item in order:
+        if isinstance(item, str):
+            out.append(item)
+            continue
+        (stage, msg), idxs = item, groups[item]
+        count = f" ({len(idxs)} agents)" if len(idxs) > 1 else ""
+        out.append(f"{stage}[{_index_ranges(idxs)}]{count}: {msg}")
+    return out
+
+
+def _index_ranges(idxs: list[int]) -> str:
+    """``[0, 1, 2, 5, 7, 8]`` -> ``"0-2,5,7-8"``."""
+
+    spans: list[list[int]] = []
+    for i in sorted(set(idxs)):
+        if spans and i == spans[-1][1] + 1:
+            spans[-1][1] = i
+        else:
+            spans.append([i, i])
+    return ",".join(str(a) if a == b else f"{a}-{b}" for a, b in spans)
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -384,8 +457,10 @@ class VolumeControlPlane(ControlPlane):
 # Schema soft-contract                                                                           #
 # --------------------------------------------------------------------------------------------- #
 _SCHEMA_INSTRUCTION = (
-    "\n\n---\nWhen you have finished, also write your final result as a single JSON document that "
-    "conforms to this JSON schema to the file `{path}` (create parent directories if needed):\n"
+    "\n\n---\nREQUIRED OUTPUT: as soon as you have the result -- before any final review, summary "
+    "or status bookkeeping -- write it as a single JSON document that conforms to this JSON schema "
+    "to the file `{path}` (create parent directories if needed). It is part of the task, not an "
+    "afterthought: an agent that runs out of time before writing it has not delivered.\n"
     "```json\n{schema}\n```\n"
 )
 
@@ -442,6 +517,12 @@ class _AgentRun:
     state: str = "starting"
     schema_ok: bool | None = None
     offset: int = 0
+    error: str | None = None
+    last_reload: float = 0.0
+    #: Terminal and fully published, so later ticks skip it. Set on the refresh AFTER the first one
+    #: that read a terminal state, so trace lines the runner writes after flipping status still land.
+    settled: bool = False
+    _seen_terminal: bool = False
 
     @property
     def id(self) -> str:
@@ -508,6 +589,7 @@ class Controller:
         # Orchestrator trace tailing (its sandbox is not a subagent; tail it so its trace persists
         # to the volume too and survives teardown).
         self._orch_run: Any = None
+        self._orch_box: Any = None
         self._orch_offset = 0
         #: Orchestrator harness session id, discovered from its trace and published to meta.json so a
         #: resume does not have to scrape the trace (issue S9) -- also what resume_orchestrator reads.
@@ -568,6 +650,7 @@ class Controller:
             self._advance(wf)
             self._publish_workflow(wf)
 
+        self._reload_orchestrator()  # so its `aom-swarm` sees the acks + state just written
         self._tail_orchestrator()
         self._supervise_orchestrator()
 
@@ -682,21 +765,36 @@ class Controller:
             return
         # Refresh every running agent's state first (and validate schema on completion), THEN decide
         # what is finished -- otherwise completion would always lag a tick behind reality.
-        for stage_runs in wf.runs.values():
-            for ar in stage_runs.values():
-                self._refresh(ar)
+        live = [ar for stage_runs in wf.runs.values() for ar in stage_runs.values() if not ar.settled]
+        errors = [error for _, _, error in self._map(self._refresh, live) if error]
         finished_by_stage = [self._finished_indices(wf, si) for si in range(len(wf.plan.stages))]
-        if wf.paused:
-            return
-        active = active_stage_index(wf.plan, finished_by_stage)
-        if active is None:
-            return  # workflow complete
-        stage = wf.plan.stages[active]
-        stage_runs = wf.runs.setdefault(active, {})
-        started = set(stage_runs.keys())
-        finished = finished_by_stage[active]
-        for idx in stage_next_indices(stage, started, finished):
-            stage_runs[idx] = self._spawn_agent(wf, active, idx)
+        if not wf.paused:
+            active = active_stage_index(wf.plan, finished_by_stage)
+            if active is not None:  # None: workflow complete
+                stage = wf.plan.stages[active]
+                stage_runs = wf.runs.setdefault(active, {})
+                todo = stage_next_indices(stage, set(stage_runs), finished_by_stage[active])
+                for idx, ar, error in self._map(lambda i: self._spawn_agent(wf, active, i), todo):
+                    if error:  # left unstarted: the next tick retries it
+                        errors.append(error)
+                    else:
+                        stage_runs[idx] = ar
+        if errors:
+            raise errors[0]  # run_forever records it; everything that succeeded is already kept
+
+    def _map(self, fn: Any, items: list) -> list[tuple[Any, Any, BaseException | None]]:
+        """``fn`` over ``items`` on up to :data:`CONTROLLER_CONCURRENCY` threads, in order:
+        ``[(item, result, error)]`` -- one failure never discards the others' results."""
+
+        if not items:
+            return []
+        with ThreadPoolExecutor(max_workers=min(CONTROLLER_CONCURRENCY, len(items))) as pool:
+            futures = [(item, pool.submit(fn, item)) for item in items]
+        out = []
+        for item, future in futures:
+            error = future.exception()
+            out.append((item, None if error else future.result(), error))
+        return out
 
     def _finished_indices(self, wf: _WorkflowRuntime, stage_index: int) -> set[int]:
         done = set()
@@ -722,7 +820,7 @@ class Controller:
             out = f"/shared/{RESERVED}/outputs/{box.id}.json"
             prompt += _SCHEMA_INSTRUCTION.format(path=out, schema=json.dumps(spec.schema, indent=2))
         run = box.start(
-            self.harness,
+            spec.harness or self.harness,
             self.endpoint,
             prompt,
             goal=spec.goal,
@@ -743,12 +841,21 @@ class Controller:
     def _refresh(self, ar: _AgentRun) -> None:
         try:
             ar.state = str(ar.run.status().get("state", ar.state))
-        except Exception:  # noqa: BLE001 - mid-flight read; keep the last known state
-            pass
+        except Exception:  # noqa: BLE001 - mid-flight read; keep the last known state...
+            # ...unless the sandbox itself is gone: then the run can never report again, and
+            # leaving it "running" would hang `aom-swarm wait` and the stage forever.
+            if ar.state not in TERMINAL_STATES and not _box_alive(ar.box):
+                ar.state = "failed"
+                ar.error = "sandbox exited before the run finished (timeout, idle timeout, or OOM)"
         self._publish_trace(ar)
         if ar.state in TERMINAL_STATES and ar.spec.schema is not None and ar.schema_ok is None:
             self._check_schema(ar)
         self._publish_agent(ar)
+        if ar.state in TERMINAL_STATES:
+            ar.settled, ar._seen_terminal = ar._seen_terminal, True
+        elif time.time() - ar.last_reload >= SUBAGENT_RELOAD_INTERVAL:
+            ar.last_reload = time.time()
+            _reload_volumes(ar.box)  # let it see what its siblings wrote to /shared
 
     def _check_schema(self, ar: _AgentRun) -> None:
         produced = self.control.get_json(f"{RESERVED}/outputs/{ar.id}.json")
@@ -777,6 +884,16 @@ class Controller:
         except Exception:  # noqa: BLE001
             return
         self._append_events(ar.id, ar.run, envelopes)
+
+    def _reload_orchestrator(self) -> None:
+        if not self.orchestrator_id:
+            return
+        try:
+            if self._orch_box is None:
+                self._orch_box = self._sb.get("modal", self.orchestrator_id)
+        except Exception:  # noqa: BLE001 - orchestrator gone; nothing to reload
+            return
+        _reload_volumes(self._orch_box)
 
     def _tail_orchestrator(self) -> None:
         """Persist the orchestrator's trace too (it is a sandbox, not a subagent), so it survives
@@ -902,12 +1019,14 @@ class Controller:
                 "stage": ar.stage,
                 "idx": ar.idx,
                 "role": "subagent",
+                "harness": ar.spec.harness or self.harness,
                 "state": ar.state,
                 "goal": ar.spec.goal,
                 "timeout": ar.spec.timeout,
                 "effort": ar.spec.effort,
                 "schema": ar.spec.schema is not None,
                 "schema_ok": ar.schema_ok,
+                "error": ar.error,
             },
         )
 
@@ -992,6 +1111,7 @@ class DynamicSwarm:
         prompt: str,
         *,
         timeout: float,
+        max_containers: int,
         effort: str | None = None,
         proxy: str | None = None,
         shared_volume: str | None = None,
@@ -1002,18 +1122,19 @@ class DynamicSwarm:
         from .models import lifecycle as model_ops
 
         resolved = models.get(model)
-        # Ensure the shared model is deployed (idempotent); do NOT scale it per swarm. The model is
-        # an account-level shared resource -- Modal's concurrency autoscaler sizes it from aggregate
-        # load across the orchestrator, this swarm's subagents, and any other consumer, under the
-        # conservative catalog policy (``Scaling``).
-        endpoint = model_ops.deploy(resolved)
+        # Attach to the shared model (deploying it only if it isn't yet); never redeploy it or size
+        # it by agent count. The model is an account-level shared resource -- Modal's concurrency
+        # autoscaler sizes it from aggregate load across the orchestrator, this swarm's subagents,
+        # and any other consumer, under the catalog policy (``Scaling``) and the container cap the
+        # apps on it asked for (``max_containers`` only ever raises it) -- and a redeploy would
+        # replace its containers under all of them.
+        endpoint = model_ops.ensure_deployed(resolved, max_containers=max_containers)
 
         swarm_id = sandbox.new_id("swarm-")
         shared = shared_volume or f"aom-shared-{swarm_id}"
         allowed = _model_efforts(resolved)
         instructions = build_orchestrator_instructions(
             default_timeout=default_subagent_timeout,
-            model_name=resolved.name,
             allowed_efforts=allowed,
         )
         full_prompt = f"{instructions}\n\n---\n\n# Your task\n\n{prompt}\n"
@@ -1048,6 +1169,31 @@ class DynamicSwarm:
                 },
             )
         except Exception:  # noqa: BLE001
+            pass
+        # The launch record, for tracking and reproduction: the exact prompt the orchestrator got
+        # (injected instructions + task) and the settings to relaunch it. Records only WHETHER a
+        # proxy was used -- its URL can carry credentials.
+        try:
+            cp.put_text(f"{RESERVED}/{ORCHESTRATOR_PROMPT_FILE}", full_prompt)
+            cp.put_json(
+                f"{RESERVED}/{LAUNCH_FILE}",
+                {
+                    "swarm_id": swarm_id,
+                    "created_at": time.time(),
+                    "harness": harness,
+                    "model": resolved.name,
+                    "effort": effort,
+                    "timeout": timeout,
+                    "max_containers": max_containers,
+                    "default_subagent_timeout": default_subagent_timeout,
+                    "proxied": bool(proxy),
+                    "orchestrator_id": box.id,
+                    "orchestrator_run_id": getattr(run, "run_id", None),
+                    "task": prompt,
+                    "orchestrator_prompt_file": f"{RESERVED}/{ORCHESTRATOR_PROMPT_FILE}",
+                },
+            )
+        except Exception:  # noqa: BLE001 - best-effort, like meta.json
             pass
         return cls(
             id=swarm_id,
@@ -1197,7 +1343,7 @@ def resume_orchestrator(
     default_timeout = float(meta.get("default_timeout", DEFAULT_TIMEOUT))
 
     instructions = build_orchestrator_instructions(
-        default_timeout=default_timeout, model_name=model.name, allowed_efforts=_model_efforts(model),
+        default_timeout=default_timeout, allowed_efforts=_model_efforts(model),
     )
     prior = meta.get("orchestrator_id")
     task = (
@@ -1240,23 +1386,56 @@ def _model_efforts(model: Any) -> list[str]:
     return ordered or ["low", "medium", "high"]
 
 
-def _install_cli_shim(box: Any) -> None:
-    """Best-effort: put an ``aom-swarm`` wrapper on PATH in the orchestrator sandbox. If it fails,
-    the injected instructions also give the ``python3 -m agents_on_modal.swarmctl`` form."""
+def _reload_volumes(box: Any) -> None:
+    """Best-effort ``box.reload_volumes()``: a failed reload only delays visibility to the next one."""
 
-    shim = '#!/bin/sh\nexec python3 -m agents_on_modal.swarmctl "$@"\n'
     try:
-        box.write_file("/tmp/aom-swarm", shim)
-        box.exec(["install", "-m", "0755", "/tmp/aom-swarm", "/usr/local/bin/aom-swarm"], root=True)
-    except Exception:  # noqa: BLE001 - sugar only
+        box.reload_volumes()
+    except Exception:  # noqa: BLE001 - no reload_volumes() (fakes), sandbox gone, or a flaky call
         pass
+
+
+def _box_alive(box: Any) -> bool:
+    """Whether ``box`` still exists; ``True`` when that can't be told (never fail a run on doubt)."""
+
+    try:
+        return bool(box.alive())
+    except Exception:  # noqa: BLE001 - no alive() (fakes) or a flaky poll
+        return True
+
+
+#: ``aom`` in a sandbox: the host CLI needs Modal credentials a sandbox never has, but agents reach
+#: for it by analogy with ``aom-swarm``, so answer with a pointer instead of "command not found".
+_AOM_HINT_SHIM = (
+    "#!/bin/sh\n"
+    "echo 'aom: the host-side aom CLI (models, deploys) is not available inside a sandbox.' >&2\n"
+    "echo 'Use aom-swarm to drive subagents: aom-swarm --help' >&2\n"
+    "exit 127\n"
+)
+
+
+def _install_cli_shim(box: Any) -> None:
+    """Best-effort: put an ``aom-swarm`` wrapper (and an ``aom`` pointer to it) on PATH in the
+    orchestrator sandbox. If it fails, the injected instructions also give the
+    ``python3 -m agents_on_modal.swarmctl`` form."""
+
+    shims = {
+        "aom-swarm": '#!/bin/sh\nexec python3 -m agents_on_modal.swarmctl "$@"\n',
+        "aom": _AOM_HINT_SHIM,
+    }
+    for name, text in shims.items():
+        try:
+            box.write_file(f"/tmp/{name}", text)
+            box.exec(["install", "-m", "0755", f"/tmp/{name}", f"/usr/local/bin/{name}"], root=True)
+        except Exception:  # noqa: BLE001 - sugar only
+            pass
 
 
 # --------------------------------------------------------------------------------------------- #
 # Injected orchestrator instructions (shown verbatim in the dashboard)                           #
 # --------------------------------------------------------------------------------------------- #
 def build_orchestrator_instructions(
-    *, default_timeout: float, model_name: str, allowed_efforts: list[str]
+    *, default_timeout: float, allowed_efforts: list[str]
 ) -> str:
     """Markdown prepended to the orchestrator's prompt (and surfaced by the dashboard so the user
     sees exactly what was injected)."""
@@ -1266,19 +1445,31 @@ def build_orchestrator_instructions(
     return f"""# You are a dynamic-swarm orchestrator
 
 You can spawn and manage a fleet of **subagents** (each its own Modal sandbox running the same
-harness and model, `{model_name}`) to accomplish the task below. You do this with the `aom-swarm`
-command. Spawn only what the task needs; subagents are expensive.
+harness and model as you) to accomplish the task below. You do this with the `aom-swarm` command.
+
+The endpoint is shared and batch-served: it runs many requests per GPU at once, so a fleet is cheaper
+per unit of work than a trickle and an agent that sits on a tool call costs the GPU nothing. Agents
+are only expensive when the box is already full or idle-waiting on each other — so prefer a wide
+concurrent pool over a narrow one, unless the task itself says otherwise.
 
 ## Shared workspace
-Every agent — you and all subagents — shares a live directory at `/shared`. The subdirectory
-`/shared/_swarm/` is reserved for the `aom-swarm` control plane; **do not write there yourself.**
-Everything else under `/shared` is yours to organize however you like. *You* decide how subagents
-coordinate — e.g. a message-board file they append findings to, a `reports/` folder where each
-writes its own markdown, a conventions file — and you must spell that out in the prompt you give
-each subagent (they only know what you tell them). These are your choices, not fixed rules.
+Every agent — you and all subagents — shares a directory at `/shared` (a network volume). The
+subdirectory `/shared/_swarm/` is reserved for the `aom-swarm` control plane; **do not write there
+yourself.** Everything else under `/shared` is yours to organize however you like. *You* decide how
+subagents coordinate — e.g. a `reports/` folder where each writes its own markdown, one file per
+agent that you merge later, a conventions file you write before spawning — and you must spell that
+out in the prompt you give each subagent (they only know what you tell them).
+
+**One writer per file.** Agents writing *different* files under `/shared` all land fine, but when
+several agents append to or edit the *same* file at once, they overwrite each other (last writer
+wins — 100 agents appending to one board file kept 1 line), and a file another agent just wrote can
+take a while to show up. So never have subagents share a file: give each its own path (e.g.
+`/shared/board/<agent>.md`) and combine them yourself after `aom-swarm wait`.
 
 ## The `aom-swarm` CLI
 Run it in your shell. (If `aom-swarm` is not found, use `python3 -m agents_on_modal.swarmctl`.)
+It is the only control command here: the host-side `aom` CLI (models, deploys) is not available in
+a sandbox.
 
 - `aom-swarm submit --file plan.json [--name NAME]` — run a whole plan (waves + pools). Validates
   the plan and prints errors; fix them and resubmit. You can submit several plans.
@@ -1286,10 +1477,11 @@ Run it in your shell. (If `aom-swarm` is not found, use `python3 -m agents_on_mo
   — spawn one subagent ad hoc.
 - `aom-swarm status [--workflow W] [--json]` — see every workflow, stage and subagent's state.
 - `aom-swarm trace AGENT_ID [--tail N]` — read a subagent's recent activity.
-- `aom-swarm wait [--all|--any] [--workflow W] [--timeout N]` — block until subagents finish. Use
-  this to sequence work: submit a wave, `wait --all`, read results from `/shared`, then spawn the
-  next wave or a final synthesis agent. Do NOT use `sleep`/`time.sleep` to wait for subagents — the
-  sandbox blocks long foreground sleeps, so `aom-swarm wait` is the ONLY correct way to wait.
+- `aom-swarm wait [--all|--any] [--workflow W]` — block until subagents finish. Use this to
+  sequence work: submit a wave, `wait --all`, read results from `/shared`, then spawn the next wave
+  or a final synthesis agent. One call blocks up to ~100 s (it stays under your shell's command
+  timeout) and then says how many agents are done; just run it again until it prints `ok`. Do NOT
+  poll `status` in a loop or use `sleep` to wait — `aom-swarm wait` is the ONLY correct way to wait.
 - `aom-swarm stop TARGET` — pause a workflow (by name) or terminate one subagent (by id).
 - `aom-swarm resume --workflow W` — un-pause a workflow.
 
@@ -1314,8 +1506,10 @@ Run it in your shell. (If `aom-swarm` is not found, use `python3 -m agents_on_mo
   finishes — this is how you make a bounded pool (set `max_concurrent` to e.g. 2).
 - Per agent: `prompt` (required), `goal` (true = run under /goal until it declares the goal met),
   `timeout` (seconds — **always set one**; default {timeout}), `effort` (one of: {efforts} — the
-  model maps any level to its nearest supported), and optional `schema` (a JSON Schema; the subagent
-  is asked to also emit matching JSON, which is validated — a soft contract, not a hard guarantee).
+  model maps any level to its nearest supported), and optional `schema` (a JSON Schema, inline or
+  as a path to a JSON file — one shared `/shared/schema.json` can serve a whole wave; the subagent
+  is asked to also emit matching JSON, which is validated — a soft contract, not a hard guarantee),
+  and optional `harness` (`claude` or `codex`; default: the one you run on).
 
 ## How to work
 1. Do any research you need yourself (browser, web search) to design the workflow.

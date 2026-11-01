@@ -342,3 +342,90 @@ def test_bad_spec_records_failed(tmp_path, monkeypatch):
     rc = runner.main([str(run_dir)])
     assert rc == 1
     assert _read_status(run_dir)["state"] == "failed"
+
+
+def test_goal_run_seeds_goal_file_and_start_carries_identity(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run-g"
+    # the harness (cwd = workdir) prints the goal file it sees while the run is live
+    reads_goal = ("import sys, pathlib; p = pathlib.Path('.goal/GOAL.md'); "
+                  "sys.stdout.write((p.read_text() if p.exists() else 'NO GOAL FILE').replace(chr(10), ' ') + chr(10))")
+    _install(monkeypatch, FakeHarness(script=reads_goal))
+    _write_spec(run_dir, goal=True, prompt="make the tests pass")
+    runner.main([str(run_dir)])
+    goal_file = run_dir / ".goal" / "GOAL.md"
+    seen = [e.get("text", "") for e in _read_envelopes(run_dir) if e.get("src") == "harness"]
+    assert any("make the tests pass" in line for line in seen)
+    assert not goal_file.exists()  # removed at the end so it cannot steer a later non-goal run
+    start = _runner_events(run_dir)[0]
+    assert start["event"] == "start" and start["goal_file"] == str(goal_file)
+    assert start["run_id"] == "run-g" and start["sandbox"] == {"kind": "local", "id": "x"}
+    assert start["meta"] == {}
+
+
+def test_goal_file_is_never_overwritten(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run-g2"
+    (run_dir / ".goal").mkdir(parents=True)
+    (run_dir / ".goal" / "GOAL.md").write_text("hand-written goal", encoding="utf-8")
+    _install(monkeypatch, FakeHarness(script=_script(['{"type": "session", "session_id": "s"}'])))
+    _write_spec(run_dir, goal=True, prompt="something else")
+    runner.main([str(run_dir)])
+    assert (run_dir / ".goal" / "GOAL.md").read_text(encoding="utf-8") == "hand-written goal"
+
+
+def test_silent_harness_gets_heartbeats(tmp_path, monkeypatch):
+    # A harness waiting on a cold/saturated model prints nothing; the trace must still show it alive.
+    monkeypatch.setattr(runner, "HEARTBEAT_INTERVAL", 0.2)
+    run_dir = tmp_path / "run-hb"
+    _install(monkeypatch, FakeHarness(script=_script([], sleep=1.0)))
+    _write_spec(run_dir, goal=False)
+    runner.main([str(run_dir)])
+    beats = [d for d in _runner_events(run_dir) if d.get("event") == "heartbeat"]
+    assert beats and all(b["silent_s"] >= 0 for b in beats)
+
+
+def test_non_goal_run_never_creates_a_goal_file(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run-ng"
+    _install(monkeypatch, FakeHarness(script=_script(['{"type": "session", "session_id": "s"}'])))
+    _write_spec(run_dir, goal=False)
+    runner.main([str(run_dir)])
+    assert not (run_dir / ".goal").exists()
+    assert _runner_events(run_dir)[0]["goal_file"] is None
+
+
+def test_goal_marked_complete_before_the_deadline_is_done_not_timeout(tmp_path, monkeypatch):
+    # The agent finished, recorded STATUS=complete, and was killed during its final summary turn.
+    run_dir = tmp_path / "run-st"
+    writes_status = ("import pathlib, time; pathlib.Path('.goal/STATUS').write_text('complete'); "
+                     "time.sleep(30)")
+    # the harness itself never reports the goal met: only the deadline ends this run
+    _install(monkeypatch, FakeHarness(script=writes_status, goal_active_calls=99))
+    _write_spec(run_dir, goal=True, deadline=time.time() + 1.5)
+    runner.main([str(run_dir)])
+    status = _read_status(run_dir)
+    assert status["state"] == "done" and status["goal_state"] == "complete"
+    done = [d for d in _runner_events(run_dir) if d.get("event") == "done"]
+    assert done and "STATUS complete" in done[-1]["reason"]
+
+
+def test_a_stale_status_from_an_earlier_goal_does_not_complete_a_new_one(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run-stale"
+    (run_dir / ".goal").mkdir(parents=True)
+    (run_dir / ".goal" / "STATUS").write_text("complete\n", encoding="utf-8")  # left by a past goal
+    _install(monkeypatch, FakeHarness(script=_script([], sleep=30.0)))
+    _write_spec(run_dir, goal=True, deadline=time.time() + 0.8)
+    runner.main([str(run_dir)])
+    assert _read_status(run_dir)["state"] == "timeout"
+
+
+def test_the_harness_and_goal_file_know_the_deadline(tmp_path, monkeypatch):
+    # Agents can't feel time pass: give them the hard deadline, in the env and the goal file.
+    run_dir = tmp_path / "run-dl"
+    prints_env = "import os, sys; sys.stdout.write('DL=' + os.environ.get('AOM_RUN_DEADLINE', 'unset') + chr(10))"
+    _install(monkeypatch, FakeHarness(script=prints_env))
+    deadline = time.time() + 120
+    _write_spec(run_dir, goal=True, deadline=deadline, prompt="ship it")
+    goal_text = runner._goal_text("ship it", deadline)
+    assert "Hard deadline" in goal_text and str(int(deadline)) in goal_text
+    runner.main([str(run_dir)])
+    seen = [e.get("text", "") for e in _read_envelopes(run_dir) if e.get("src") == "harness"]
+    assert any(f"DL={int(deadline)}" in line for line in seen)

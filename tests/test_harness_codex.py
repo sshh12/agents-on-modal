@@ -241,12 +241,38 @@ def test_parse_command_execution_nonzero_is_error():
     assert events[1].data["is_error"] is True
 
 
-def test_parse_file_change_is_tool_result():
+def test_parse_file_change_is_an_apply_patch_call_and_result():
+    # It used to be a result with no call, so apply_patch never counted as a tool call.
     h = Codex()
     item = {"id": "i1", "type": "file_change", "changes": [{"path": "hello.txt", "kind": "add"}], "status": "completed"}
     events = h.parse(_env({"type": "item.completed", "item": item}))
-    assert len(events) == 1 and events[0].kind == "tool_result"
-    assert events[0].data["is_error"] is False
+    assert [e.kind for e in events] == ["tool_call", "tool_result"]
+    assert events[0].data["name"] == "apply_patch"
+    assert events[1].data["is_error"] is False
+
+
+def test_parse_failed_file_change_is_an_error():
+    h = Codex()
+    item = {"id": "i2", "type": "file_change", "changes": [], "status": "failed"}
+    events = h.parse(_env({"type": "item.completed", "item": item}))
+    assert events[-1].kind == "tool_result" and events[-1].data["is_error"] is True
+
+
+def test_item_started_records_the_call_at_its_start_time():
+    # call -> result then spans the tool's own runtime; completion must not repeat the call.
+    h = Codex()
+    item = {"id": "c1", "type": "command_execution", "command": "ls", "status": "in_progress"}
+    started = h.parse({"ts": 10.0, "data": {"type": "item.started", "item": item}})
+    done = h.parse({"ts": 12.5, "data": {"type": "item.completed", "item": {
+        **item, "status": "completed", "exit_code": 0, "aggregated_output": "a.txt"}}})
+    assert [(e.kind, e.ts) for e in started] == [("tool_call", 10.0)]
+    assert [(e.kind, e.ts) for e in done] == [("tool_result", 12.5)]
+
+
+def test_unknown_items_are_logged_not_dropped():
+    h = Codex()
+    events = h.parse(_env({"type": "item.completed", "item": {"id": "t", "type": "todo_list", "items": []}}))
+    assert events and events[0].kind == "log" and "todo_list" in events[0].data["text"]
 
 
 def test_parse_collab_tool_call_is_subagent():

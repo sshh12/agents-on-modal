@@ -20,7 +20,7 @@ mapped per model.
 import agents_on_modal as aom
 
 model = aom.models.get("qwen3.8-27b")
-endpoint = aom.models.deploy(model)                 # idempotent; weights downloaded on CPU first
+endpoint = aom.models.ensure_deployed(model, max_containers=1)  # deploys if needed; weights on CPU first
 
 box = aom.sandbox.create("docker")                  # batteries-included container
 run = box.start("claude", endpoint, "add a /health route and test it", goal=True, timeout=1800)
@@ -42,12 +42,19 @@ Requires Python 3.10+ and a Modal account. For the `docker` sandbox you also nee
 
 ```sh
 aom models list
-aom models deploy qwen3.8-27b
+aom models deploy qwen3.8-27b --max 1             # --max: GPU container cap (a redeploy restarts it)
 aom models scale qwen3.8-27b --min 2 --max 32     # live, no redeploy — for a fan-out
 ```
 
 Adding a model is one entry in `agents_on_modal/catalog.json` (repo, engine, GPU, parsers, context,
 and the per-model reasoning-effort map), not new code.
+
+The container cap isn't in the catalog. The apps using an endpoint choose it: every command and
+example asks for 1 by default (`--max-containers N` to ask for more). The first app to need the model
+deploys it at that cap. Later ones attach to it as-is and only ever raise the cap, so they never
+restart it under a session or swarm already using it. Only `aom models scale --max` lowers it. The
+cap is a ceiling, not a reservation: Modal adds a container only when one is saturated past the
+model's `target_concurrency`, and idle ones still scale to zero.
 
 ## Run an agent
 
@@ -88,8 +95,16 @@ page that re-discovers in-flight agents after a restart, so you can close the ta
 ```sh
 aom swarm --harness claude --model qwen3.8-27b --count 50 --goal --timeout 7200 \
   "design a REST API for a library; write the spec and a reference impl in /shared"
-python examples/swarm/server.py            # open the dashboard
+python examples/swarm/server.py            # open the dashboard (add --swarm <id> to jump to one)
 ```
+
+The dashboard sets itself up: it loads the repo `.env` (`HF_TOKEN`, `AOM_SWARM_PRESET_KEY`, …),
+re-launches on the repo `.venv` (creating it and `pip install -e .`-ing on first run), and runs the
+Modal login / `aom setup` if they haven't been done, so any `python` on your PATH works. A spawn
+asks for a cap of 1 like every other app. To give a second, parallel swarm its own GPU once the first
+one saturates the endpoint, raise the model's max instances live in the dashboard's model endpoints
+panel; that's also where you lower it again. To roll out a catalog change to a deployed model, run
+`aom models deploy <name> --max N`, which does replace its running containers.
 
 An impossible `/goal` keeps running (auto-compacting) until the timeout, then you read whatever the
 agents left in `/shared`.

@@ -25,10 +25,10 @@ TASK = (
 
 
 @pytest.mark.skipif(
-    not os.environ.get("HF_TOKEN"), reason="Swarm.launch redeploys the model, which needs HF_TOKEN"
+    not os.environ.get("HF_TOKEN"), reason="Swarm.launch may deploy the model, which needs HF_TOKEN"
 )
 def test_swarm_fanout_reconnect_shared(model_name):
-    swarm = Swarm.launch("claude", model_name, TASK, count=2, timeout=600)
+    swarm = Swarm.launch("claude", model_name, TASK, count=2, max_containers=1, timeout=600)
     try:
         deadline = time.time() + 600
         while time.time() < deadline and not all(a.state() in TERMINAL for a in swarm.agents()):

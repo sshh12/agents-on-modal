@@ -2,7 +2,7 @@
 
     import agents_on_modal as aom
     model = aom.models.get("qwen3.8-27b")
-    endpoint = aom.models.deploy(model)
+    endpoint = aom.models.ensure_deployed(model, max_containers=1)
     box = aom.sandbox.create("modal")
     run = box.start("codex", endpoint, "build a todo app and test it in the browser", goal=True)
     for event in run.events(follow=True):

@@ -309,6 +309,8 @@ async def stream_sse(
     tool_order: list[int] = []
     finish_reason: str | None = None
     usage = ir.Usage()
+    #: Whitespace-only text not yet worth a message item (see ``ir.hold_whitespace``).
+    pending_ws = ""
 
     def close_content() -> list[bytes]:
         nonlocal open_item
@@ -372,13 +374,17 @@ async def stream_sse(
                 yield emit("response.reasoning_text.delta",
                            {"item_id": state["id"], "output_index": state["index"], "content_index": 0, "delta": item.text})
             elif isinstance(item, ir.TextDelta):
+                in_message = open_item is not None and open_item["kind"] == "message"
+                text, pending_ws = ir.hold_whitespace(pending_ws, item.text, in_message)
+                if not text:
+                    continue
                 state, frames = ensure_content("message")
                 for f in frames:
                     yield f
-                state["text"] += item.text
+                state["text"] += text
                 yield emit("response.output_text.delta",
                            {"item_id": state["id"], "output_index": state["index"], "content_index": 0,
-                            "delta": item.text, "logprobs": []})
+                            "delta": text, "logprobs": []})
             elif isinstance(item, ir.ToolCallStart):
                 if item.index not in tool_buf:
                     tool_order.append(item.index)

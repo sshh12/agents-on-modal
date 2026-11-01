@@ -12,6 +12,7 @@
       "hf_token_env": "HF_TOKEN",
       "image": "lmsysorg/sglang:v0.5.22-cu130",
       "engine_args": [
+        "--enable-metrics",
         "--reasoning-parser=qwen3",
         "--tool-call-parser=qwen3_coder",
         "--kv-cache-dtype=fp8_e4m3",
@@ -48,6 +49,7 @@
       "hf_token_env": "HF_TOKEN",
       "image": "lmsysorg/sglang:v0.5.22-cu130",
       "engine_args": [
+        "--enable-metrics",
         "--reasoning-parser=qwen3",
         "--tool-call-parser=qwen3_coder",
         "--mem-fraction-static=0.85",
@@ -78,6 +80,7 @@
       "region": "us-west",
       "image": "lmsysorg/sglang:v0.5.22-cu130",
       "engine_args": [
+        "--enable-metrics",
         "--reasoning-parser=gpt-oss",
         "--tool-call-parser=gpt-oss",
         "--mem-fraction-static=0.9",
@@ -108,6 +111,7 @@
       "image": "lmsysorg/sglang:v0.5.22-cu130",
       "startup_timeout": 7200,
       "engine_args": [
+        "--enable-metrics",
         "--reasoning-parser=deepseek-v4",
         "--tool-call-parser=deepseekv4",
         "--moe-runner-backend=marlin",
@@ -119,8 +123,7 @@
         "--trust-remote-code"
       ],
       "scaling": {
-        "target_concurrency": 4.0,
-        "max_containers": 1
+        "target_concurrency": 16.0
       },
       "reasoning": {
         "default": "high",
@@ -148,6 +151,7 @@
       "image": "lmsysorg/sglang:glm-5.3-flash",
       "startup_timeout": 7200,
       "engine_args": [
+        "--enable-metrics",
         "--reasoning-parser=glm45",
         "--tool-call-parser=glm47",
         "--ep-size=2",
@@ -158,8 +162,7 @@
         "--enable-cache-report"
       ],
       "scaling": {
-        "target_concurrency": 8.0,
-        "max_containers": 1
+        "target_concurrency": 32.0
       },
       "reasoning": {
         "default": "high",
@@ -187,6 +190,7 @@
       "image": "lmsysorg/sglang:v0.5.19-cu130",
       "startup_timeout": 7200,
       "engine_args": [
+        "--enable-metrics",
         "--chunked-prefill-size=4096",
         "--cuda-graph-max-bs-decode=16",
         "--mem-fraction-static=0.85",
@@ -197,8 +201,7 @@
         "--trust-remote-code"
       ],
       "scaling": {
-        "target_concurrency": 4.0,
-        "max_containers": 1
+        "target_concurrency": 16.0
       },
       "reasoning": {
         "default": "high",
@@ -226,6 +229,7 @@
       "image": "lmsysorg/sglang:v0.5.19-cu130",
       "startup_timeout": 7200,
       "engine_args": [
+        "--enable-metrics",
         "--quantization=modelopt_fp4",
         "--chunked-prefill-size=8192",
         "--mem-fraction-static=0.9",
@@ -233,8 +237,7 @@
         "--reasoning-parser=glm45"
       ],
       "scaling": {
-        "target_concurrency": 8.0,
-        "max_containers": 1
+        "target_concurrency": 32.0
       },
       "reasoning": {
         "default": "high",
@@ -261,6 +264,7 @@
       "image": "lmsysorg/sglang:v0.5.19-cu130",
       "startup_timeout": 7200,
       "engine_args": [
+        "--enable-metrics",
         "--quantization=modelopt_fp4",
         "--chunked-prefill-size=8192",
         "--mem-fraction-static=0.9",
@@ -268,8 +272,7 @@
         "--reasoning-parser=glm45"
       ],
       "scaling": {
-        "target_concurrency": 8.0,
-        "max_containers": 1
+        "target_concurrency": 32.0
       },
       "reasoning": {
         "default": "high",
@@ -297,6 +300,7 @@
       "vision": true,
       "startup_timeout": 7200,
       "engine_args": [
+        "--enable-metrics",
         "--chunked-prefill-size=4096",
         "--cuda-graph-max-bs-decode=16",
         "--mem-fraction-static=0.85",
@@ -307,8 +311,7 @@
         "--trust-remote-code"
       ],
       "scaling": {
-        "target_concurrency": 4.0,
-        "max_containers": 1
+        "target_concurrency": 16.0
       },
       "reasoning": {
         "default": "high",
@@ -325,7 +328,7 @@
       }
     },
     "deepseek-v4.1-flash-uncensored-fp8": {
-      "description": "DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8 (dealignai, 763B total/multimodal) via SGLang on B300:4. REQUIRES the preview image lmsysorg/sglang:dev-dsv41: config.json is DeepseekV41ForCausalLM / model_type deepseek_v41, a NEW architecture that has not shipped in any stock SGLang release (support lives only on the dsv4.1 branch / this dev image), so the v0.5.19-cu130 image the other entries use cannot load it. Quant is DeepSeek-native FP8 e4m3 with ue8m0 block scales at [32,32] PLUS expert_dtype fp4 (not ModelOpt NVFP4). SIZING - the key lesson: at ~475.3 GiB the weights alone are too big for 4xH200. On H200:4 tp4 that is ~118.8 GiB/GPU = 85% of the 139 GiB usable, and SGLang hard-fails at boot with 'Loaded weights leave no GPU memory for the KV cache under --mem-fraction-static=0.8 ... minimum viable 0.870'; pushing mem-fraction above 0.87 then starves the ~10% non-static pool and cuda-graph capture OOMs (exit -9), the same failure the GLM NVFP4 entry hit at 0.92. The model card's 0.80/4xH200 recipe was for a smaller base artifact, not this 475 GiB uncensored build. B300:2 tp2 is worse (~237.6 GiB/GPU = 89%). B300:4 tp4 is the right fit: ~118.8 GiB/GPU of B300's ~267.7 GiB usable = 44%, so at mem-fraction-static 0.85 the KV pool is ~100+ GiB/GPU with ~40 GiB/GPU left for cuda-graph capture - comfortable, and it keeps the card-verified tp4 parallelism while running the FP4 experts on Blackwell natively. Parsers are --reasoning-parser auto / --tool-call-parser auto per SGLang's V4.1 cookbook (the dev image resolves deepseek-v41 from the model config). ep-size 4 matches tp. Backends (attention/moe-runner/fp8-gemm) are deliberately NOT pinned - the cookbook warns manual overrides fall back to slow Triton; confirm the resolved backends in the startup log. Context capped at 262144 (the checkpoint supports 1M via yarn factor 16 from 65536, but every catalog entry caps at 256k). DSpark speculative decoding (--speculative-algorithm DSPARK --speculative-dspark-block-size 5) is available but left OFF for a known-good bring-up; add it only with a re-verified run.",
+      "description": "DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8 (dealignai, 763B total/multimodal) via SGLang on B300:4. REQUIRES the preview image lmsysorg/sglang:dev-dsv41: config.json is DeepseekV41ForCausalLM / model_type deepseek_v41, a NEW architecture that has not shipped in any stock SGLang release (support lives only on the dsv4.1 branch / this dev image), so the v0.5.19-cu130 image the other entries use cannot load it. Quant is DeepSeek-native FP8 e4m3 with ue8m0 block scales at [32,32] PLUS expert_dtype fp4 (not ModelOpt NVFP4). SIZING - the key lesson: at ~475.3 GiB the weights alone are too big for 4xH200. On H200:4 tp4 that is ~118.8 GiB/GPU = 85% of the 139 GiB usable, and SGLang hard-fails at boot with 'Loaded weights leave no GPU memory for the KV cache under --mem-fraction-static=0.8 ... minimum viable 0.870'; pushing mem-fraction above 0.87 then starves the ~10% non-static pool and cuda-graph capture OOMs (exit -9), the same failure the GLM NVFP4 entry hit at 0.92. The model card's 0.80/4xH200 recipe was for a smaller base artifact, not this 475 GiB uncensored build. B300:2 tp2 is worse (~237.6 GiB/GPU = 89%). B300:4 tp4 is the right fit: ~118.8 GiB/GPU of B300's ~267.7 GiB usable = 44%, so at mem-fraction-static 0.85 the KV pool is ~100+ GiB/GPU with ~40 GiB/GPU left for cuda-graph capture - comfortable, and it keeps the card-verified tp4 parallelism while running the FP4 experts on Blackwell natively. Parsers are --reasoning-parser auto / --tool-call-parser auto per SGLang's V4.1 cookbook (the dev image resolves deepseek-v41 from the model config). ep-size 4 matches tp. Backends (attention/moe-runner/fp8-gemm) are deliberately NOT pinned - the cookbook warns manual overrides fall back to slow Triton; confirm the resolved backends in the startup log. Context capped at 262144 (the checkpoint supports 1M via yarn factor 16 from 65536, but every catalog entry caps at 256k). DSpark speculative decoding (--speculative-algorithm DSPARK --speculative-dspark-block-size 5) is available but left OFF for a known-good bring-up; add it only with a re-verified run. SCALING for agent swarms: no --max-running-requests -- SGLang sizes the running batch itself, and this DSA arch's KV pool holds ~68M tokens on B300:4, so memory never limits it. A 100-agent pressure test at --max-running-requests=20 kept 80 requests queued behind 20 (GPUs at 99%, ~400-750 decode tok/s, 21/100 agents finishing a 15-min task). Uncapped, SGLang picked 256: the same 100-agent wave ran with 0 queued, ~1.5k decode tok/s, a 99% prefix-cache hit rate and only ~10% of the KV pool used, and 100/100 agents finished (median 342 s). The engine queues rather than rejects, so no cap ever produced a 429. --enable-metrics exposes sglang:* Prometheus metrics on the engine port for watching load. target_concurrency=100 ~ the agents one container serves before Modal would add another (only matters once the endpoint's max containers is raised above 1). max containers is not a catalog setting -- the app using the endpoint asks for it, and 1 is the default.",
       "repo": "dealignai/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8",
       "engine": "sglang",
       "gpu": "B300:4",
@@ -338,14 +341,13 @@
       "engine_args": [
         "--mem-fraction-static=0.85",
         "--ep-size=4",
-        "--max-running-requests=20",
+        "--enable-metrics",
         "--reasoning-parser=auto",
         "--tool-call-parser=auto",
         "--trust-remote-code"
       ],
       "scaling": {
-        "target_concurrency": 4.0,
-        "max_containers": 1
+        "target_concurrency": 100.0
       },
       "reasoning": {
         "default": "high",
@@ -373,12 +375,12 @@
       "download_subdir": "Mix-256G",
       "startup_timeout": 7200,
       "engine_args": [
+        "--metrics",
         "--parallel=1",
         "--no-reasoning-preserve"
       ],
       "scaling": {
-        "target_concurrency": 1.0,
-        "max_containers": 1
+        "target_concurrency": 1.0
       },
       "reasoning": {
         "default": "high",
@@ -406,6 +408,7 @@
       "image": "lmsysorg/sglang:v0.5.19-cu130",
       "startup_timeout": 7200,
       "engine_args": [
+        "--enable-metrics",
         "--reasoning-parser=glm45",
         "--tool-call-parser=glm47",
         "--ep-size=4",
@@ -414,8 +417,7 @@
         "--enable-cache-report"
       ],
       "scaling": {
-        "target_concurrency": 4.0,
-        "max_containers": 1
+        "target_concurrency": 32.0
       },
       "reasoning": {
         "default": "high",
@@ -442,12 +444,12 @@
       "download_subdir": "UD-IQ1_M",
       "startup_timeout": 7200,
       "engine_args": [
+        "--metrics",
         "--parallel=1",
         "--no-reasoning-preserve"
       ],
       "scaling": {
-        "target_concurrency": 1.0,
-        "max_containers": 1
+        "target_concurrency": 1.0
       },
       "reasoning": {
         "default": "high",

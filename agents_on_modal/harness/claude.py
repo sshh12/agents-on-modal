@@ -48,11 +48,17 @@ class ClaudeCode(Harness):
                 "projects": {workdir.replace("\\", "/"): {"hasTrustDialogAccepted": True}},
             }
         )
+        permissions: dict[str, Any] = {"defaultMode": "bypassPermissions"}
+        if profile.extra_dirs:
+            # Claude Code resets the Bash cwd to the workdir after any command that ends outside its
+            # working directories ("Shell cwd was reset to /work", glued onto the tool output), so a
+            # `cd /shared` never carried to the next call. These are working directories too.
+            permissions["additionalDirectories"] = list(profile.extra_dirs)
         files[join(home, "settings.json")] = _json(
             {
                 "theme": "dark",
                 "skipDangerousModePermissionPrompt": True,
-                "permissions": {"defaultMode": "bypassPermissions"},
+                "permissions": permissions,
             }
         )
 
@@ -185,6 +191,9 @@ class ClaudeCode(Harness):
                         "model": data.get("model"),
                         "cwd": data.get("cwd"),
                         "tools": data.get("tools"),
+                        # [{name, status}]: a server that failed to start is otherwise invisible --
+                        # the browser MCP silently never loaded for a whole 100-agent run.
+                        "mcp_servers": data.get("mcp_servers"),
                     },
                     ts=ts,
                 )
@@ -234,10 +243,30 @@ class ClaudeCode(Harness):
                         ts=ts,
                     )
                 )
+        # stream-json emits one assistant line PER CONTENT BLOCK, each repeating the same message's
+        # usage snapshot (taken at message_start), so report it once per message id. An all-zero
+        # snapshot is a placeholder (the gateway only knows the counts at message end), not a
+        # measurement: skip it rather than log zeros; the run's `result` carries the real totals.
         usage = message.get("usage")
         if isinstance(usage, dict) and usage.get("output_tokens") is not None:
-            events.append(Event("usage", _usage(usage), agent=agent, ts=ts))
+            data = _usage(usage)
+            msg_id = _as_str(message.get("id"))
+            if any(data.values()) and self._first_usage_for(msg_id):
+                if msg_id:
+                    data["message_id"] = msg_id
+                events.append(Event("usage", data, agent=agent, ts=ts))
         return events
+
+    def _first_usage_for(self, msg_id: str | None) -> bool:
+        """True the first time a message id's usage is seen by this harness instance (one per run)."""
+
+        if not msg_id:
+            return True
+        seen = self.__dict__.setdefault("_usage_seen", set())
+        if msg_id in seen:
+            return False
+        seen.add(msg_id)
+        return True
 
     def _parse_user(self, data: dict[str, Any], ts: float) -> list[Event]:
         message = data.get("message") or {}

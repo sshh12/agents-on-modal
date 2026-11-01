@@ -80,7 +80,9 @@ class FakeBox:
 def launch_env(monkeypatch):
     bag = {"deployed": [], "scaled": [], "boxes": [], "endpoint": FakeEndpoint()}
     monkeypatch.setattr(models, "get", lambda n: FakeModel(n if isinstance(n, str) else n.name))
-    monkeypatch.setattr(model_ops, "deploy", lambda m: (bag["deployed"].append(m), bag["endpoint"])[1])
+    monkeypatch.setattr(model_ops, "ensure_deployed",
+                        lambda m, **k: (bag["deployed"].append((m, k)), bag["endpoint"])[1])
+    monkeypatch.setattr(model_ops, "deploy", lambda *a, **k: pytest.fail("launch must not redeploy"))
     monkeypatch.setattr(model_ops, "scale", lambda m, **s: bag["scaled"].append(s))
     monkeypatch.setattr(sandbox, "new_id", lambda prefix="": f"{prefix}test")
 
@@ -98,7 +100,7 @@ def launch_env(monkeypatch):
 # launch                                                                                        #
 # --------------------------------------------------------------------------------------------- #
 def test_launch_creates_n_sandboxes_and_runs(launch_env):
-    s = Swarm.launch("claude", "m", "build it", count=3)
+    s = Swarm.launch("claude", "m", "build it", count=3, max_containers=1)
     assert isinstance(s, Swarm)
     assert s.id == "swarm-test"
     assert s.model == "m"
@@ -119,20 +121,21 @@ def test_launch_deploys_but_does_not_scale(launch_env):
     # The model is a shared, account-level resource: launch only ensures it is deployed
     # (idempotent). It must NOT scale per swarm -- Modal autoscales the shared endpoint from
     # aggregate load under the catalog policy; scaling here would stomp that global setting.
-    Swarm.launch("codex", "m", "p", count=10)
+    Swarm.launch("codex", "m", "p", count=10, max_containers=1)
     assert len(launch_env["deployed"]) == 1
+    assert launch_env["deployed"][0][1] == {"max_containers": 1}  # the swarm's ask, passed through
     assert launch_env["scaled"] == []
 
 
 def test_launch_never_scales_regardless_of_count(launch_env):
     # Even a large fan-out does not provision GPUs by agent count -- no scale call at all.
-    Swarm.launch("codex", "m", "p", count=100)
+    Swarm.launch("codex", "m", "p", count=100, max_containers=1)
     assert launch_env["scaled"] == []
 
 
 def test_launch_rejects_zero_count(launch_env):
     with pytest.raises(AomError):
-        Swarm.launch("claude", "m", "p", count=0)
+        Swarm.launch("claude", "m", "p", count=0, max_containers=1)
 
 
 def test_launch_retries_then_fails(monkeypatch, launch_env):
@@ -145,12 +148,12 @@ def test_launch_retries_then_fails(monkeypatch, launch_env):
 
     monkeypatch.setattr(sandbox, "create", flaky_create)
     with pytest.raises(AomError):
-        Swarm.launch("claude", "m", "p", count=1)
+        Swarm.launch("claude", "m", "p", count=1, max_containers=1)
     assert calls["n"] == swarm.CREATE_RETRIES
 
 
 def test_launch_honors_explicit_shared_volume(launch_env):
-    s = Swarm.launch("claude", "m", "p", count=1, shared_volume="my-vol")
+    s = Swarm.launch("claude", "m", "p", count=1, max_containers=1, shared_volume="my-vol")
     assert s.shared_volume == "my-vol"
     assert launch_env["boxes"][0].create_opts["shared_volume"] == "my-vol"
 

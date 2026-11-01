@@ -480,6 +480,7 @@ class DockerSandbox(Sandbox):
             skills=load_skills(),
             mcp_servers={"playwright": playwright},
             env={},
+            extra_dirs=("/tmp",),
         )
 
 

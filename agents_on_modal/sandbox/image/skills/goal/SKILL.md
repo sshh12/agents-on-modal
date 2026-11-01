@@ -1,6 +1,6 @@
 ---
 name: goal
-description: Long-horizon goal mode. Use whenever a goal file exists at .goal/GOAL.md, or you were told to keep working until a condition is met. Re-read the goal every turn, work from evidence, run the checks, and only report done when verified.
+description: Long-horizon goal mode. Use ONLY when this run was started as a goal (you were told to keep working until a condition is met); otherwise ignore this skill. Re-read the goal every turn, work from evidence, run the checks, and only report done when verified.
 ---
 
 # Goal mode
@@ -11,10 +11,10 @@ Work autonomously; never stop to ask for confirmation.
 
 ## Every turn, in order
 
-1. **Re-read the goal.** Open `.goal/GOAL.md` in the workspace and read it in
-   full. It holds the objective, the acceptance checks, constraints, and an
-   optional `check:` command. Treat it as the source of truth, not your memory
-   of it.
+1. **Re-read the goal.** Open `.goal/GOAL.md` in the workspace (the harness
+   writes it from your task when a goal run starts) and read it in full. It
+   holds the objective, the acceptance checks, constraints, and an optional
+   `check:` command. Treat it as the source of truth, not your memory of it.
 2. **Orient from evidence, not assumption.** Inspect the real state of the
    workspace (files, test output, running services) before deciding what to do.
    Do not trust earlier turns' claims; re-verify.

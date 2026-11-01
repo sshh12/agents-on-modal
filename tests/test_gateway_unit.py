@@ -95,3 +95,42 @@ def test_usage_cache_semantics():
     usage = ir.Usage(prompt_tokens=100, completion_tokens=20, cached_tokens=30)
     assert usage.input_tokens_ex_cache == 70  # Anthropic excludes cache reads
     assert usage.total_tokens == 120
+
+
+async def test_post_chunks_retries_a_dropped_engine_connection(monkeypatch):
+    # A stale pooled keep-alive connection fails the POST before any response; a retry fixes it
+    # (surfaced as a 503 instead, Codex fails the whole turn with "model is at capacity").
+    import aiohttp
+
+    from agents_on_modal.gateway import chat
+
+    class Resp:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    calls = {"n": 0}
+
+    class Session:
+        async def post(self, url, json):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise aiohttp.ServerDisconnectedError()
+            return Resp()
+
+    async def one_chunk(_resp):
+        yield '{"choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": null}]}'
+
+    monkeypatch.setattr(chat, "_iter_sse_data", one_chunk)
+    monkeypatch.setattr(chat.asyncio, "sleep", lambda *_: _noop())
+    got = [c async for c in chat.post_chunks(Session(), "http://engine", {})]
+    assert calls["n"] == 2
+    assert got[0]["choices"][0]["delta"]["content"] == "hi"
+
+
+async def _noop():
+    return None

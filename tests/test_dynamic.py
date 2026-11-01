@@ -7,7 +7,10 @@ No Modal. ``sandbox``/``models`` seams are faked or monkeypatched exactly like `
 from __future__ import annotations
 
 import io
+import itertools
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -64,11 +67,10 @@ class FakeRun:
 
 
 class FakeBox:
-    _n = 0
+    _ids = itertools.count(1)  # the controller creates boxes from several threads at once
 
     def __init__(self):
-        FakeBox._n += 1
-        self.id = f"aom-{FakeBox._n:04d}"
+        self.id = f"aom-{next(FakeBox._ids):04d}"
         self.started = None
         self.stopped = False
         self._run = FakeRun(run_id=f"{self.id}-run")
@@ -226,7 +228,8 @@ def test_controller_submit_runs_pool_then_wave(tmp_path):
     c.tick()
     assert control.get_json("_swarm/ack/req-1.json")["ok"] is True
     assert len(sb.created) == 2  # pool cap
-    a0 = sb.created[0].started
+    # spawns run concurrently, so creation order is not index order: look agents up by idx
+    a0 = next(b.started for b in sb.created if b.started["meta"]["idx"] == 0)
     assert a0["goal"] is True and a0["timeout"] == 123 and a0["effort"] == "high"
     assert a0["meta"] == {"swarm_id": "sw", "workflow": "wf", "stage": "w1", "idx": 0, "role": "subagent"}
 
@@ -450,7 +453,8 @@ def test_launch_spawns_orchestrator_with_injected_context(tmp_path, monkeypatch)
     created: list = []
     deployed: list = []
     scaled: list = []
-    monkeypatch.setattr(model_ops, "deploy", lambda m: (deployed.append(m), FakeEndpoint())[1])
+    monkeypatch.setattr(model_ops, "ensure_deployed", lambda m, **k: (deployed.append(k), FakeEndpoint())[1])
+    monkeypatch.setattr(model_ops, "deploy", lambda *a, **k: pytest.fail("launch must not redeploy"))
     monkeypatch.setattr(model_ops, "scale", lambda m, **k: scaled.append(k))
     monkeypatch.setattr(sandbox, "new_id", lambda prefix="": f"{prefix}test")
 
@@ -463,7 +467,8 @@ def test_launch_spawns_orchestrator_with_injected_context(tmp_path, monkeypatch)
     monkeypatch.setattr(sandbox, "create", fake_create)
     control = LocalDirControlPlane(str(tmp_path))
 
-    ds = DynamicSwarm.launch("claude", "qwen3.8-27b", "do research", timeout=3600, control=control)
+    ds = DynamicSwarm.launch("claude", "qwen3.8-27b", "do research", timeout=3600,
+                             max_containers=1, control=control)
 
     assert ds.id == "swarm-test"
     assert ds.model == "qwen3.8-27b"
@@ -475,9 +480,15 @@ def test_launch_spawns_orchestrator_with_injected_context(tmp_path, monkeypatch)
     assert started["goal"] is True
     assert started["meta"] == {"swarm_id": "swarm-test", "role": "orchestrator"}
     # the shared model is deployed (idempotent) but NOT scaled per swarm.
-    assert deployed and scaled == []
+    assert deployed == [{"max_containers": 1}] and scaled == []
     meta = control.get_json("_swarm/meta.json")
     assert meta["orchestrator_id"] == created[0].id and meta["model"] == "qwen3.8-27b"
+    # the launch record: the exact orchestrator prompt + what it takes to relaunch it
+    assert control.read_text("_swarm/orchestrator_prompt.md") == started["prompt"]
+    launch = control.get_json("_swarm/launch.json")
+    assert launch["task"] == "do research" and launch["max_containers"] == 1
+    assert launch["harness"] == "claude" and launch["model"] == "qwen3.8-27b"
+    assert launch["proxied"] is False and launch["timeout"] == 3600
 
 
 def test_reconnect_reads_meta(monkeypatch):
@@ -500,7 +511,7 @@ def test_reconnect_reads_meta(monkeypatch):
 
 def test_orchestrator_instructions_mention_cli_and_efforts():
     text = build_orchestrator_instructions(
-        default_timeout=1800, model_name="qwen3.8-27b", allowed_efforts=["low", "medium", "xhigh"])
+        default_timeout=1800, allowed_efforts=["low", "medium", "xhigh"])
     for needle in ("aom-swarm submit", "aom-swarm wait", "max_concurrent", "/shared/_swarm",
                    "low, medium, xhigh", "1800"):
         assert needle in text
@@ -522,3 +533,175 @@ def test_server_has_dynamic_routes():
     for needle in ("/api/files", "/api/file", "/api/injected", "DynamicSwarm",
                    "_ensure_controller", "_dynamic_agents_payload"):
         assert needle in src
+
+
+# --------------------------------------------------------------------------------------------- #
+# feedback fixes: concurrent dispatch, settled agents, dead sandboxes, collapsed errors, schema  #
+# paths, launch record                                                                          #
+# --------------------------------------------------------------------------------------------- #
+def _submit(control, plan, reqid="r"):
+    control.put_json(f"_swarm/requests/{reqid}.json", {"id": reqid, "verb": "submit", "payload": plan})
+
+
+def test_controller_dispatches_a_wave_concurrently(tmp_path):
+    # A Modal create+start is ~10 s; one at a time a 100-agent wave took ~20 min to fill. Measure
+    # how many creates overlap rather than wall time, so a loaded CI box can't flake it.
+    state = {"live": 0, "peak": 0}
+    lock = threading.Lock()
+
+    class SlowSandboxes(FakeSandboxes):
+        def create(self, name, **opts):
+            with lock:
+                state["live"] += 1
+                state["peak"] = max(state["peak"], state["live"])
+            time.sleep(0.2)
+            with lock:
+                state["live"] -= 1
+            return super().create(name, **opts)
+
+    c, control, sb = _controller(tmp_path, SlowSandboxes())
+    _submit(control, {"name": "wf", "stages": [
+        {"name": "w", "max_concurrent": 8, "agents": [{"prompt": f"p{i}"} for i in range(8)]}]})
+    c.tick()
+    assert len(sb.created) == 8
+    assert state["peak"] > 1  # creates ran side by side, not one after another
+    assert sorted(b.started["meta"]["idx"] for b in sb.created) == list(range(8))
+
+
+def test_controller_stops_polling_settled_agents(tmp_path):
+    calls = {"n": 0}
+
+    class CountingRun(FakeRun):
+        def status(self):
+            calls["n"] += 1
+            return super().status()
+
+    class Boxes(FakeSandboxes):
+        def create(self, name, **opts):
+            box = super().create(name, **opts)
+            box._run = CountingRun(run_id=f"{box.id}-run")
+            return box
+
+    c, control, sb = _controller(tmp_path, Boxes())
+    _submit(control, {"name": "wf", "stages": [{"name": "w", "agents": [{"prompt": "a"}]}]})
+    c.tick()
+    sb.created[0]._run.state = "done"
+    c.tick()  # sees "done"
+    c.tick()  # one more pass flushes any trailing trace, then the agent is settled
+    before = calls["n"]
+    c.tick()
+    c.tick()
+    assert calls["n"] == before  # no more Modal round-trips for a finished agent
+    assert control.get_json("_swarm/workflows/wf.json")["status"] == "done"
+
+
+def test_controller_fails_an_agent_whose_sandbox_is_gone(tmp_path):
+    # A sandbox killed from outside (timeout, idle timeout, OOM) can never report again; it must not
+    # stay "running" forever and hang `aom-swarm wait` and its stage.
+    c, control, sb = _controller(tmp_path)
+    _submit(control, {"name": "wf", "stages": [{"name": "w", "agents": [{"prompt": "a"}]}]})
+    c.tick()
+    box = sb.created[0]
+
+    def unreadable():
+        raise RuntimeError("sandbox terminated")
+
+    box._run.status = unreadable
+    box.alive = lambda: True
+    c.tick()  # unreadable but alive: a flaky read keeps the last state
+    assert control.get_json(f"_swarm/agents/{box.id}.json")["state"] == "running"
+    box.alive = lambda: False
+    c.tick()
+    agent = control.get_json(f"_swarm/agents/{box.id}.json")
+    assert agent["state"] == "failed" and "sandbox exited" in agent["error"]
+    assert control.get_json("_swarm/workflows/wf.json")["status"] == "done"
+
+
+def test_controller_keeps_the_rest_of_a_wave_when_one_create_fails(tmp_path):
+    class FlakySandboxes(FakeSandboxes):
+        def __init__(self):
+            super().__init__()
+            self.failed = False
+            self.lock = threading.Lock()
+
+        def create(self, name, **opts):
+            with self.lock:
+                first, self.failed = not self.failed, True
+            if first:
+                raise RuntimeError("modal hiccup")
+            return super().create(name, **opts)
+
+    c, control, sb = _controller(tmp_path, FlakySandboxes())
+    _submit(control, {"name": "wf", "stages": [
+        {"name": "w", "max_concurrent": 4, "agents": [{"prompt": f"p{i}"} for i in range(4)]}]})
+    with pytest.raises(RuntimeError, match="modal hiccup"):
+        c.tick()  # surfaced (run_forever records it) ...
+    assert len(sb.created) == 3  # ... but the three that did start are kept
+    c.tick()
+    assert sorted(b.started["meta"]["idx"] for b in sb.created) == list(range(4))  # retried
+
+
+def test_parse_plan_collapses_an_error_repeated_across_a_wave():
+    plan = {"stages": [{"agents": [{"prompt": "x", "schema": "/shared/schema.json"}] * 112}]}
+    _, errors, _ = parse_plan(plan)
+    assert len(errors) == 1
+    assert errors[0].startswith("stages[0].agents[0-111] (112 agents): 'schema' must be a JSON object")
+    assert dynamic._index_ranges([0, 1, 2, 5, 7, 8]) == "0-2,5,7-8"
+    _, one, _ = parse_plan({"stages": [{"agents": [{"prompt": "x", "schema": 1}]}]})
+    assert one[0].startswith("stages[0].agents[0]: ")  # a single agent keeps the plain form
+
+
+def test_cli_submit_inlines_a_shared_schema_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(swarmctl, "_reqid", lambda: "req-s")
+    swarm_dir = tmp_path / "_swarm"
+    LocalDirControlPlane(str(swarm_dir)).put_json("ack/req-s.json", {"id": "req-s", "ok": True})
+    schema = {"type": "object", "required": ["summary"]}
+    (tmp_path / "schema.json").write_text(json.dumps(schema), encoding="utf-8")
+    plan_file = tmp_path / "plan.json"
+    plan_file.write_text(json.dumps({"stages": [{"agents": [
+        {"prompt": "a", "schema": "schema.json"}, {"prompt": "b", "schema": "schema.json"}]}]}),
+        encoding="utf-8")
+    code, _ = _run_cli(["submit", "--file", str(plan_file)], swarm_dir, monkeypatch)
+    assert code == 0
+    sent = LocalDirControlPlane(str(swarm_dir)).get_json("requests/req-s.json")["payload"]
+    assert [a["schema"] for a in sent["stages"][0]["agents"]] == [schema, schema]
+
+
+def test_cli_submit_reports_a_missing_schema_file_once(tmp_path, monkeypatch):
+    plan_file = tmp_path / "plan.json"
+    plan_file.write_text(json.dumps({"stages": [{"agents": [
+        {"prompt": "a", "schema": "nope.json"}] * 50}]}), encoding="utf-8")
+    code, text = _run_cli(["submit", "--file", str(plan_file)], tmp_path / "_swarm", monkeypatch)
+    assert code == 1 and "plan not submitted" in text
+    assert text.count("schema file 'nope.json'") == 1  # one line, not one per agent
+    assert text.count("(50 agents)") == 1  # and the per-agent lint error collapses to one line
+
+
+def test_plan_agents_can_pick_their_own_harness(tmp_path):
+    plan, errors, _ = parse_plan({"stages": [{"agents": [
+        {"prompt": "a"}, {"prompt": "b", "harness": "codex"}]}]})
+    assert not errors and [a.harness for a in plan.stages[0].agents] == [None, "codex"]
+    _, bad, _ = parse_plan({"stages": [{"agents": [{"prompt": "a", "harness": "vim"}]}]})
+    assert bad and "unknown harness 'vim'" in bad[0]
+
+    c, control, sb = _controller(tmp_path)  # the swarm's harness is claude
+    _submit(control, {"name": "wf", "stages": [{"name": "w", "agents": [
+        {"prompt": "a"}, {"prompt": "b", "harness": "codex"}]}]})
+    c.tick()
+    by_idx = {b.started["meta"]["idx"]: b for b in sb.created}
+    assert by_idx[0].started["harness"] == "claude" and by_idx[1].started["harness"] == "codex"
+    assert control.get_json(f"_swarm/agents/{by_idx[1].id}.json")["harness"] == "codex"
+
+
+def test_cli_wait_blocks_under_the_shell_timeout_and_reports_progress(tmp_path, monkeypatch):
+    # A 7200 s default got the call killed by the harness's 120 s shell timeout, so orchestrators
+    # polled `status` every second instead. One call must fit, then say where things stand.
+    args = swarmctl.build_parser().parse_args(["wait"])
+    assert args.timeout < 120
+    swarm_dir = tmp_path / "_swarm"
+    cp = LocalDirControlPlane(str(swarm_dir))
+    cp.put_json("workflows/wf.json", {"name": "wf", "status": "running", "stages": []})
+    cp.put_json("agents/a1.json", {"id": "a1", "workflow": "wf", "state": "done"})
+    cp.put_json("agents/a2.json", {"id": "a2", "workflow": "wf", "state": "running"})
+    code, text = _run_cli(["wait", "--timeout", "0"], swarm_dir, monkeypatch)
+    assert code == 2 and "1/2 agents finished" in text and "run `aom-swarm wait` again" in text

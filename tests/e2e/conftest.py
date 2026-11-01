@@ -45,6 +45,6 @@ def endpoint(model_name):
     from agents_on_modal import models
 
     model = models.get(model_name)
-    ep = models.deploy(model) if os.environ.get("AOM_E2E_DEPLOY") == "1" else models.endpoint(model)
+    ep = models.ensure_deployed(model, max_containers=1) if os.environ.get("AOM_E2E_DEPLOY") == "1" else models.endpoint(model)
     models.wait_ready(ep, timeout=1800)
     return ep

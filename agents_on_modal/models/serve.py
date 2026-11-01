@@ -37,6 +37,7 @@ AOM_MODEL_JSON_ENV = "AOM_MODEL_JSON"
 #: error. base64 is [A-Za-z0-9+/=] only, so it is always safe inside the quoted ENV.
 AOM_MODEL_JSON_B64_ENV = "AOM_MODEL_JSON_B64"
 AOM_APP_NAME_ENV = "AOM_APP_NAME"
+AOM_MAX_CONTAINERS_ENV = "AOM_MAX_CONTAINERS"
 
 # Mount points and ports inside the GPU container.
 MODEL_MOUNT = "/aom-weights"
@@ -92,6 +93,15 @@ app_name = os.environ.get(AOM_APP_NAME_ENV) or f"aom-{str(model_json['name']).re
 volume_name = f"aom-{str(model_json['name']).replace('.', '-')}-weights"
 
 _scaling = dict(model_json.get("scaling") or {})
+# The endpoint's GPU container cap is not part of the model spec: the deploying app picks it
+# (lifecycle.deploy(max_containers=...)). It is baked into the images beside the spec so the
+# container re-imports this module identically; only a bare offline import falls back to 1.
+_max_containers_env = os.environ.get(AOM_MAX_CONTAINERS_ENV)
+if not _max_containers_env and os.environ.get(AOM_MODEL_JSON_ENV):
+    raise RuntimeError(
+        f"{AOM_MAX_CONTAINERS_ENV} is unset; deploy via agents_on_modal.models.deploy(max_containers=...)."
+    )
+_max_containers = int(_max_containers_env or 1)
 _startup_timeout = int(model_json.get("startup_timeout", 3600))
 
 app = modal.App(name=app_name)
@@ -119,6 +129,7 @@ if base_volume is not None:
 _IDENTITY_ENV = {
     AOM_MODEL_JSON_B64_ENV: base64.b64encode(json.dumps(model_json).encode("utf-8")).decode("ascii"),
     AOM_APP_NAME_ENV: app_name,
+    AOM_MAX_CONTAINERS_ENV: str(_max_containers),
 }
 
 prepare_image = (
@@ -329,7 +340,7 @@ def prepare() -> dict[str, Any]:
     cpu=int(model_json.get("cpu", 8)),
     memory=int(model_json.get("memory", 98_304)),
     min_containers=int(_scaling.get("min_containers", 0)),
-    max_containers=int(_scaling.get("max_containers", 2)),
+    max_containers=_max_containers,
     buffer_containers=int(_scaling.get("buffer_containers", 0)),
     scaledown_window=int(_scaling.get("scaledown_window", 900)),
     scaleup_window=int(_scaling.get("scaleup_window", 60)),

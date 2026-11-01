@@ -75,7 +75,10 @@ def patched(monkeypatch):
     monkeypatch.setattr(models, "get", lambda n: FakeModel(n))
     monkeypatch.setattr(models, "list_models", lambda: [FakeModel("a"), FakeModel("b")])
     monkeypatch.setattr(model_ops, "endpoint", lambda m: bag["endpoint"])
-    monkeypatch.setattr(model_ops, "deploy", lambda m: (bag["deployed"].append(m), bag["endpoint"])[1])
+    monkeypatch.setattr(model_ops, "deploy",
+                        lambda m, **k: (bag["deployed"].append(("deploy", k)), bag["endpoint"])[1])
+    monkeypatch.setattr(model_ops, "ensure_deployed",
+                        lambda m, **k: (bag["deployed"].append(("ensure", k)), bag["endpoint"])[1])
     monkeypatch.setattr(model_ops, "wait_ready", lambda ep, **kw: bag["waited"].append(ep))
     monkeypatch.setattr(model_ops, "scale", lambda m, **s: bag["scaled"].append(s))
     monkeypatch.setattr(model_ops, "stop", lambda m: bag["stopped"].append(m))
@@ -105,7 +108,7 @@ def test_every_subcommand_has_a_func():
         assert callable(args.func)
     for sub in ("list",):
         assert callable(parser.parse_args(["models", sub]).func)
-    for sub, extra in (("deploy", ["m"]), ("scale", ["m"]), ("stop", ["m"]), ("status", ["m"])):
+    for sub, extra in (("deploy", ["m", "--max", "1"]), ("scale", ["m"]), ("stop", ["m"]), ("status", ["m"])):
         assert callable(parser.parse_args(["models", sub, *extra]).func)
 
 
@@ -145,7 +148,8 @@ def test_run_attaches_creates_and_streams(patched, capsys):
 def test_run_deploy_flag_deploys_and_waits(patched):
     rc = main(["run", "--harness", "codex", "--model", "m", "--deploy", "--sandbox", "modal", "p"])
     assert rc == 0
-    assert len(patched["deployed"]) == 1
+    # --deploy never redeploys a live endpoint: it ensures it, asking for the default cap of 1
+    assert patched["deployed"] == [("ensure", {"max_containers": 1})]
     assert patched["waited"] == [patched["endpoint"]]
 
 
@@ -188,8 +192,14 @@ def test_models_list(patched, capsys):
 
 
 def test_models_deploy(patched):
-    assert main(["models", "deploy", "m"]) == 0
-    assert len(patched["deployed"]) == 1
+    assert main(["models", "deploy", "m", "--max", "2"]) == 0
+    assert patched["deployed"] == [("deploy", {"max_containers": 2})]
+
+
+def test_models_deploy_requires_an_explicit_cap(patched):
+    with pytest.raises(SystemExit) as exc:
+        main(["models", "deploy", "m"])
+    assert exc.value.code == 2
 
 
 def test_models_scale_maps_flags(patched):
@@ -231,6 +241,7 @@ def test_swarm_calls_launch_with_parsed_args(monkeypatch, capsys):
     assert rc == 0
     assert captured["harness"] == "claude"
     assert captured["count"] == 3
+    assert captured["max_containers"] == 1  # the CLI asks for 1 unless --max-containers says more
     assert captured["goal"] is True
     assert captured["timeout"] == 60.0
     out = capsys.readouterr().out

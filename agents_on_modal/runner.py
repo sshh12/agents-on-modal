@@ -43,8 +43,16 @@ from .harness.base import GoalState, Harness, HarnessSetup
 #: States that mean the run is over (mirrors ``sandbox.base.TERMINAL_STATES``).
 TERMINAL_STATES = ("done", "timeout", "failed", "cancelled")
 
+#: Env var carrying the run's hard deadline (epoch seconds) to the harness and its tools.
+DEADLINE_ENV = "AOM_RUN_DEADLINE"
+
 #: How often to poll for deadline / cancel while a child runs (seconds).
 POLL_INTERVAL = float(os.environ.get("AOM_RUNNER_POLL", "0.1"))
+
+#: While the harness has printed nothing for this long (seconds) -- typically waiting on a cold or
+#: saturated model -- emit a ``heartbeat`` status this often, so a trace tells "alive but waiting"
+#: apart from "dead" instead of just stopping at ``attempt``.
+HEARTBEAT_INTERVAL = float(os.environ.get("AOM_RUNNER_HEARTBEAT", "60"))
 
 #: Consecutive goal iterations with no new distinct action before we give up.
 MAX_NO_PROGRESS = 3
@@ -270,11 +278,13 @@ def _run_subprocess(
     _ACTIVE["proc"] = proc
     envelopes: list[dict[str, Any]] = []
     append_lock = threading.Lock()
+    last_output = [time.time()]
 
     def reader(stream: Any) -> None:
         try:
             for line in stream:
                 env = sink.emit_harness(line)
+                last_output[0] = time.time()
                 with append_lock:
                     envelopes.append(env)
         except Exception:
@@ -289,13 +299,19 @@ def _run_subprocess(
         t.start()
 
     reason: str | None = None
+    last_beat = time.time()
     while proc.poll() is None:
-        if deadline is not None and time.time() > deadline:
+        now = time.time()
+        if deadline is not None and now > deadline:
             reason = "timeout"
             break
         if cancel_path.exists():
             reason = "cancelled"
             break
+        silent = now - last_output[0]
+        if silent >= HEARTBEAT_INTERVAL and now - last_beat >= HEARTBEAT_INTERVAL:
+            sink.emit_runner({"event": "heartbeat", "silent_s": int(silent)})
+            last_beat = now
         time.sleep(POLL_INTERVAL)
 
     if reason is not None:
@@ -315,6 +331,71 @@ def _run_subprocess(
 # --------------------------------------------------------------------------------------------------
 # driving the run
 # --------------------------------------------------------------------------------------------------
+def _seed_goal_file(workdir: str, prompt: str, deadline: float | None = None) -> str | None:
+    """Write the goal prompt to ``<workdir>/.goal/GOAL.md`` unless one is already there.
+
+    The sandbox instructions and the ``goal`` skill tell a goal-mode agent to re-read that file
+    every turn; without it, every agent spent its first turns finding out it does not exist.
+    Returns the path (``None`` if it could not be written).
+    """
+
+    path = Path(workdir) / ".goal" / "GOAL.md"
+    try:
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(_goal_text(prompt, deadline), encoding="utf-8")
+            # A new goal: a STATUS left by an earlier one must not mark this one complete.
+            (path.parent / "STATUS").unlink(missing_ok=True)
+        return str(path)
+    except OSError:
+        return None
+
+
+def _declared_complete(workdir: str) -> bool:
+    """The agent recorded ``.goal/STATUS`` = ``complete`` (the goal skill writes it only after its
+    completion audit). Read at the deadline: an agent that finished its work but was killed during a
+    final summary turn is done, not timed out."""
+
+    try:
+        status = (Path(workdir) / ".goal" / "STATUS").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return status.strip().lower().startswith("complete")
+
+
+def _finish_at_deadline(goal: bool, cwd: str, status: "StatusWriter", sink: "TraceSink",
+                        goal_state: str, session_id: str | None) -> None:
+    if goal and _declared_complete(cwd):
+        status.set(state="done", goal_state="complete", session_id=session_id)
+        sink.emit_runner({"event": "done", "state": "done", "goal_state": "complete",
+                          "reason": "deadline reached after the agent recorded .goal/STATUS complete"})
+        return
+    status.set(state="timeout", goal_state=goal_state, session_id=session_id)
+    sink.emit_runner({"event": "timeout", "state": "timeout"})
+
+
+def _goal_text(prompt: str, deadline: float | None = None) -> str:
+    when = ""
+    if deadline is not None:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(deadline))
+        when = (f"\n\nHard deadline: {stamp} (epoch {int(deadline)}; also in ${DEADLINE_ENV}). "
+                "Check `date -u` as you go: finish every deliverable before any polish.")
+    return f"# Goal\n\n{prompt.strip()}{when}\n"
+
+
+def _unseed_goal_file(workdir: str, prompt: str, deadline: float | None = None) -> None:
+    """Remove the GOAL.md this run seeded, if it is still verbatim, so it cannot steer a later
+    NON-goal run in the same workspace (a reused sandbox, or the local sandbox's real repo). A goal
+    file someone wrote or edited is left alone."""
+
+    path = Path(workdir) / ".goal" / "GOAL.md"
+    try:
+        if path.read_text(encoding="utf-8") == _goal_text(prompt, deadline):
+            path.unlink()
+    except OSError:
+        pass
+
+
 def _final_nongoal_state(exit_code: int, events: list) -> str:
     """``done`` if the invocation exited cleanly or still produced a result; else ``failed``."""
 
@@ -335,6 +416,8 @@ def _drive(spec: dict[str, Any], harness: Harness, setup: HarnessSetup,
     cancel_path = run_dir / "cancel"
 
     env = {**os.environ, **setup.env}
+    if deadline is not None:  # agents can't otherwise tell how much time they have left
+        env[DEADLINE_ENV] = str(int(deadline))
     cwd = setup.workdir
 
     all_events: list = []
@@ -344,7 +427,11 @@ def _drive(spec: dict[str, Any], harness: Harness, setup: HarnessSetup,
     compaction_retries = 0
     attempt = 0
 
-    sink.emit_runner({"event": "start", "harness": harness.name, "goal": goal, "deadline": deadline})
+    goal_file = _seed_goal_file(cwd, prompt, deadline) if goal else None
+    # Identity on the first event, so a trace joins to its swarm/workflow/stage/agent on its own.
+    sink.emit_runner({"event": "start", "harness": harness.name, "goal": goal, "deadline": deadline,
+                      "goal_file": goal_file, "run_id": spec.get("run_id"),
+                      "sandbox": spec.get("sandbox"), "meta": spec.get("meta") or {}})
 
     while True:
         # Honour cancel / deadline before spending another invocation.
@@ -353,8 +440,7 @@ def _drive(spec: dict[str, Any], harness: Harness, setup: HarnessSetup,
             sink.emit_runner({"event": "done", "state": "cancelled"})
             return 0
         if deadline is not None and time.time() > deadline:
-            status.set(state="timeout", goal_state=goal_state, session_id=session_id)
-            sink.emit_runner({"event": "timeout", "state": "timeout"})
+            _finish_at_deadline(goal, cwd, status, sink, goal_state, session_id)
             return 0
 
         attempt += 1
@@ -404,8 +490,7 @@ def _drive(spec: dict[str, Any], harness: Harness, setup: HarnessSetup,
 
         # The child was killed by us -> terminal immediately.
         if reason == "timeout":
-            status.set(state="timeout")
-            sink.emit_runner({"event": "timeout", "state": "timeout"})
+            _finish_at_deadline(goal, cwd, status, sink, goal_state, session_id)
             return 0
         if reason == "cancelled":
             status.set(state="cancelled")
@@ -516,6 +601,10 @@ def main(argv: list[str] | None = None) -> int:
         sink.emit_runner({"event": "done", "state": "failed", "error": str(exc)})
         return 1
     finally:
+        if spec.get("goal"):
+            deadline = spec.get("deadline")
+            _unseed_goal_file(setup.workdir, str(spec.get("prompt", "")),
+                              float(deadline) if deadline is not None else None)
         sink.close()
 
 

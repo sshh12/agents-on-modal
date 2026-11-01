@@ -155,3 +155,15 @@ async def test_responses_reasoning_effort_passthrough_of_arbitrary_string():
             "stream": True, "reasoning": {"effort": "xhigh", "summary": "auto"},
             "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "x"}]}]})).text()
     assert capture[0]["reasoning_effort"] == "xhigh"  # qwen3.8 xhigh -> xhigh
+
+
+async def test_responses_stream_drops_whitespace_message_before_a_tool_call():
+    # 370 of 388 Codex text events in a pressure test were a bare "\n\n\n" before a tool call.
+    chunks = [c_text("\n\n\n"), c_tool_start(0, "call_1", "exec_command", '{"cmd": "ls"}'),
+              c_finish("tool_calls"), c_usage()]
+    async with gateway(model(), streaming(chunks)) as gw:
+        resp = await gw.post("/v1/responses", json={"stream": True, "input": "run ls", "tools": [
+            {"type": "function", "name": "exec_command", "parameters": {"type": "object"}}]})
+        events = [d for _e, d in parse_sse(await resp.text())]
+    added = [d["item"]["type"] for d in _events_of(events, "response.output_item.added")]
+    assert "message" not in added and "function_call" in added

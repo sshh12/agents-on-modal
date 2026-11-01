@@ -364,6 +364,23 @@ def drop_images_for_text_model(messages: list[dict[str, Any]]) -> int:
     return changed
 
 
+def hold_whitespace(pending: str, delta: str, open_text: bool) -> tuple[str, str]:
+    """``(text to emit now, whitespace still held)`` for one streamed text delta.
+
+    Some models (DeepSeek-V4.1) emit a bare ``"\\n\\n\\n"`` before a tool call. Opened as an
+    assistant text block / message item, that is an empty message on every tool turn (370 of 388
+    Codex text events in a pressure test). Whitespace is held until real text follows -- then
+    emitted with it, so spacing is unchanged -- and dropped if none does. Inside an already-open
+    text block nothing is held.
+    """
+
+    if open_text:
+        return pending + delta, ""
+    if not delta.strip():
+        return "", pending + delta
+    return pending + delta, ""
+
+
 def estimate_tokens(text: str) -> int:
     """A cheap, deterministic prompt-size estimate (~4 chars/token) for ``max_tokens`` clamping."""
 

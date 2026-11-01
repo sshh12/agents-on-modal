@@ -22,6 +22,9 @@ from . import ir
 # Sentinel yielded by :func:`stream_with_keepalive` when the upstream is idle.
 KEEPALIVE = object()
 
+#: Tries for a request whose connection to the engine fails before any response (see post_chunks).
+ENGINE_CONNECT_ATTEMPTS = 3
+
 
 class UpstreamError(AomError):
     """An error returned by the engine (HTTP non-200 or a mid-stream error frame)."""
@@ -121,10 +124,19 @@ async def post_chunks(
     """POST the chat body and yield parsed chunk dicts; raise :class:`UpstreamError` on failure."""
 
     url = engine_url.rstrip("/") + "/v1/chat/completions"
-    try:
-        resp = await session.post(url, json=body)
-    except aiohttp.ClientError as exc:
-        raise UpstreamError(f"cannot reach engine: {exc}", status=503, code="overloaded_error") from exc
+    # A connection-level failure before any response (typically a pooled keep-alive connection the
+    # engine already closed -> ServerDisconnectedError) is retried: surfaced as a 503, Claude Code
+    # retries it but Codex fails the whole turn ("Selected model is at capacity").
+    for attempt in range(ENGINE_CONNECT_ATTEMPTS):
+        try:
+            resp = await session.post(url, json=body)
+            break
+        except aiohttp.ClientConnectionError as exc:
+            if attempt == ENGINE_CONNECT_ATTEMPTS - 1:
+                raise UpstreamError(f"cannot reach engine: {exc}", status=503, code="overloaded_error") from exc
+            await asyncio.sleep(0.5 * (attempt + 1))
+        except aiohttp.ClientError as exc:
+            raise UpstreamError(f"cannot reach engine: {exc}", status=503, code="overloaded_error") from exc
     async with resp:
         if resp.status != 200:
             raise _error_from_body(resp.status, await resp.text())

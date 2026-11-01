@@ -291,3 +291,35 @@ def test_goal_state_active_on_error_or_missing():
 
 def _setup() -> HarnessSetup:
     return HarnessSetup(harness="claude", home="/h", workdir="/work", env={})
+
+
+def test_usage_is_reported_once_per_message_and_never_as_zero_placeholders():
+    # stream-json repeats one message's usage on every content-block line; zeros are placeholders.
+    h = ClaudeCode()
+
+    def line(block, usage, msg_id="msg_1"):
+        return {"ts": 1.0, "data": {"type": "assistant", "message": {
+            "id": msg_id, "content": [block], "usage": usage}}}
+
+    real = {"input_tokens": 100, "output_tokens": 5}
+    zero = {"input_tokens": 0, "output_tokens": 0}
+    events = [ev for env in (line({"type": "thinking", "thinking": "t"}, real),
+                             line({"type": "text", "text": "x"}, real),
+                             line({"type": "text", "text": "y"}, real, msg_id="msg_2"),
+                             line({"type": "text", "text": "z"}, zero, msg_id="msg_3"))
+              for ev in h.parse(env)]
+    usage = [e.data for e in events if e.kind == "usage"]
+    assert [u.get("message_id") for u in usage] == ["msg_1", "msg_2"]
+    assert usage[0]["input_tokens"] == 100
+
+
+def test_extra_dirs_become_claude_working_directories():
+    # Otherwise Claude Code resets the shell cwd after a `cd /shared` ("Shell cwd was reset").
+    h = ClaudeCode()
+    access = ModelAccess(model_id="m", base_url="https://x", token="t", context_window=1000,
+                         max_output_tokens=100, default_effort="medium")
+    profile = SandboxProfile(kind="modal", instructions="", extra_dirs=("/shared", "/tmp"))
+    setup = h.prepare(access, profile, home="/home/agent/.aom/claude", workdir="/work")
+    settings = json.loads(setup.files["/home/agent/.aom/claude/settings.json"])
+    assert settings["permissions"]["additionalDirectories"] == ["/shared", "/tmp"]
+    assert settings["permissions"]["defaultMode"] == "bypassPermissions"

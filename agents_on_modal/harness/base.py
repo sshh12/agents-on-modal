@@ -67,6 +67,9 @@ class SandboxProfile:
     skills: dict[str, str] = field(default_factory=dict)        # skill name -> SKILL.md text
     mcp_servers: dict[str, McpServer] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)           # extra env for the harness process
+    #: Directories outside the workdir the agent legitimately works in (``/shared``, ``/tmp``). A
+    #: harness that confines its shell's cwd to the workdir must allow these too.
+    extra_dirs: tuple[str, ...] = ()
 
 
 @dataclass

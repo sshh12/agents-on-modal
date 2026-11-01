@@ -24,11 +24,16 @@ def main() -> int:
     parser.add_argument("--workdir", default=".", help="directory the agent works in (default: cwd)")
     parser.add_argument("--effort", default=None, help="reasoning effort (none..max)")
     parser.add_argument("--deploy", action="store_true",
-                        help="deploy + prepare the model first (default: attach to an existing one)")
+                        help="deploy + prepare the model first if it isn't deployed "
+                             "(default: attach to an existing one)")
+    parser.add_argument("--max-containers", type=int, default=1,
+                        help="with --deploy: the endpoint's GPU container cap to ask for "
+                             "(a live endpoint is only raised to it, never restarted)")
     args = parser.parse_args()
 
     model = models.get(args.model)
-    endpoint = models.deploy(model) if args.deploy else models.endpoint(model)
+    endpoint = (models.ensure_deployed(model, max_containers=args.max_containers) if args.deploy
+                else models.endpoint(model))
 
     # Always wait for the endpoint to be serving before handing off to the harness. Even on the
     # attach path (no --deploy) the model may be scaled to zero and cold-starting, so the very

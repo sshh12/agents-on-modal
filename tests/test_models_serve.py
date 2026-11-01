@@ -21,6 +21,7 @@ def test_serve_env_var_names_match_deploy():
     # deploy.py duplicates these constants; drift would silently break deploys.
     assert serve.AOM_MODEL_JSON_ENV == deploy.AOM_MODEL_JSON_ENV
     assert serve.AOM_APP_NAME_ENV == deploy.AOM_APP_NAME_ENV
+    assert serve.AOM_MAX_CONTAINERS_ENV == deploy.AOM_MAX_CONTAINERS_ENV
 
 
 def test_load_model_json_reads_env(monkeypatch):

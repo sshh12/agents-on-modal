@@ -265,8 +265,14 @@ def build_app(model: dict, engine_url: str) -> web.Application:
     app.router.add_route("HEAD", "/api/hello", head_ok)
 
     async def _on_startup(_app: web.Application) -> None:
-        # No total timeout: streams and cold starts can run for many minutes.
-        state["session"] = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_connect=None))
+        # No total timeout: streams and cold starts can run for many minutes. No connection cap
+        # either (limit=0): aiohttp's default of 100 silently queued every request past the 100th
+        # in-flight stream inside the gateway, while the engine itself admits far more (and queues
+        # the rest where its scheduler can see them).
+        state["session"] = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=0),
+            timeout=aiohttp.ClientTimeout(total=None, sock_connect=None),
+        )
 
     async def _on_cleanup(_app: web.Application) -> None:
         session = state.get("session")

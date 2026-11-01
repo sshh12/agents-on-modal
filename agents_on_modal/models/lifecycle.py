@@ -4,7 +4,13 @@ These are the functions re-exported from ``agents_on_modal.models`` (``deploy``,
 ``wait_ready``, ``scale``, ``stop``, ``status``). Deploy is idempotent: it ``modal deploy``\\ s
 ``agents_on_modal.models.serve`` with the model spec in ``AOM_MODEL_JSON``, runs the CPU
 ``prepare`` function so weights are downloaded before any GPU is requested, and returns an
-``Endpoint``.
+``Endpoint``. ``ensure_deployed`` is the shared-consumer variant: it attaches to an app that is
+already deployed rather than redeploying it out from under whoever is using it.
+
+The endpoint's GPU container cap (``max_containers``) is not in the model spec; the app using the
+endpoint passes it. ``deploy`` sets it exactly (a redeploy restarts the endpoint anyway), while
+``ensure_deployed`` only ever raises it, so two apps asking for 1 share one endpoint at 1, and
+an app asking for 2 bumps it live without disturbing the other. Only ``scale`` lowers it.
 
 ``modal`` is imported inside the functions, never at module top, so importing this module (and
 therefore the catalog) off-host never pulls in Modal. The URL / app / volume-name derivation and
@@ -18,6 +24,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -33,6 +40,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # which imports modal). Kept in sync with agents_on_modal.models.serve.
 AOM_MODEL_JSON_ENV = "AOM_MODEL_JSON"
 AOM_APP_NAME_ENV = "AOM_APP_NAME"
+AOM_MAX_CONTAINERS_ENV = "AOM_MAX_CONTAINERS"
 
 SERVE_MODULE = "agents_on_modal.models.serve"
 #: Pin the image builder so deploys are reproducible (A5).
@@ -163,6 +171,50 @@ def _run_prepare(app_name: str) -> Any:
         return function.remote()
 
 
+def _server_deployed(app_name: str) -> bool:
+    """True when the app's Server resolves, i.e. it is deployed (scaled to zero still counts)."""
+
+    import modal
+
+    try:
+        modal.Server.from_name(app_name, "Server").hydrate()
+    except Exception:  # noqa: BLE001 - not found / stopped -> not deployed (same signal as status())
+        return False
+    return True
+
+
+def _live_max_containers(app_name: str) -> int | None:
+    """The Server's cap in effect right now; ``None`` when Modal reports none (no Server-level cap)."""
+
+    import modal
+
+    settings = _autoscaler_settings(modal.Server.from_name(app_name, "Server")) or {}
+    return settings.get("max_containers")
+
+
+def _set_max_containers(app_name: str, n: int) -> None:
+    import modal
+
+    _apply_autoscaler(modal.Server.from_name(app_name, "Server"), {"max_containers": n})
+
+
+#: One lock per app, so concurrent ``ensure_deployed`` calls in this process (say, two dashboard
+#: spawns) neither race two deploys of one app nor interleave their cap checks.
+_APP_LOCKS: dict[str, threading.Lock] = {}
+_APP_LOCKS_GUARD = threading.Lock()
+
+
+def _app_lock(app_name: str) -> threading.Lock:
+    with _APP_LOCKS_GUARD:
+        return _APP_LOCKS.setdefault(app_name, threading.Lock())
+
+
+def _check_max_containers(n: Any) -> int:
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise AomError(f"max_containers must be a positive integer, got {n!r}.")
+    return n
+
+
 def _apply_autoscaler(server: Any, settings: dict[str, Any]) -> None:
     """Update a Server's autoscaler (modal >= 1.6.2 ``autoscaler.update``; 1.5.x fallback)."""
 
@@ -189,12 +241,21 @@ def _autoscaler_settings(server: Any) -> dict[str, Any] | None:
 # --------------------------------------------------------------------------- #
 # Public API                                                                   #
 # --------------------------------------------------------------------------- #
-def deploy(model: "Model", *, scaling: "Scaling | None" = None, token: "ProxyToken | None" = None) -> "Endpoint":
-    """Idempotently deploy the model's Modal app and prepare its weights; return an Endpoint."""
+def deploy(
+    model: "Model", *, max_containers: int, scaling: "Scaling | None" = None,
+    token: "ProxyToken | None" = None,
+) -> "Endpoint":
+    """Deploy (or redeploy) the model's Modal app capped at ``max_containers``; prepare its weights.
+
+    Redeploying a live app restarts it (see ``ensure_deployed``, the attach-if-live variant apps
+    should use). The cap is set exactly, statically and as a live override right after the deploy,
+    so the cap read back from the endpoint is the one this deploy chose.
+    """
 
     from ..config import load_token
     from . import Endpoint
 
+    cap = _check_max_containers(max_containers)
     proxy = token or load_token()
     model_json = model.to_json()
     if scaling is not None:
@@ -206,16 +267,58 @@ def deploy(model: "Model", *, scaling: "Scaling | None" = None, token: "ProxyTok
     env = os.environ.copy()
     env[AOM_MODEL_JSON_ENV] = json.dumps(model_json)
     env[AOM_APP_NAME_ENV] = app_name
+    env[AOM_MAX_CONTAINERS_ENV] = str(cap)
     env["MODAL_IMAGE_BUILDER_VERSION"] = MODAL_IMAGE_BUILDER_VERSION
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
 
     _modal_deploy(app_name, env)
+    _set_max_containers(app_name, cap)
     # Prepare weights on CPU before any GPU allocates (cost-critical, A11).
     _run_prepare(app_name)
 
     url = base_url(app_name, workspace, str(model_json.get("region", "us-west")))
     return Endpoint(model=model, url=url, token=proxy.bearer)
+
+
+def ensure_deployed(
+    model: "Model", *, max_containers: int, token: "ProxyToken | None" = None,
+) -> "Endpoint":
+    """Attach to the model's app if it is already deployed, ``deploy`` it if not; return an Endpoint.
+
+    The entry point for every app that *uses* a model (swarm launches, sessions, the dashboard).
+    ``deploy`` always ``modal deploy``\\ s, and a redeploy that changes anything in the app -- a
+    catalog edit (the spec is baked into the image) or a different ``agents_on_modal`` source
+    upload -- makes Modal replace the running containers: every in-flight request from every other
+    app (another swarm, a local session) is cut and the next one waits out a full cold start.
+    Attaching leaves the endpoint running; rolling out a change stays an explicit ``deploy``
+    (``aom models deploy``). ``prepare`` still runs (resumable, a no-op once the weights are
+    complete), so an interrupted first download gets finished instead of served from a partial
+    volume.
+
+    ``max_containers`` is this app's ask for the endpoint's GPU container cap. A first deploy uses
+    it; a live endpoint is raised to it when lower (live, no restart) and never lowered, since other
+    apps on it may have asked for more. A cap is a ceiling, not a reservation: Modal only adds a
+    container once in-flight requests exceed the model's ``target_concurrency`` per container for
+    ``scaleup_window``, and scales idle ones to zero, so a raised cap costs nothing until there is
+    load for it. Lowering is an explicit ``scale``.
+    """
+
+    from ..config import load_token
+
+    cap = _check_max_containers(max_containers)
+    proxy = token or load_token()
+    app_name = deployed_app_name(model, _workspace_slug())
+    with _app_lock(app_name):
+        if not _server_deployed(app_name):
+            return deploy(model, max_containers=cap, token=proxy)
+        _run_prepare(app_name)
+        current = _live_max_containers(app_name)
+        if current is None or current < cap:  # None: no cap in effect -- establish this one
+            _set_max_containers(app_name, cap)
+            was = "none" if current is None else current
+            print(f"[aom] {model.name}: max containers {was} -> {cap}", flush=True)
+    return endpoint(model, token=proxy)
 
 
 def endpoint(model: "Model", *, token: "ProxyToken | None" = None) -> "Endpoint":

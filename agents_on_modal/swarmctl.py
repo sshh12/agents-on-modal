@@ -68,6 +68,36 @@ def _await_ack(control: LocalDirControlPlane, reqid: str, *, timeout: float, out
 # --------------------------------------------------------------------------------------------- #
 # verbs                                                                                         #
 # --------------------------------------------------------------------------------------------- #
+def _inline_schema_paths(data, base_dir: str) -> list[str]:
+    """Replace each agent's ``"schema": "<path>"`` with that JSON file's contents, in place.
+
+    A path is resolved against ``base_dir`` (the plan file's directory) unless absolute, and each
+    file is read once however many agents share it -- so a 100-agent wave can point at one
+    ``/shared/schema.json``. Returns one error per unreadable path; the controller only ever sees
+    inline objects.
+    """
+
+    loaded: dict[str, object] = {}
+    errors: list[str] = []
+    stages = data.get("stages") if isinstance(data, dict) else None
+    for stage in stages if isinstance(stages, list) else []:
+        agents = stage.get("agents") if isinstance(stage, dict) else None
+        for agent in agents if isinstance(agents, list) else []:
+            if not isinstance(agent, dict) or not isinstance(agent.get("schema"), str):
+                continue
+            path = os.path.join(base_dir, agent["schema"])
+            if path not in loaded:
+                try:
+                    with open(path, encoding="utf-8") as stream:
+                        loaded[path] = json.load(stream)
+                except (OSError, ValueError) as error:
+                    loaded[path] = None
+                    errors.append(f"schema file {agent['schema']!r}: {error}")
+            if loaded[path] is not None:
+                agent["schema"] = loaded[path]
+    return errors
+
+
 def _cmd_submit(args, control, out) -> int:
     raw = sys.stdin.read() if args.file == "-" else open(args.file, encoding="utf-8").read()
     try:
@@ -77,10 +107,14 @@ def _cmd_submit(args, control, out) -> int:
         return 1
     if args.name:
         data = {**data, "name": args.name}
+    base_dir = os.getcwd() if args.file == "-" else os.path.dirname(os.path.abspath(args.file))
+    path_errors = _inline_schema_paths(data, base_dir)
     plan, errors, warnings = parse_plan(data)  # instant client-side lint
+    errors = path_errors + errors
     for w in warnings:
         print(f"warning: {w}", file=out)
     if errors:
+        print(f"plan not submitted: {len(errors)} error(s)", file=out)
         for e in errors:
             print(f"error: {e}", file=out)
         return 1
@@ -92,6 +126,8 @@ def _cmd_spawn(args, control, out) -> int:
     agent: dict = {"prompt": args.prompt, "goal": bool(args.goal), "timeout": args.timeout}
     if args.effort:
         agent["effort"] = args.effort
+    if args.harness:
+        agent["harness"] = args.harness
     if args.schema:
         try:
             agent["schema"] = json.loads(open(args.schema, encoding="utf-8").read())
@@ -202,7 +238,16 @@ def _cmd_wait(args, control, out) -> int:
                 print("ok: all workflows finished", file=out)
                 return 0
         time.sleep(args.poll)
-    print(f"timed out after {args.timeout:g}s", file=out)
+    # Not a failure: the default timeout keeps one call under the harness's shell timeout, so the
+    # caller just waits again. Say where things stand so it doesn't poll `status` in between.
+    workflows = _load_workflows(control, args.workflow)
+    agents = [a for a in _all_agents(control) if args.workflow is None or a.get("workflow") == args.workflow]
+    states = [a.get("state") for a in agents]
+    finished = sum(1 for s in states if s in TERMINAL)
+    where = (f"{finished}/{len(states)} agents finished across {len(workflows)} workflow(s)"
+             if workflows else "no workflow is running yet (a submit may still be pending its ack)")
+    print(f"still waiting after {args.timeout:g}s: {where}. Not an error -- run "
+          f"`aom-swarm wait` again to keep waiting.", file=out)
     return 2
 
 
@@ -240,11 +285,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="verb", required=True)
 
     def ack_arg(p):
-        # Default raised well past observed controller ack latency under load (~12 min seen) so a
-        # slow ack is not mistaken for failure (issue S4). Override with AOM_SWARM_ACK_TIMEOUT.
+        # The "~12 min" acks once seen under load were the orchestrator's /shared mount never
+        # showing the controller's writes; the controller now reloads that mount every tick, so an
+        # ack lands in seconds. 90 s stays under the harness's 120 s default shell timeout (900 s
+        # forced orchestrators to background the call). A timeout is still not a failure (S4).
         p.add_argument("--ack-timeout", type=float,
-                       default=float(os.environ.get("AOM_SWARM_ACK_TIMEOUT", "900")),
-                       help="seconds to wait for the controller's ack (env AOM_SWARM_ACK_TIMEOUT, default 900)")
+                       default=float(os.environ.get("AOM_SWARM_ACK_TIMEOUT", "90")),
+                       help="seconds to wait for the controller's ack (env AOM_SWARM_ACK_TIMEOUT, default 90)")
 
     p = sub.add_parser("submit", help="validate and run a plan (waves + pools)")
     p.add_argument("--file", required=True, help="plan JSON file, or - for stdin")
@@ -257,6 +304,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--goal", action="store_true", help="run the subagent under /goal")
     p.add_argument("--timeout", type=float, default=None, help="deadline seconds (required in effect)")
     p.add_argument("--effort")
+    p.add_argument("--harness", help="claude or codex (default: the orchestrator's harness)")
     p.add_argument("--schema", help="path to a JSON Schema file (soft output contract)")
     p.add_argument("--workflow", help="attach to / name the workflow")
     ack_arg(p)
@@ -277,7 +325,10 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--all", action="store_true", help="until all workflows finish (default)")
     group.add_argument("--any", action="store_true", help="until any one agent finishes")
     p.add_argument("--workflow")
-    p.add_argument("--timeout", type=float, default=7200.0)
+    # 100 s: one call fits the harness's 120 s shell timeout (7200 got the call killed, and the
+    # orchestrator fell back to polling `status` every second or two); just call it again.
+    p.add_argument("--timeout", type=float, default=100.0,
+                   help="seconds to block (default 100, under the shell's timeout); then run it again")
     p.add_argument("--poll", type=float, default=5.0)
     p.set_defaults(func=_cmd_wait)
 

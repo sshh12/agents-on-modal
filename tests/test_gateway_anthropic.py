@@ -184,3 +184,37 @@ async def test_count_tokens():
                              json={"messages": [{"role": "user", "content": "hello there"}]})
         data = await resp.json()
     assert isinstance(data["input_tokens"], int) and data["input_tokens"] > 0
+
+
+async def test_messages_stream_drops_whitespace_text_before_a_tool_call():
+    # DeepSeek-V4.1 emits "\n\n\n" before a tool call; it must not become an empty text block.
+    chunks = [c_text("\n\n\n"), c_tool_start(0, "toolu_1", "Bash", '{"cmd": "ls"}'),
+              c_finish("tool_calls"), c_usage()]
+    async with gateway(model(), streaming(chunks)) as gw:
+        resp = await gw.post("/v1/messages", json={"stream": True, "tools": [
+            {"name": "Bash", "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}}}],
+            "messages": [{"role": "user", "content": "run ls"}]})
+        events = parse_sse(await resp.text())
+    starts = [d["content_block"]["type"] for e, d in events if d and d.get("type") == "content_block_start"]
+    assert starts == ["tool_use"]
+
+
+async def test_messages_stream_keeps_whitespace_that_leads_real_text():
+    chunks = [c_text("\n\n"), c_text("Hello"), c_finish("stop"), c_usage()]
+    async with gateway(model(), streaming(chunks)) as gw:
+        resp = await gw.post("/v1/messages", json={"stream": True, "messages": [{"role": "user", "content": "hi"}]})
+        events = parse_sse(await resp.text())
+    text = "".join(d["delta"]["text"] for e, d in events
+                   if d and d.get("type") == "content_block_delta" and d["delta"]["type"] == "text_delta")
+    assert text == "\n\nHello"
+
+
+async def test_message_start_reports_the_prompt_size():
+    # Claude Code snapshots usage per content block from message_start; 0 made every one zero.
+    chunks = [c_text("ok"), c_finish("stop"), c_usage()]
+    async with gateway(model(), streaming(chunks)) as gw:
+        resp = await gw.post("/v1/messages", json={"stream": True,
+                                                   "messages": [{"role": "user", "content": "hi " * 400}]})
+        events = parse_sse(await resp.text())
+    start = next(d for e, d in events if d and d.get("type") == "message_start")
+    assert start["message"]["usage"]["input_tokens"] > 100

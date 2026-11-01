@@ -99,20 +99,26 @@ class Swarm:
     # ---- launch -----------------------------------------------------------------------------
     @classmethod
     def launch(cls, harness: str, model: str | Any, prompt: str, *, count: int,
-               goal: bool = False, timeout: float | None = None, proxy: str | None = None,
-               effort: str | None = None, shared_volume: str | None = None) -> "Swarm":
-        """Ensure the shared model is deployed, then create ``count`` modal sandboxes and start a run in each."""
+               max_containers: int, goal: bool = False, timeout: float | None = None,
+               proxy: str | None = None, effort: str | None = None,
+               shared_volume: str | None = None) -> "Swarm":
+        """Ensure the shared model is deployed, then create ``count`` modal sandboxes and start a run in each.
+
+        ``max_containers`` is this swarm's ask for the model endpoint's GPU container cap (see
+        ``models.ensure_deployed``: it deploys at it, or raises a live endpoint to it, never lowers).
+        """
 
         if count < 1:
             raise AomError("swarm count must be >= 1.")
 
         resolved = models.get(model)
-        # Just ensure the shared model is deployed (idempotent). We do NOT scale it for this swarm:
-        # the model is an account-level shared resource and Modal's concurrency autoscaler sizes it
-        # from AGGREGATE load across every consumer, under the conservative catalog policy
-        # (``Scaling``). Scaling per launch would stomp that global setting and provision GPUs by
-        # agent count instead of by real request load.
-        endpoint = model_ops.deploy(resolved)
+        # Attach to the shared model, deploying it only if it isn't deployed yet. We never redeploy
+        # it or size it by agent count: the model is an account-level shared resource and Modal's
+        # concurrency autoscaler sizes it from AGGREGATE load across every consumer, under the
+        # catalog policy (``Scaling``) and the cap the apps on it asked for. A redeploy would
+        # replace its containers under every other consumer; scaling per agent would provision GPUs
+        # by agent count instead of by real request load.
+        endpoint = model_ops.ensure_deployed(resolved, max_containers=max_containers)
 
         swarm_id = sandbox.new_id("swarm-")
         shared = shared_volume or f"aom-shared-{swarm_id}"
