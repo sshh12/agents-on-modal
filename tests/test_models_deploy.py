@@ -335,6 +335,18 @@ def test_stop_calls_app_stop(monkeypatch):
     assert fake.stopped is True
 
 
+def test_stop_without_app_stop_uses_the_cli(monkeypatch):
+    # modal 1.6 has no App.stop and rejects max_containers=0 (the old fallback raised InvalidError).
+    import modal
+
+    stopped: list[str] = []
+    monkeypatch.setattr(deploy, "_workspace_slug", lambda: "myws")
+    monkeypatch.setattr(modal.App, "lookup", staticmethod(lambda name: object()))
+    monkeypatch.setattr(deploy, "_modal_app_stop", lambda name: stopped.append(name))
+    deploy.stop(_model())
+    assert stopped == ["aom-qwen3-8-27b"]
+
+
 def test_stop_is_idempotent_when_app_missing(monkeypatch):
     import modal
 

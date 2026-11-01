@@ -424,9 +424,19 @@ def stop(model: "Model") -> None:
     if callable(stop_fn):
         stop_fn()
         return
-    # modal 1.5.x has no App.stop; stop running containers by zeroing the autoscaler.
-    server = modal.Server.from_name(app_name, "Server")
-    _apply_autoscaler(server, {"min_containers": 0, "max_containers": 0})
+    # No App.stop in this SDK (1.5/1.6), and 1.6 rejects the old "max_containers=0" fallback; the
+    # CLI's `app stop` works on every version and drains the running containers too.
+    _modal_app_stop(app_name)
+
+
+def _modal_app_stop(app_name: str) -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "modal", "app", "stop", app_name, "--yes"],
+        text=True, encoding="utf-8", errors="replace",
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+    )
+    if result.returncode != 0:
+        raise AomError(f"modal app stop {app_name} failed: {(result.stdout or '').strip()[-400:]}")
 
 
 def status(model: "Model") -> dict[str, Any]:
