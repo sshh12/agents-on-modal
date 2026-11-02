@@ -256,3 +256,56 @@ def test_server_py_uses_reconnect_and_serves_index():
     assert "/api/events" in src
     assert "/api/spawn" in src
     assert "index.html" in src
+
+
+def _server():
+    import sys
+
+    if str(EXAMPLES) not in sys.path:
+        sys.path.insert(0, str(EXAMPLES))
+    import server  # examples/swarm/server.py
+
+    return server
+
+
+def test_dashboard_zip_download_is_an_attachment_named_after_the_volume(monkeypatch):
+    import threading
+    import urllib.request
+
+    server = _server()
+    calls = []
+
+    def fake_zip(name, dest, *, all_files=False):
+        calls.append((name, all_files))
+        dest.write(b"PK-zip-bytes")
+        return {"files": 3}
+
+    monkeypatch.setattr(server.export, "zip_shared_volume", fake_zip, raising=True)
+    httpd = server._bind("127.0.0.1", 0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        with urllib.request.urlopen(base + "/api/zip?swarm=swarm-1&all=1") as res:
+            assert res.headers["Content-Type"] == "application/zip"
+            assert res.headers["Content-Disposition"] == 'attachment; filename="aom-shared-swarm-1-all.zip"'
+            assert res.headers["X-Aom-Files"] == "3"
+            assert res.read() == b"PK-zip-bytes"
+        with urllib.request.urlopen(base + "/api/zip?swarm=swarm-1") as res:
+            assert 'filename="aom-shared-swarm-1.zip"' in res.headers["Content-Disposition"]
+        assert calls == [("aom-shared-swarm-1", True), ("aom-shared-swarm-1", False)]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_dashboard_zip_rejects_a_bad_swarm_id():
+    server = _server()
+    for bad in ("", "../x", "a b", "x/y"):
+        with pytest.raises(AomError):
+            server._zip_export(bad, False)
+
+
+def test_index_html_wires_the_zip_download():
+    html = (EXAMPLES / "index.html").read_text(encoding="utf-8")
+    assert 'id="zipBtn"' in html and 'id="zipScope"' in html
+    assert "/api/zip?swarm=" in html

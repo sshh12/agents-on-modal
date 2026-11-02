@@ -162,6 +162,13 @@
 <header>
   <h1>aom swarm</h1>
   <span class="meta" id="swarmMeta">no swarm</span>
+  <span id="zipWrap" style="display:none">
+    <select id="zipScope" title="what to include (dependency/cache dirs like node_modules are always skipped)"
+      style="width:auto; padding:2px 6px; font-size:11px;">
+      <option value="">outputs (.md .tsv .csv .json)</option><option value="all">all files</option></select>
+    <button type="button" id="zipBtn" class="ghost" title="zip /shared on Modal's side and download it"
+      style="width:auto; padding:2px 8px; font-size:11px;">download .zip</button>
+  </span>
   <span id="error"></span>
 </header>
 <main>
@@ -438,6 +445,7 @@ function elEmpty(msg) { const d = document.createElement("div"); d.className = "
 
 // --------------------------------------------------------------------------- refresh loop
 async function refresh() {
+  $("zipWrap").style.display = swarmId ? "" : "none";
   if (!swarmId) return;
   try {
     const data = await getJSON("/api/agents?swarm=" + encodeURIComponent(swarmId));
@@ -736,6 +744,30 @@ $("harness").addEventListener("change", loadInjected);
 $("model").addEventListener("change", loadInjected);
 
 $("epRefresh").addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); loadEndpoints(); });
+
+// Download /shared as a zip. The server zips it on Modal's side (a minute or so on a big volume),
+// so fetch it here with a spinner instead of a bare link that shows nothing until it is ready.
+$("zipBtn").addEventListener("click", async () => {
+  if (!swarmId) return;
+  const btn = $("zipBtn"); const all = $("zipScope").value === "all";
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> zipping…';
+  try {
+    const res = await fetch("/api/zip?swarm=" + encodeURIComponent(swarmId) + (all ? "&all=1" : ""));
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || ("HTTP " + res.status));
+    }
+    const m = (res.headers.get("Content-Disposition") || "").match(/filename="([^"]+)"/);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(await res.blob());
+    a.download = m ? m[1] : "aom-shared-" + swarmId + ".zip";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    btn.title = "last download: " + (res.headers.get("X-Aom-Files") || "?") + " files";
+    setError("");
+  } catch (e) { setError("zip download failed: " + (e.message || e)); }
+  finally { btn.disabled = false; btn.textContent = "download .zip"; }
+});
 
 $("spawn").addEventListener("submit", async (e) => {
   e.preventDefault();

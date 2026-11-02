@@ -25,6 +25,7 @@ Endpoints
     GET  /api/events?agent=&run=&offset=        -> {events, offset, state, done}
     GET  /api/files?swarm=&path=/               -> {paths:[...]}            (live /shared listing)
     GET  /api/file?swarm=&path=...              -> {path, text, truncated}  (one shared file)
+    GET  /api/zip?swarm=[&all=1]                -> application/zip  (/shared, zipped on Modal's side)
     GET  /api/injected?harness=&model=          -> {text}                   (orchestrator context)
     GET  /api/models                            -> {models:[{name,description,gpu,context_window}]}
     GET  /api/presets                           -> {presets:[{name,label,mode,prompt?,locked}]}
@@ -39,7 +40,9 @@ import concurrent.futures
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -65,6 +68,7 @@ from agents_on_modal.dynamic import (  # noqa: E402
 )
 from agents_on_modal.swarm import Swarm  # noqa: E402
 
+import export  # noqa: E402 - local module beside this file
 import presets as presets_mod  # noqa: E402 - local module beside this file
 
 HERE = Path(__file__).resolve().parent
@@ -374,6 +378,31 @@ def _file_payload(swarm_id: str, path: str, offset: int = 0) -> dict:
             "truncated": total > MAX_FILE_BYTES}
 
 
+#: Swarm ids are minted by ``sandbox.new_id``; anything else is not a shared volume we made.
+_SWARM_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def _zip_export(swarm_id: str, all_files: bool) -> tuple:
+    """The swarm's shared volume as a zip: ``(file, size, filename, stats)``, zipped on Modal's side.
+
+    Built into a temp file before any response byte is sent, so a failure is a JSON error, never a
+    truncated download. Needs only the volume, so it works after the swarm's sandboxes are gone.
+    """
+
+    if not _SWARM_ID.fullmatch(swarm_id or ""):
+        raise AomError(f"invalid swarm id: {swarm_id!r}")
+    volume = f"aom-shared-{swarm_id}"
+    handle = tempfile.TemporaryFile()
+    try:
+        stats = export.zip_shared_volume(volume, handle, all_files=all_files)
+        size = handle.tell()
+        handle.seek(0)
+    except BaseException:
+        handle.close()
+        raise
+    return handle, size, f"{volume}{'-all' if all_files else ''}.zip", stats
+
+
 def _presets_payload() -> dict:
     """The swarm presets from presets.json, with encrypted entries decrypted where possible.
 
@@ -484,6 +513,20 @@ class Handler(BaseHTTPRequestHandler):
         except ConnectionError:
             self.close_connection = True
 
+    def _send_zip(self, swarm_id: str, all_files: bool) -> None:
+        handle, size, filename, stats = _zip_export(swarm_id, all_files)
+        with handle:
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("X-Aom-Files", str(stats.get("files", "")))
+                self.end_headers()
+                shutil.copyfileobj(handle, self.wfile, 1 << 20)
+            except ConnectionError:
+                self.close_connection = True
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
@@ -501,6 +544,9 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/file":
                 self._send_json(_file_payload(one("swarm", os.environ.get("AOM_SWARM", "")),
                                               one("path"), int(one("offset", "0") or 0)))
+            elif parsed.path == "/api/zip":
+                self._send_zip(one("swarm", os.environ.get("AOM_SWARM", "")),
+                               one("all").lower() in ("1", "true", "yes"))
             elif parsed.path == "/api/injected":
                 self._send_json(_injected_payload(one("harness"), one("model")))
             elif parsed.path == "/api/models":
