@@ -9,6 +9,10 @@ is injected by the egress proxy, so the agent never sees it. Everything is manag
     python examples/docker_session.py --harness claude --model qwen3.8-27b \\
         --proxy socks5h://user:pass@residential.example:1080
 
+    # anything else goes to the harness: an initial prompt and/or its own flags
+    # (after `--`, everything does, even flags named like ours)
+    python examples/docker_session.py --harness claude --model qwen3.8-27b "audit this repo"
+
 Needs Docker running locally and a stored Modal proxy token (`aom setup`).
 """
 
@@ -19,8 +23,20 @@ import argparse
 from agents_on_modal import models, sandbox
 
 
+def _harness_args(extra: list[str]) -> list[str]:
+    """Unrecognised args go to the harness verbatim; the first ``--`` only ends our options."""
+
+    if "--" in extra:
+        extra = list(extra)
+        extra.remove("--")
+    return extra
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, allow_abbrev=False, formatter_class=argparse.RawDescriptionHelpFormatter,
+        usage="%(prog)s [options] [harness args...]",
+    )
     parser.add_argument("--harness", choices=("claude", "codex"), default="claude")
     parser.add_argument("--model", default="qwen3.8-27b", help="catalog model name")
     parser.add_argument("--proxy", default=None,
@@ -32,7 +48,8 @@ def main() -> int:
     parser.add_argument("--max-containers", type=int, default=1,
                         help="with --deploy: the endpoint's GPU container cap to ask for "
                              "(a live endpoint is only raised to it, never restarted)")
-    args = parser.parse_args()
+    # Anything we don't recognise (an initial prompt, harness flags) is passed to the harness.
+    args, extra = parser.parse_known_args()
 
     model = models.get(args.model)
     endpoint = (models.ensure_deployed(model, max_containers=args.max_containers) if args.deploy
@@ -42,7 +59,7 @@ def main() -> int:
 
     box = sandbox.create("docker", endpoint=endpoint, proxy=args.proxy)
     try:
-        return box.interactive(args.harness, endpoint, effort=args.effort)
+        return box.interactive(args.harness, endpoint, effort=args.effort, args=_harness_args(extra))
     finally:
         box.stop()
 

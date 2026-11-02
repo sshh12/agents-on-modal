@@ -7,6 +7,11 @@ Everything else (the model endpoint, the harness home, config, instructions) is 
     # deploy the model once (idempotent), then:
     python examples/local_session.py --harness claude --model qwen3.8-27b
 
+    # anything else goes to the harness: an initial prompt and/or its own flags
+    # (after `--`, everything does, even flags named like ours)
+    python examples/local_session.py --harness claude --model qwen3.8-27b "fix the failing tests"
+    python examples/local_session.py --harness codex --model qwen3.8-27b -- --model x "hi"
+
 Run `aom setup` first so a Modal proxy token is stored.
 """
 
@@ -17,8 +22,20 @@ import argparse
 from agents_on_modal import models, sandbox
 
 
+def _harness_args(extra: list[str]) -> list[str]:
+    """Unrecognised args go to the harness verbatim; the first ``--`` only ends our options."""
+
+    if "--" in extra:
+        extra = list(extra)
+        extra.remove("--")
+    return extra
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, allow_abbrev=False, formatter_class=argparse.RawDescriptionHelpFormatter,
+        usage="%(prog)s [options] [harness args...]",
+    )
     parser.add_argument("--harness", choices=("claude", "codex"), default="claude")
     parser.add_argument("--model", default="qwen3.8-27b", help="catalog model name")
     parser.add_argument("--workdir", default=".", help="directory the agent works in (default: cwd)")
@@ -29,7 +46,8 @@ def main() -> int:
     parser.add_argument("--max-containers", type=int, default=1,
                         help="with --deploy: the endpoint's GPU container cap to ask for "
                              "(a live endpoint is only raised to it, never restarted)")
-    args = parser.parse_args()
+    # Anything we don't recognise (an initial prompt, harness flags) is passed to the harness.
+    args, extra = parser.parse_known_args()
 
     model = models.get(args.model)
     endpoint = (models.ensure_deployed(model, max_containers=args.max_containers) if args.deploy
@@ -51,7 +69,7 @@ def main() -> int:
     # A local sandbox is just this host; the chosen directory is the agent's workspace.
     box = sandbox.create("local", endpoint=endpoint, workdir=args.workdir)
     try:
-        return box.interactive(args.harness, endpoint, effort=args.effort)
+        return box.interactive(args.harness, endpoint, effort=args.effort, args=_harness_args(extra))
     finally:
         box.stop()
 

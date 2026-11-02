@@ -183,6 +183,19 @@ def test_attach_inherits_stdio_and_returns_code(aom_home, workdir):
     assert box.attach([sys.executable, "-c", "import sys; sys.exit(5)"]) == 5
 
 
+def test_interactive_appends_harness_args(aom_home, workdir, monkeypatch):
+    box = LocalSandbox.create(workdir=str(workdir))
+    harness = SimpleNamespace(interactive_argv=lambda setup: ["claude", "--flag"])
+    setup = SimpleNamespace(env={"K": "V"}, workdir=str(workdir))
+    monkeypatch.setattr(box, "setup_harness", lambda h, endpoint, effort=None: (harness, setup))
+    calls = []
+    monkeypatch.setattr(box, "attach", lambda argv, env=None, cwd=None: calls.append(argv) or 0)
+
+    assert box.interactive("claude", object()) == 0
+    assert box.interactive("claude", object(), args=["do the thing", "--resume"]) == 0
+    assert calls == [["claude", "--flag"], ["claude", "--flag", "do the thing", "--resume"]]
+
+
 def test_stop_removes_state_and_is_idempotent(aom_home, workdir):
     box = LocalSandbox.create(workdir=str(workdir))
     state = aom_home / "local" / box.id

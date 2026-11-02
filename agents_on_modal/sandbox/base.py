@@ -208,11 +208,16 @@ class Sandbox(ABC):
     def run(self, run_id: str) -> "Run":
         return Run(self, run_id)
 
-    def interactive(self, harness: str | Harness, endpoint: Any, *, effort: str | None = None) -> int:
-        """Open the harness TUI in this sandbox on the caller's terminal."""
+    def interactive(self, harness: str | Harness, endpoint: Any, *, effort: str | None = None,
+                    args: Sequence[str] = ()) -> int:
+        """Open the harness TUI in this sandbox on the caller's terminal.
+
+        ``args`` are appended to the harness's own interactive argv verbatim -- an initial prompt
+        and/or extra harness flags (e.g. ``["fix the tests"]`` or ``["--resume"]``).
+        """
 
         h, setup = self.setup_harness(harness, endpoint, effort=effort)
-        return self.attach(h.interactive_argv(setup), env=setup.env, cwd=setup.workdir)
+        return self.attach([*h.interactive_argv(setup), *args], env=setup.env, cwd=setup.workdir)
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.id}>"
