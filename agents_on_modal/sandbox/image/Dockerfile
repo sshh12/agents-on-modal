@@ -27,6 +27,7 @@ ARG AGENT_BROWSER_VERSION=0.39.2
 ARG PY_PLAYWRIGHT_VERSION=1.64.1
 ARG DSH_SDK_VERSION=0.2.1rc2
 ARG UV_VERSION=0.13.5
+ARG PYTEST_VERSION=9.1.1
 ARG GO_VERSION=1.24.8
 ARG TARGETARCH
 
@@ -122,10 +123,12 @@ RUN set -eux; \
     claude --version || true; \
     codex --version || true
 
-# --- Python browser lib + uv, system-wide (PEP 668 override: this is a devbox).
+# --- Python browser lib + uv + pytest, system-wide (PEP 668 override: this is a devbox). pytest is
+# here because nearly every coding agent runs `python -m pytest` early; without it 95 of 100 agents in
+# a pressure test spent turns on "No module named pytest" and a pip install first.
 RUN set -eux; \
     pip3 install --no-cache-dir --break-system-packages \
-        playwright==${PY_PLAYWRIGHT_VERSION} "uv==${UV_VERSION}"
+        playwright==${PY_PLAYWRIGHT_VERSION} "uv==${UV_VERSION}" "pytest==${PYTEST_VERSION}"
 
 # --- DeepSeek Harness SDK (the `dsh` harness). The wheel vendors the `dsh` runtime + binary and the
 # `deepseek_harness` Python module that agents_on_modal.harness._dsh_adapter imports. System-wide so

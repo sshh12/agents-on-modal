@@ -19,7 +19,10 @@ import aiohttp
 from aiohttp import web
 
 from . import anthropic, chat, responses
-from .ir import clamp_max_tokens, drop_images_for_text_model, estimate_tokens
+from .ir import (
+    affinity_key, clamp_max_tokens, dp_rank_for, dp_size_of, drop_images_for_text_model, estimate_tokens,
+    history_args,
+)
 from .reasoning import chat_reasoning_fields
 
 _SSE_HEADERS = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"}
@@ -54,6 +57,9 @@ def build_app(model: dict, engine_url: str) -> web.Application:
     vision = bool(model.get("vision"))
     reasoning_cfg = model.get("reasoning") or {}
     sampling_defaults = dict(model.get("sampling") or {})
+    #: SGLang DP schedulers (``--attn-dp-size`` / ``--dp-size``): each keeps its own prefix cache, so
+    #: every request carries ``routed_dp_rank`` pinning its conversation to one (``ir.dp_rank_for``).
+    dp_size = dp_size_of(model.get("engine_args")) if model.get("engine") in (None, "sglang") else 1
     engine = engine_url.rstrip("/")
     _engine_split = urlsplit(engine)
     engine_host = _engine_split.hostname or "127.0.0.1"
@@ -121,7 +127,9 @@ def build_app(model: dict, engine_url: str) -> web.Application:
             drop_images_for_text_model(parsed.messages)  # S1: never send image blocks to a text model
         body: dict[str, Any] = {"model": name, "messages": parsed.messages, "stream": stream}
         if stream:
-            body["stream_options"] = {"include_usage": True, "continuous_usage_stats": True}
+            # Final usage only: every consumer reads the last usage block, and per-chunk usage
+            # (continuous_usage_stats) costs the engine's single HTTP process work on every token.
+            body["stream_options"] = {"include_usage": True}
         if parsed.tools:
             body["tools"] = parsed.tools
             if parsed.tool_choice is not None:
@@ -142,6 +150,8 @@ def build_app(model: dict, engine_url: str) -> web.Application:
             parsed.max_tokens_requested, context_window=context_window, prompt_estimate=prompt_estimate,
             model_max_output=max_output, default=max_output,
         )
+        if dp_size > 1:
+            body["routed_dp_rank"] = dp_rank_for(parsed.affinity or affinity_key(parsed.messages), dp_size)
         return body
 
     # ---- Anthropic Messages -----------------------------------------------------------------
@@ -216,12 +226,20 @@ def build_app(model: dict, engine_url: str) -> web.Application:
         body["model"] = name
         if not vision:
             drop_images_for_text_model(body.get("messages") or [])  # S1 (chat pass-through path too)
+        for msg in body.get("messages") or []:  # one malformed call must not fail every later turn
+            for call in (msg.get("tool_calls") or []) if isinstance(msg, dict) else []:
+                fn = call.get("function") if isinstance(call, dict) else None
+                if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                    fn["arguments"] = history_args(fn["arguments"])
         _apply_reasoning(body, chat_reasoning_fields(body.get("reasoning_effort"), reasoning_cfg))
         prompt_estimate = estimate_tokens(json.dumps(body.get("messages") or [], ensure_ascii=False))
         body["max_tokens"] = clamp_max_tokens(
             body.get("max_tokens"), context_window=context_window, prompt_estimate=prompt_estimate,
             model_max_output=max_output, default=max_output,
         )
+        if dp_size > 1 and body.get("routed_dp_rank") is None:
+            key = body.get("user") or affinity_key(body.get("messages") or [])
+            body["routed_dp_rank"] = dp_rank_for(str(key), dp_size)
         stream = bool(body.get("stream"))
         url = engine + "/v1/chat/completions"
         try:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from agents_on_modal.gateway import ir
 from agents_on_modal.gateway.reasoning import chat_reasoning_fields
 
@@ -134,3 +136,59 @@ async def test_post_chunks_retries_a_dropped_engine_connection(monkeypatch):
 
 async def _noop():
     return None
+
+
+def test_dp_size_of_reads_sglang_dp_flags():
+    assert ir.dp_size_of(None) == 1
+    assert ir.dp_size_of(["--enable-metrics", "--ep-size=4"]) == 1
+    assert ir.dp_size_of(["--enable-dp-attention", "--dp-size=4"]) == 4
+    assert ir.dp_size_of(["--dp=2"]) == 2
+    assert ir.dp_size_of(["--attn-dp-size=4"]) == 4
+
+
+def test_dp_rank_is_stable_per_conversation_and_spreads_conversations():
+    assert ir.dp_rank_for("session-a", 4) == ir.dp_rank_for("session-a", 4)
+    ranks = {ir.dp_rank_for(f"session-{i}", 4) for i in range(64)}
+    assert ranks == {0, 1, 2, 3}
+    # Without a client key, later turns of a conversation still hash like its first turn.
+    first = [{"role": "system", "content": "sys"}, {"role": "user", "content": "task 7"}]
+    later = first + [{"role": "assistant", "content": "ok"}, {"role": "tool", "tool_call_id": "c", "content": "x"},
+                     {"role": "user", "content": "more"}]
+    assert ir.affinity_key(first) == ir.affinity_key(later)
+
+
+def test_history_args_keep_valid_objects_and_wrap_anything_else():
+    assert ir.history_args('{"cmd":"ls"}') == '{"cmd":"ls"}'
+    assert ir.history_args("") == ""
+    truncated = '{"cmd": "python -m pytest -q && echo do'
+    assert json.loads(ir.history_args(truncated)) == {"_invalid_arguments": truncated}
+    assert json.loads(ir.history_args('["a"]')) == {"_invalid_arguments": '["a"]'}
+
+
+def test_repetition_guard_flags_short_period_loops_only():
+    guard = ir.RepetitionGuard(window=1000)
+    lines = [f"def f{i}(w, h):\n    return w * h + {i}  # the area plus {i}, see the docstring\n" for i in range(60)]
+    for line in lines:  # long, ordinary code: never periodic over 1000 chars
+        assert guard.feed(line) is None
+    loop = ir.RepetitionGuard(window=1000)
+    found = None
+    for _ in range(600):
+        found = loop.feed("The") or found
+    assert found == 3
+    assert ir.RepetitionGuard(window=0).feed("x" * 5000) is None  # disabled
+
+
+async def test_stream_cut_on_runaway_repetition_finishes_as_length(monkeypatch):
+    from agents_on_modal.gateway import chat
+
+    async def fake_chunks(_session, _url, _body):
+        yield {"choices": [{"delta": {"content": "Starting. "}}]}
+        for _ in range(2000):
+            yield {"choices": [{"delta": {"reasoning_content": "Fail"}}]}
+        yield {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(chat, "post_chunks", fake_chunks)
+    events = [e async for e in chat.stream_events(None, "http://engine", {})]
+    finishes = [e for e in events if isinstance(e, ir.Finish)]
+    assert [f.reason for f in finishes] == ["length"]
+    assert sum(1 for e in events if isinstance(e, ir.ReasoningDelta)) < 400  # cut long before the end

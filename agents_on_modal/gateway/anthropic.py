@@ -166,6 +166,10 @@ def parse_request(body: dict[str, Any]) -> ir.ParsedRequest:
     if isinstance(tc, dict) and tc.get("disable_parallel_tool_use"):
         parallel = False
 
+    # Claude Code names its session in metadata.user_id (stable across the session's turns).
+    metadata = body.get("metadata") or {}
+    affinity = metadata.get("user_id") if isinstance(metadata, dict) else None
+
     return ir.ParsedRequest(
         messages=chat_messages,
         tools=_convert_tools(body.get("tools") or []),
@@ -177,6 +181,7 @@ def parse_request(body: dict[str, Any]) -> ir.ParsedRequest:
         effort=effort,
         thinking_enabled=thinking_enabled,
         max_tokens_requested=body.get("max_tokens"),
+        affinity=str(affinity) if affinity else None,
     )
 
 

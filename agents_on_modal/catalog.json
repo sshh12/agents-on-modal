@@ -397,7 +397,7 @@
       }
     },
     "glm-5.3-uncensored-fp8": {
-      "description": "GLM-5.3 uncensored (dealignai), block-FP8 e4m3 -- the FULL 753B glm_moe_dsa model (NOT the 320B Flash), ~703.7 GiB across 282 shards -- via SGLang on B300:4. Same arch and parsers as the glm-5.3-*-nvfp4 entries: glm45 reasoning + glm47 tool-call are mandatory (auto picks wrong), the template always opens <think>, and reasoning_effort honors low/high only (anything else becomes max), so always send an explicit level. Image lmsysorg/sglang:v0.5.19-cu130 is the proven glm_moe_dsa image (its transformers 5.12.1 already registers glm_moe_dsa; do NOT force 5.16.0 -- it collides with SGLang's qwen3_asr config registration and the server exits 1 before the health check). This is FP8 BLOCK quant, so unlike the NVFP4 entries there is NO --quantization flag: SGLang auto-detects block-FP8 from config.json. SIZING: at 703.7 GiB the weights need 4 GPUs. B300:4 tp4 = ~176 GiB/GPU = ~66% of B300's ~267.7 GiB usable -- comfortable: mem-fraction-static 0.85 leaves ~51 GiB/GPU static + ~40 GiB/GPU non-static for cuda-graph capture. B300:2 (~352 GiB/GPU) does not fit; H200:4 (~176/139 = 127%) does not fit. The card's 8xH200 TP8 vLLM recipe (max-model-len 131072, gpu-mem-util 0.90, enforce-eager) is the Hopper fallback; B300:4 is a cheaper power-of-2 TP that runs FP8 natively on Blackwell. CONTEXT: full 262144 fits because glm_moe_dsa uses DeepSeek Sparse Attention (DSA) -- the KV pool is small (the NVFP4 full-GLM entries already serve 256k on B300:2 with far less KV headroom), so NO fp8 kv-cache is needed (and DSA + fp8-kv is unproven). --chunked-prefill-size=8192 (proven on the NVFP4 GLM entries) keeps long-context prefill throughput up; --ep-size=4 matches tp. MoE/gemm backends are NOT pinned -- SGLang auto-resolves deep_gemm/cutlass on Blackwell; confirm the resolved backends in the startup log. Text-only (no vision). If 256k KV ever refuses to fit at boot, drop context to 131072 (the card's H200 ceiling) rather than pushing mem-fraction past 0.85 (that starves capture -> exit -9).",
+      "description": "GLM-5.3 uncensored (dealignai), block-FP8 e4m3 -- the FULL 753B glm_moe_dsa model (NOT the 320B Flash), ~703.7 GiB across 282 shards -- via SGLang on B300:4. Parsers: glm45 reasoning + glm47 tool-call are mandatory (auto picks wrong); the template always opens <think>; reasoning_effort honors low/high only (anything else becomes max), so always send an explicit level. No --quantization flag: SGLang auto-detects block-FP8 from config.json. IMAGE v0.5.23-cu130 (was v0.5.19, which had only Jinja rendering): v0.5.23 renders GLM-5.3 prompts with a Python chat template that caches the token ids of the repeated history -- on v0.5.19 re-tokenizing every turn's whole conversation was 98% of the engine's single HTTP process, which saturated at ~100 agents -- and fixes the glm47 parser's O(n^2) rescan of streamed tool arguments and its non-streaming 'true' -> 'True' argument bug. SAMPLING repetition_penalty=1.0 is mandatory: this checkpoint's generation_config.json (unlike zai-org's) sets 1.1, which SGLang applies to every request by default; over agent-length prompts it gave degenerate 'TheTheThe' reasoning, Edit old_string misses and malformed apply_patch envelopes. --default-chat-template-kwargs clear_thinking=false pins zai-org's preserved-thinking default (the checkpoint's Jinja defaults true; v0.5.23's Python template false). SIZING: 175.9 GiB/GPU weights = ~66% of B300 usable at mem-fraction-static 0.85; fp8_e4m3 KV is auto-selected on SM10x for DSA (trtllm DSA backends), ~1.03M tokens with MTP (1.12M without), and 100 agents peaked at ~74% because Claude Code's ~25k shared prefix is cached once. B300:2 and H200:4 do not fit. MTP: EAGLE on the checkpoint's nextn layer, 3 steps / topk 1 / 4 draft tokens, accepts ~3 of 4 tokens on agent traffic; at 50-100 concurrent requests decode is bound by reading the MoE weights, so verification is nearly free (+21% decode tok/s, +45% per-stream over the same config without it). SGLang silently caps --max-running-requests at 48 when speculative decoding is on, so it is set to 128. --stream-interval=8: agents do not need per-token streaming, and it cuts the HTTP process's and the gateway's per-chunk work. COLD START ~13-15 min: container ~1.5 min, weights 384 s with --weight-loader-prefetch-checkpoints (536 s without), DeepGEMM JIT warmup trimmed by SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1, then prefill/decode/verify CUDA graphs ~2.5 min. PRESSURE TEST (100 Modal agents, 2/3 claude 1/3 codex, a 10-minute coding task): the v0.5.19 baseline finished 82/100 (decode 1.46k tok/s with >=50 agents active, TTFT 1.9 s); this config finished 100/100, all within 4 minutes of launch (median time-to-done claude 151 s vs 261 s, codex 194 s vs 383 s; decode 2.29k tok/s, TTFT 0.84 s, 27% fewer tokens generated). target_concurrency=100: one container served all 100 agents with nothing queued. Max containers is not a catalog setting -- the app using the endpoint asks for it, and 1 is the default.",
       "repo": "dealignai/GLM-5.3-UNCENSORED-FP8",
       "engine": "sglang",
       "gpu": "B300:4",
@@ -405,7 +405,7 @@
       "max_output_tokens": 32768,
       "region": "us-west",
       "hf_token_env": "HF_TOKEN",
-      "image": "lmsysorg/sglang:v0.5.19-cu130",
+      "image": "lmsysorg/sglang:v0.5.23-cu130",
       "startup_timeout": 7200,
       "engine_args": [
         "--enable-metrics",
@@ -414,10 +414,18 @@
         "--ep-size=4",
         "--chunked-prefill-size=8192",
         "--mem-fraction-static=0.85",
-        "--enable-cache-report"
+        "--enable-cache-report",
+        "--stream-interval=8",
+        "--weight-loader-prefetch-checkpoints",
+        "--default-chat-template-kwargs={\"clear_thinking\":false}",
+        "--max-running-requests=128",
+        "--speculative-algorithm=EAGLE",
+        "--speculative-num-steps=3",
+        "--speculative-eagle-topk=1",
+        "--speculative-num-draft-tokens=4"
       ],
       "scaling": {
-        "target_concurrency": 32.0
+        "target_concurrency": 100.0
       },
       "reasoning": {
         "default": "high",
@@ -430,6 +438,12 @@
           "xhigh": "max",
           "max": "max"
         }
+      },
+      "sampling": {
+        "repetition_penalty": 1.0
+      },
+      "engine_env": {
+        "SGLANG_JIT_DEEPGEMM_FAST_WARMUP": "1"
       }
     },
     "deepseek-v4.1-flash-huihui-gguf": {

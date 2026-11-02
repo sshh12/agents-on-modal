@@ -8,6 +8,7 @@ history only from ``response.output_item.done`` items plus ``response.completed`
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import time
 from typing import Any, AsyncIterator
@@ -69,19 +70,80 @@ def _output_to_str(output: Any) -> str:
     return "" if output is None else str(output)
 
 
+#: A worked example for Codex's freeform apply_patch: with only its Lark grammar to go on, a
+#: function-calling model sometimes writes the grammar's rule names ("begin_patch", "add_file: x")
+#: instead of the quoted markers -- 2 of 8 add-file patches in a GLM-5.3 replay.
+_APPLY_PATCH_EXAMPLE = """*** Begin Patch
+*** Add File: hello.py
++print("hi")
+*** Update File: src/app.py
+@@ def main():
+-    return 1
++    return 2
+*** End Patch"""
+
+
 def _custom_tool(tool: dict[str, Any]) -> tuple[dict[str, Any], str]:
     name = tool.get("name", "")
     description = tool.get("description", "")
     fmt = tool.get("format") or {}
     definition = fmt.get("definition")
     if definition:
-        description = f"{description}\n\nFormat:\n```{fmt.get('syntax', 'lark')}\n{definition}\n```"
+        syntax = fmt.get("syntax", "lark")
+        description = (
+            f"{description}\n\nPut the whole {name} input in `input` as raw text (not JSON, not a code "
+            f"block). It must match this {syntax} grammar; rule names such as `begin_patch` are labels, "
+            f"not text -- write the quoted strings literally.\n```{syntax}\n{definition}\n```"
+        )
+        if name == "apply_patch":
+            description += f"\nExample input:\n```\n{_APPLY_PATCH_EXAMPLE}\n```"
     params = {
         "type": "object",
         "properties": {"input": {"type": "string", "description": f"raw {name} input in the format above"}},
         "required": ["input"],
     }
     return {"type": "function", "function": {"name": name, "description": description, "parameters": params}}, name
+
+
+_PATCH_BEGIN, _PATCH_END = "*** Begin Patch", "*** End Patch"
+_PATCH_RULE_LINES = {"begin_patch": _PATCH_BEGIN, "end_patch": _PATCH_END, "eof_line": "*** End of File"}
+_PATCH_RULE_HEADER = re.compile(
+    r"^(add_file|add_hunk|update_file|update_hunk|delete_file|delete_hunk|move_to|change_move):\s*(\S.*)$")
+_PATCH_HEADERS = {"add": "*** Add File: ", "update": "*** Update File: ", "delete": "*** Delete File: ",
+                  "move": "*** Move to: ", "change": "*** Move to: "}
+
+
+def repair_apply_patch(text: str) -> str:
+    """Fix the envelope of an apply_patch input Codex would reject, never its hunks.
+
+    A patch whose first and last lines are already the markers is returned unchanged. Otherwise:
+    stray lines before ``*** Begin Patch`` / after ``*** End Patch`` are dropped, and a patch
+    written with the grammar's rule names (``begin_patch`` / ``add_file: x`` / ``end_patch``) gets
+    the literal markers. Codex refuses all of these outright, so the repair can only help.
+    """
+
+    lines = text.strip("\n").split("\n")
+    marks = [line.strip() for line in lines]
+    if marks and marks[0] == _PATCH_BEGIN and marks[-1] == _PATCH_END:
+        return text
+    if _PATCH_BEGIN not in marks and marks and marks[0] == "begin_patch":
+        fixed = []
+        for line, mark in zip(lines, marks):
+            header = _PATCH_RULE_HEADER.match(mark)
+            if mark in _PATCH_RULE_LINES:
+                fixed.append(_PATCH_RULE_LINES[mark])
+            elif header:
+                fixed.append(_PATCH_HEADERS[header.group(1).split("_")[0]] + header.group(2))
+            else:
+                fixed.append(line)
+        lines, marks = fixed, [line.strip() for line in fixed]
+    if _PATCH_BEGIN in marks:
+        start = marks.index(_PATCH_BEGIN)
+        lines, marks = lines[start:], marks[start:]
+    if _PATCH_END in marks:
+        end = len(marks) - 1 - marks[::-1].index(_PATCH_END)
+        lines = lines[: end + 1]
+    return "\n".join(lines) + "\n"
 
 
 def _function_tool(tool: dict[str, Any], name: str | None = None) -> dict[str, Any]:
@@ -249,6 +311,8 @@ def parse_request(body: dict[str, Any]) -> ir.ParsedRequest:
         custom_tool_names=custom_names,
         namespaces=namespaces,
         summary_enabled=summary_enabled,
+        # Codex sends its conversation id as the prompt cache key, unchanged turn to turn.
+        affinity=str(body["prompt_cache_key"]) if body.get("prompt_cache_key") else None,
     )
 
 
@@ -424,6 +488,8 @@ async def stream_sse(
                 decoded = json.loads(args).get("input", "") if args else ""
             except (ValueError, AttributeError):
                 decoded = args
+            if flat == "apply_patch" and isinstance(decoded, str):
+                decoded = repair_apply_patch(decoded)
             yield emit("response.custom_tool_call_input.delta",
                        {"item_id": "ctc_" + call_id, "output_index": idx, "delta": decoded})
             yield emit("response.custom_tool_call_input.done",

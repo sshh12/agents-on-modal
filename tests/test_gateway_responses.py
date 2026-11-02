@@ -167,3 +167,62 @@ async def test_responses_stream_drops_whitespace_message_before_a_tool_call():
         events = [d for _e, d in parse_sse(await resp.text())]
     added = [d["item"]["type"] for d in _events_of(events, "response.output_item.added")]
     assert "message" not in added and "function_call" in added
+
+
+async def test_responses_pin_a_conversation_to_one_dp_rank():
+    from agents_on_modal.gateway import ir
+
+    capture: list = []
+    dp_model = model(engine="sglang", engine_args=["--enable-dp-attention", "--dp-size=4"])
+    async with gateway(dp_model, streaming([c_text("ok"), c_finish(), c_usage()], capture=capture)) as gw:
+        await (await gw.post("/v1/responses", json={
+            "stream": True, "prompt_cache_key": "conv-42",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "x"}]}]})).text()
+    assert capture[0]["routed_dp_rank"] == ir.dp_rank_for("conv-42", 4)
+
+
+async def test_responses_history_with_truncated_call_arguments_still_renders():
+    # Codex replays a model's malformed call on every later turn; the engine would reject the request.
+    capture: list = []
+    truncated = '{"cmd": "cat mod.py && pyth'
+    async with gateway(model(), streaming([c_text("ok"), c_finish(), c_usage()], capture=capture)) as gw:
+        resp = await gw.post("/v1/responses", json={"stream": True, "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+            {"type": "function_call", "name": "exec_command", "call_id": "c1", "arguments": truncated},
+            {"type": "function_call_output", "call_id": "c1", "output": "failed to parse arguments"}]})
+        assert resp.status == 200
+        await resp.text()
+    call = next(m for m in capture[0]["messages"] if m.get("tool_calls"))["tool_calls"][0]
+    assert json.loads(call["function"]["arguments"]) == {"_invalid_arguments": truncated}
+
+
+def test_repair_apply_patch_fixes_only_the_envelope():
+    from agents_on_modal.gateway.responses import repair_apply_patch
+
+    good = "*** Begin Patch\n*** Add File: a.py\n+x = 1\n*** End Patch\n"
+    assert repair_apply_patch(good) == good
+    # Observed from GLM-5.3: the grammar's rule names instead of the markers ...
+    rule_names = "begin_patch\nadd_file: geom.py\n+def f():\n+    return 1\nend_patch"
+    assert repair_apply_patch(rule_names) == "*** Begin Patch\n*** Add File: geom.py\n+def f():\n+    return 1\n*** End Patch\n"
+    # ... and a stray rule-name line in front of a correct patch.
+    assert repair_apply_patch("begin_patch\n" + good) == good
+    assert repair_apply_patch(good.rstrip("\n") + "\nEOF\n") == good
+    # Hunk lines that merely look like rule names are left alone.
+    body = "*** Begin Patch\n*** Update File: n.txt\n@@\n-add_file: x\n+add_file: y\n*** End Patch\n"
+    assert repair_apply_patch(body) == body
+
+
+async def test_responses_apply_patch_written_with_rule_names_is_repaired():
+    args = json.dumps({"input": "begin_patch\nadd_file: x.txt\n+hi\nend_patch"})
+    chunks = [c_tool_start(0, "call_p", "apply_patch", args), c_finish("tool_calls"), c_usage()]
+    body = {"stream": True,
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "patch"}]}],
+            "tools": [{"type": "custom", "name": "apply_patch", "description": "FREEFORM tool",
+                       "format": {"type": "grammar", "syntax": "lark", "definition": "start: begin_patch hunk+ end_patch"}}]}
+    capture: list = []
+    async with gateway(model(), streaming(chunks, capture=capture)) as gw:
+        events = [d for _e, d in parse_sse(await (await gw.post("/v1/responses", json=body)).text())]
+    item = next(d["item"] for d in _events_of(events, "response.output_item.done") if d["item"]["type"] == "custom_tool_call")
+    assert item["input"] == "*** Begin Patch\n*** Add File: x.txt\n+hi\n*** End Patch\n"
+    desc = capture[0]["tools"][0]["function"]["description"]
+    assert "rule names" in desc and "*** Begin Patch" in desc  # labels-vs-literals note + worked example

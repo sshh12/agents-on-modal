@@ -11,6 +11,7 @@ This module is pure stdlib; it never imports aiohttp or modal.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import dataclass, field
@@ -117,6 +118,9 @@ class ParsedRequest:
     namespaces: dict[str, str] = field(default_factory=dict)
     #: Responses only: whether to emit reasoning summary events.
     summary_enabled: bool = False
+    #: A client key stable across one conversation's turns (Claude Code's ``metadata.user_id``,
+    #: Codex's ``prompt_cache_key``); pins it to one engine DP rank (see :func:`dp_rank_for`).
+    affinity: str | None = None
 
 
 # --------------------------------------------------------------------------------------------------
@@ -257,6 +261,26 @@ def _tool_message(result: ToolResultPart) -> dict[str, Any]:
     }
 
 
+def history_args(args_json: str) -> str:
+    """Tool-call arguments from the conversation history, as a JSON object the engine accepts.
+
+    A model sometimes emits arguments that are not a JSON object (truncated mid-string: Codex logs
+    "EOF while parsing an object"). The harness fails that one call, but keeps it in the history it
+    replays on every later turn, and SGLang rejects any request whose history holds such a call
+    ("Assistant tool call function.arguments must be valid JSON") -- so one bad call ended the whole
+    Codex session after its reconnect retries. Wrapping the raw text keeps the turn's history honest
+    (the call was never run as anything else) and renderable.
+    """
+
+    try:
+        value = json.loads(args_json) if args_json.strip() else {}
+    except ValueError:
+        return dumps_args({"_invalid_arguments": args_json})
+    if not isinstance(value, dict):
+        return dumps_args({"_invalid_arguments": args_json})
+    return args_json
+
+
 def _assistant_message(message: Message) -> dict[str, Any]:
     out: dict[str, Any] = {"role": "assistant"}
     text = _text_of(message)
@@ -269,7 +293,7 @@ def _assistant_message(message: Message) -> dict[str, Any]:
                 {
                     "id": call.id,
                     "type": "function",
-                    "function": {"name": call.name, "arguments": call.args_json},
+                    "function": {"name": call.name, "arguments": history_args(call.args_json)},
                 }
             )
     out["content"] = text if text else None
@@ -379,6 +403,82 @@ def hold_whitespace(pending: str, delta: str, open_text: bool) -> tuple[str, str
     if not delta.strip():
         return "", pending + delta
     return pending + delta, ""
+
+
+def dp_size_of(engine_args: list[str] | None) -> int:
+    """How many DP schedulers the catalog's SGLang ``engine_args`` start (1 when unset): data-parallel
+    replicas (``--dp-size``) times attention-DP groups (``--attn-dp-size``, the newer spelling of
+    ``--dp-size N --enable-dp-attention``) -- the range SGLang accepts for ``routed_dp_rank``."""
+
+    replicas = attention = 1
+    for arg in engine_args or []:
+        flag, _, value = str(arg).partition("=")
+        if not value.isdigit():
+            continue
+        if flag in ("--dp-size", "--dp", "--data-parallel-size"):
+            replicas = max(1, int(value))
+        elif flag in ("--attn-dp-size", "--attention-data-parallel-size"):
+            attention = max(1, int(value))
+    return replicas * attention
+
+
+def affinity_key(messages: list[dict[str, Any]]) -> str:
+    """A conversation key from rendered chat ``messages`` when the client sent none: the system
+    prompt head plus the first user turn, which every later turn of the conversation repeats."""
+
+    system = next((m.get("content") for m in messages if m.get("role") == "system"), "")
+    first_user = next((m.get("content") for m in messages if m.get("role") == "user"), "")
+    return json.dumps([str(system)[:4096], first_user], ensure_ascii=False, default=str)
+
+
+def dp_rank_for(key: str, dp_size: int) -> int:
+    """The engine DP rank a conversation is pinned to.
+
+    With DP attention each rank keeps its own radix (prefix) cache, and SGLang's built-in balancing
+    (round robin / least loaded) knows nothing about it, so successive turns of one agent land on
+    different ranks and re-prefill their whole history each time. A stable hash of the conversation
+    key sends every turn to the rank that already holds its prefix.
+    """
+
+    return int(hashlib.sha1(key.encode("utf-8")).hexdigest(), 16) % dp_size
+
+
+class RepetitionGuard:
+    """Spots a generation stuck repeating one short unit ("TheTheThe...", "FailFailFail...").
+
+    Sampled models occasionally collapse into such a loop and then run to the output cap: in a
+    100-agent GLM-5.3 run two agents each spent ~10 minutes and ~32k tokens of shared decode on one,
+    then got ``max_tokens`` anyway. ``feed`` every streamed piece of reasoning and text (not tool
+    arguments: a file's contents may legitimately repeat one line); it returns the period once the
+    last ``window`` characters are exactly periodic with a period of at most ``max_period`` -- which
+    reasoning and prose essentially never are over 1000 characters -- so the caller can end the turn
+    as ``length`` straight away.
+    """
+
+    def __init__(self, window: int = 1000, max_period: int = 40, check_every: int = 64) -> None:
+        self.window = window
+        self.max_period = max_period
+        self.check_every = check_every
+        self._tail = ""
+        self._since_check = 0
+
+    def feed(self, text: str) -> int | None:
+        """The loop's period once the stream has degenerated, else ``None``."""
+
+        if self.window <= 0 or not text:
+            return None
+        self._tail = (self._tail + text)[-(self.window + self.max_period):]
+        self._since_check += len(text)
+        if self._since_check < self.check_every or len(self._tail) <= self.window:
+            return None
+        self._since_check = 0
+        tail = self._tail
+        for period in range(1, self.max_period + 1):
+            if len(tail) < self.window + period:
+                break
+            if tail[-self.window:] == tail[-self.window - period:-period]:
+                return period
+        return None
 
 
 def estimate_tokens(text: str) -> int:

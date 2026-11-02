@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
@@ -154,51 +155,71 @@ async def post_chunks(
                 yield chunk
 
 
+#: Characters of exact short-period repetition that end a generation (see ir.RepetitionGuard); 0 = off.
+REPEAT_GUARD_CHARS = int(os.environ.get("AOM_GATEWAY_REPEAT_GUARD_CHARS", "1000"))
+
+
 async def stream_events(
     session: aiohttp.ClientSession, engine_url: str, body: dict[str, Any]
 ) -> AsyncIterator[ir.StreamEvent]:
     """Translate the upstream chat stream into IR stream events."""
 
     seen_tool_index: set[int] = set()
-    async for chunk in post_chunks(session, engine_url, body):
-        choices = chunk.get("choices") or []
-        if not choices:
+    guard = ir.RepetitionGuard(window=REPEAT_GUARD_CHARS)
+    chunks = post_chunks(session, engine_url, body)
+    try:
+        async for chunk in chunks:
+            choices = chunk.get("choices") or []
+            if not choices:
+                usage = chunk.get("usage")
+                if usage:
+                    yield _usage_event(usage)
+                continue
+            choice = choices[0]
+            delta = choice.get("delta") or {}
+            generated: list[str] = []
+
+            reasoning = delta.get("reasoning_content")
+            if reasoning is None:
+                reasoning = delta.get("reasoning")  # vLLM spelling
+            if reasoning:
+                generated.append(reasoning)
+                yield ir.ReasoningDelta(reasoning)
+
+            content = delta.get("content")
+            if content:
+                generated.append(content)
+                yield ir.TextDelta(content)
+
+            for tc in delta.get("tool_calls") or []:
+                index = tc.get("index", 0)
+                fn = tc.get("function") or {}
+                name = fn.get("name")
+                if name is not None and index not in seen_tool_index:
+                    seen_tool_index.add(index)
+                    yield ir.ToolCallStart(index=index, id=tc.get("id") or f"call_{index}", name=name)
+                args = fn.get("arguments")
+                if args:  # not guarded: file contents and data can legitimately repeat a line
+                    yield ir.ToolArgsDelta(index=index, delta=args)
+
+            finish = choice.get("finish_reason")
+            if not finish:
+                period = guard.feed("".join(generated))
+                if period is not None:
+                    # End the turn as if it hit the output cap -- what the loop would have reached
+                    # anyway -- and close the stream so the engine aborts the request.
+                    print(f"[aom-gateway] cut a runaway repetition (period {period})", flush=True)
+                    yield ir.Finish(reason="length")
+                    return
+            if finish:
+                matched = choice.get("matched_stop")
+                yield ir.Finish(reason=finish, stop_matched=matched if isinstance(matched, str) else None)
+
             usage = chunk.get("usage")
             if usage:
                 yield _usage_event(usage)
-            continue
-        choice = choices[0]
-        delta = choice.get("delta") or {}
-
-        reasoning = delta.get("reasoning_content")
-        if reasoning is None:
-            reasoning = delta.get("reasoning")  # vLLM spelling
-        if reasoning:
-            yield ir.ReasoningDelta(reasoning)
-
-        content = delta.get("content")
-        if content:
-            yield ir.TextDelta(content)
-
-        for tc in delta.get("tool_calls") or []:
-            index = tc.get("index", 0)
-            fn = tc.get("function") or {}
-            name = fn.get("name")
-            if name is not None and index not in seen_tool_index:
-                seen_tool_index.add(index)
-                yield ir.ToolCallStart(index=index, id=tc.get("id") or f"call_{index}", name=name)
-            args = fn.get("arguments")
-            if args:
-                yield ir.ToolArgsDelta(index=index, delta=args)
-
-        finish = choice.get("finish_reason")
-        if finish:
-            matched = choice.get("matched_stop")
-            yield ir.Finish(reason=finish, stop_matched=matched if isinstance(matched, str) else None)
-
-        usage = chunk.get("usage")
-        if usage:
-            yield _usage_event(usage)
+    finally:
+        await chunks.aclose()
 
 
 def _usage_event(usage: dict[str, Any]) -> ir.UsageEvent:

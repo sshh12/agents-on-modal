@@ -218,3 +218,25 @@ async def test_message_start_reports_the_prompt_size():
         events = parse_sse(await resp.text())
     start = next(d for e, d in events if d and d.get("type") == "message_start")
     assert start["message"]["usage"]["input_tokens"] > 100
+
+
+async def test_messages_pin_a_session_to_one_dp_rank():
+    from agents_on_modal.gateway import ir
+
+    capture: list = []
+    dp_model = model(engine="sglang", engine_args=["--enable-dp-attention", "--dp-size=4"])
+    session = "user_abc_account__session_1234"
+    async with gateway(dp_model, streaming([c_text("ok"), c_finish(), c_usage()], capture=capture)) as gw:
+        for turn in ("first turn", "second turn"):
+            await (await gw.post("/v1/messages", json={
+                "stream": True, "metadata": {"user_id": session},
+                "messages": [{"role": "user", "content": turn}]})).text()
+    assert [b["routed_dp_rank"] for b in capture] == [ir.dp_rank_for(session, 4)] * 2
+
+
+async def test_messages_without_dp_send_no_rank():
+    capture: list = []
+    async with gateway(model(), streaming([c_text("ok"), c_finish(), c_usage()], capture=capture)) as gw:
+        await (await gw.post("/v1/messages", json={"stream": True, "metadata": {"user_id": "s"},
+                                                   "messages": [{"role": "user", "content": "hi"}]})).text()
+    assert "routed_dp_rank" not in capture[0]
