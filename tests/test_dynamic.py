@@ -744,3 +744,43 @@ def test_cli_status_reports_an_unreadable_workflow_instead_of_dropping_it(tmp_pa
     (swarm_dir / "workflows" / "wf.json").write_text("{ half-written", encoding="utf-8")
     code, text = _run_cli(["status", "--json"], swarm_dir, monkeypatch)
     assert '"unreadable"' in text
+
+
+# --------------------------------------------------------------------------------------------- #
+# hard stop (dashboard "stop swarm")                                                            #
+# --------------------------------------------------------------------------------------------- #
+def test_controller_halts_on_the_stop_marker_and_terminates_its_agents(tmp_path):
+    c, control, sb = _controller(tmp_path)
+    _submit(control, {"name": "wf", "stages": [
+        {"name": "w1", "agents": [{"prompt": "a"}, {"prompt": "b"}]}, {"name": "w2", "agents": [{"prompt": "c"}]}]})
+    c.tick()
+    assert len(sb.created) == 2
+    first, second = sorted(sb.created, key=lambda b: b.started["meta"]["idx"])
+    first._run.state = "done"  # finished since the last tick: keeps "done", not "cancelled"
+
+    control.put_json(f"_swarm/{dynamic.STOPPED_FILE}", {"ts": 1})
+    c.tick()
+    assert c.halted is True
+    assert first.stopped and second.stopped  # every sandbox is terminated either way
+    assert control.get_json(f"_swarm/agents/{first.id}.json")["state"] == "done"
+    assert control.get_json(f"_swarm/agents/{second.id}.json")["state"] == "cancelled"
+    assert control.get_json("_swarm/workflows/wf.json")["status"] == "cancelled"
+
+    # nothing is ever scheduled again: not the next stage, not a new request
+    second._run.state = "done"
+    _submit(control, {"name": "wf2", "stages": [{"name": "s", "agents": [{"prompt": "x"}]}]}, reqid="r2")
+    c.tick()
+    assert len(sb.created) == 2 and not control.exists("_swarm/ack/r2.json")
+
+
+def test_request_halt_stops_a_wave_mid_spawn_and_ends_run_forever(tmp_path):
+    c, control, sb = _controller(tmp_path)
+    _submit(control, {"name": "wf", "stages": [{"name": "w", "agents": [{"prompt": str(i)} for i in range(3)]}]})
+    c.request_halt()
+    with pytest.raises(dynamic.AomError):  # a spawn racing the stop creates no sandbox
+        c._spawn_agent(dynamic._WorkflowRuntime(name="x", plan=parse_plan(
+            {"stages": [{"name": "s", "agents": [{"prompt": "p"}]}]})[0]), 0, 0)
+    t = threading.Thread(target=c.run_forever, kwargs={"interval": 0.01}, daemon=True)
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive() and c.halted and sb.created == []

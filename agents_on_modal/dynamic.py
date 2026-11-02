@@ -52,6 +52,9 @@ RESERVED = "_swarm"
 #: Written once at launch under RESERVED: the orchestrator's exact prompt, and the launch settings.
 ORCHESTRATOR_PROMPT_FILE = "orchestrator_prompt.md"
 LAUNCH_FILE = "launch.json"
+#: Written under RESERVED by a hard stop (``swarm.stop_swarm``). Every controller of the swarm -- in
+#: any process, now or after a restart -- halts on seeing it and never schedules another agent.
+STOPPED_FILE = "stopped.json"
 
 TERMINAL_STATES = ("done", "timeout", "failed", "cancelled")
 
@@ -612,6 +615,10 @@ class Controller:
         #: Opt-in orchestrator supervision bookkeeping (issue S3); see _supervise_orchestrator.
         self._orch_restarts = 0
         self._last_restart_at = 0.0
+        #: Hard stop: requested from another thread (``request_halt``) or seen as STOPPED_FILE on
+        #: the control plane; ``halted`` once this controller's agents are terminated (``_halt``).
+        self._halt_requested = False
+        self.halted = False
 
     # -- lifecycle ---------------------------------------------------------------------------- #
     def run_forever(self, interval: float = 3.0, stop: Any = None) -> None:
@@ -624,10 +631,22 @@ class Controller:
                 self.control.put_json(
                     f"{RESERVED}/controller_error.json", {"ts": time.time(), "error": str(error)}
                 )
+            if self.halted:
+                return
             time.sleep(interval)
+
+    def request_halt(self) -> None:
+        """Hard-stop this controller from another thread: no agent is created from now on (even mid
+        wave), and its next tick terminates every agent it started, then ``run_forever`` returns."""
+
+        self._halt_requested = True
 
     def tick(self) -> None:
         """One pass: write meta, ingest new requests, advance workflows, publish state."""
+
+        if self._halt_requested or self.control.exists(f"{RESERVED}/{STOPPED_FILE}"):
+            self._halt()
+            return
 
         if not self._wrote_meta:
             self.control.put_json(
@@ -826,6 +845,8 @@ class Controller:
         return done
 
     def _spawn_agent(self, wf: _WorkflowRuntime, stage_index: int, idx: int) -> _AgentRun:
+        if self._halt_requested:  # a hard stop landed mid-wave: create nothing more
+            raise AomError(f"swarm {self.swarm_id} was stopped")
         stage = wf.plan.stages[stage_index]
         spec = stage.agents[idx]
         box = self._sb.create(
@@ -893,6 +914,37 @@ class Controller:
             pass
         ar.state = "cancelled"
         self._publish_agent(ar)
+
+    def _halt(self) -> None:
+        """Hard stop (idempotent): cancel every workflow, terminate every agent still running
+        (including any created mid-wave after the stop was requested), publish, then go quiet."""
+
+        if self.halted:
+            return
+        self._halt_requested = True
+
+        def stop(ar: _AgentRun) -> None:
+            try:  # one that finished since the last tick keeps its real state, not "cancelled"
+                state = str(ar.run.status().get("state", ar.state))
+            except Exception:  # noqa: BLE001 - unreadable: terminate it regardless
+                state = ar.state
+            if state in TERMINAL_STATES:
+                ar.state = state
+                try:
+                    ar.box.stop()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
+                self._publish_agent(ar)
+            else:
+                self._terminate(ar)
+
+        live = [ar for wf in self._workflows.values() for runs in wf.runs.values()
+                for ar in runs.values() if ar.state not in TERMINAL_STATES]
+        self._map(stop, live)  # in parallel; one failure never stops the rest
+        for wf in self._workflows.values():
+            wf.cancelled = True
+            self._publish_workflow(wf)
+        self.halted = True
 
     # -- publishing ---------------------------------------------------------------------------- #
     #: Keep this many of the most recent events per agent on the volume. Generous: enough for the

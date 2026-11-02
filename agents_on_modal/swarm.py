@@ -217,3 +217,62 @@ class Swarm:
 
     def __repr__(self) -> str:
         return f"<Swarm {self.id} model={self.model} agents={len(self._agents)}>"
+
+
+def stop_swarm(swarm_id: str, *, sandboxes: Any = None, control: Any = None) -> dict[str, Any]:
+    """Hard-stop a swarm run: terminate every live sandbox tagged ``swarm=<id>``, in parallel.
+
+    Unlike :meth:`Swarm.stop` this needs no reconnect (no per-sandbox run lookups), and it covers a
+    dynamic swarm whole: its orchestrator, every stage agent, and any resumed orchestrator are all
+    created with the swarm tag. For a dynamic swarm it first writes ``_swarm/stopped.json`` so no
+    controller schedules another agent or resumes the orchestrator, and afterwards marks the agent
+    records still running as ``cancelled`` so the dashboard stops showing them live. One failed
+    terminate never aborts the rest. The model endpoint is left alone (it is shared; it scales to
+    zero by itself). Returns ``{swarm, mode, found, stopped, errors}``.
+
+    ``sandboxes`` (default :mod:`agents_on_modal.sandbox`) and ``control`` (default the swarm's
+    Volume control plane) are injectable for tests.
+    """
+
+    from .dynamic import RESERVED, STOPPED_FILE, TERMINAL_STATES, VolumeControlPlane  # noqa: PLC0415
+
+    if sandboxes is None:
+        sandboxes = sandbox
+    if control is None:
+        control = VolumeControlPlane(f"aom-shared-{swarm_id}")
+    try:
+        dynamic = bool(control.get_json(f"{RESERVED}/meta.json"))
+    except Exception:  # noqa: BLE001 - no control volume: a naive swarm (or nothing at all)
+        dynamic = False
+    if dynamic:
+        control.put_json(f"{RESERVED}/{STOPPED_FILE}", {"ts": time.time(), "swarm_id": swarm_id})
+
+    boxes = list(sandboxes.list_sandboxes("modal", swarm=swarm_id))
+    errors: list[dict[str, str]] = []
+
+    def _stop(box: Sandbox) -> None:
+        try:
+            box.stop()
+        except Exception as error:  # noqa: BLE001 - recorded; the others still get terminated
+            errors.append({"id": getattr(box, "id", "?"), "error": str(error)})
+
+    if boxes:
+        with ThreadPoolExecutor(max_workers=min(len(boxes), 4 * MAX_CONCURRENCY)) as pool:
+            list(pool.map(_stop, boxes))
+
+    if dynamic:
+        def _cancel(name: str) -> None:
+            record = control.get_json(f"{RESERVED}/agents/{name}")
+            if isinstance(record, dict) and record.get("state") not in TERMINAL_STATES:
+                control.put_json(f"{RESERVED}/agents/{name}",
+                                 {**record, "state": "cancelled", "error": "swarm hard-stopped"})
+
+        try:
+            names = [n for n in control.listdir(f"{RESERVED}/agents") if n.endswith(".json")]
+            with ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as pool:
+                list(pool.map(_cancel, names))
+        except Exception:  # noqa: BLE001 - cosmetic: the sandboxes are already gone
+            pass
+
+    return {"swarm": swarm_id, "mode": "dynamic" if dynamic else "naive", "found": len(boxes),
+            "stopped": len(boxes) - len(errors), "errors": errors}

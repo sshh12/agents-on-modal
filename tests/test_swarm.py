@@ -309,3 +309,119 @@ def test_index_html_wires_the_zip_download():
     html = (EXAMPLES / "index.html").read_text(encoding="utf-8")
     assert 'id="zipBtn"' in html and 'id="zipScope"' in html
     assert "/api/zip?swarm=" in html
+
+
+# --------------------------------------------------------------------------------------------- #
+# hard stop (dashboard "stop swarm")                                                            #
+# --------------------------------------------------------------------------------------------- #
+class _Listing:
+    """Stand-in for the sandbox module: ``list_sandboxes`` returns the given boxes."""
+
+    def __init__(self, boxes):
+        self.boxes = boxes
+        self.calls = []
+
+    def list_sandboxes(self, kind, **filters):
+        self.calls.append((kind, filters))
+        return list(self.boxes)
+
+
+def test_stop_swarm_terminates_every_tagged_sandbox_even_when_one_fails(tmp_path):
+    from agents_on_modal.dynamic import LocalDirControlPlane
+
+    class Stuck(FakeBox):
+        def stop(self):
+            raise RuntimeError("terminate failed")
+
+    boxes = [FakeBox(), Stuck(box_id="stuck"), FakeBox()]
+    listing = _Listing(boxes)
+    control = LocalDirControlPlane(str(tmp_path))  # no meta.json: a naive swarm
+    out = swarm.stop_swarm("swarm-x", sandboxes=listing, control=control)
+    assert listing.calls == [("modal", {"swarm": "swarm-x"})]  # found by the swarm tag
+    assert boxes[0].stopped and boxes[2].stopped
+    assert out == {"swarm": "swarm-x", "mode": "naive", "found": 3, "stopped": 2,
+                   "errors": [{"id": "stuck", "error": "terminate failed"}]}
+    assert not control.exists("_swarm/stopped.json")  # naive swarms have no controller to halt
+
+
+def test_stop_swarm_on_a_dynamic_swarm_marks_it_stopped_and_cancels_live_records(tmp_path):
+    from agents_on_modal.dynamic import LocalDirControlPlane
+
+    control = LocalDirControlPlane(str(tmp_path))
+    control.put_json("_swarm/meta.json", {"swarm_id": "swarm-d", "model": "m"})
+    control.put_json("_swarm/agents/a.json", {"id": "a", "state": "running"})
+    control.put_json("_swarm/agents/b.json", {"id": "b", "state": "done"})
+    orchestrator, agent = FakeBox(box_id="orch"), FakeBox(box_id="a")
+    out = swarm.stop_swarm("swarm-d", sandboxes=_Listing([orchestrator, agent]), control=control)
+    assert out["mode"] == "dynamic" and out["stopped"] == 2 and orchestrator.stopped and agent.stopped
+    assert control.get_json("_swarm/stopped.json")["swarm_id"] == "swarm-d"
+    assert control.get_json("_swarm/agents/a.json")["state"] == "cancelled"
+    assert control.get_json("_swarm/agents/b.json")["state"] == "done"  # finished work keeps its state
+
+
+def test_dashboard_stop_halts_this_process_controller_then_sweeps_twice(monkeypatch):
+    import threading
+
+    server = _server()
+    sweeps, halts = [], []
+
+    class Ctl:
+        def request_halt(self):
+            halts.append(True)
+
+    done = threading.Thread(target=lambda: None)
+    done.start()
+    monkeypatch.setitem(server._controllers, "swarm-d",
+                        {"thread": done, "stop": threading.Event(), "controller": Ctl()})
+    monkeypatch.setattr(server, "stop_swarm", lambda sid: (sweeps.append(sid), {
+        "swarm": sid, "mode": "dynamic", "found": 3 if len(sweeps) == 1 else 1,
+        "stopped": 3 if len(sweeps) == 1 else 1, "errors": []})[1])
+    out = server._stop({"swarm": "swarm-d"})
+    assert halts == [True] and sweeps == ["swarm-d", "swarm-d"]
+    assert out["stopped"] == 4 and out["found"] == 4
+    assert server._controllers["swarm-d"]["stop"].is_set()
+    for bad in ("", "../x", "a b"):
+        with pytest.raises(AomError):
+            server._stop({"swarm": bad})
+
+
+def test_dashboard_stop_endpoint_and_button_are_wired(monkeypatch):
+    import json
+    import threading
+    import urllib.request
+
+    server = _server()
+    monkeypatch.setattr(server, "stop_swarm", lambda sid: {"swarm": sid, "mode": "naive", "found": 2,
+                                                           "stopped": 2, "errors": []})
+    httpd = server._bind("127.0.0.1", 0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/api/stop",
+                                     data=json.dumps({"swarm": "swarm-n"}).encode(), method="POST",
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as res:
+            assert json.loads(res.read())["stopped"] == 2
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    html = (EXAMPLES / "index.html").read_text(encoding="utf-8")
+    assert 'id="stopBtn"' in html and 'class="danger"' in html
+    assert '"/api/stop"' in html and "confirm(" in html
+
+
+def test_polling_a_stopped_dynamic_swarm_never_restarts_its_controller(tmp_path, monkeypatch):
+    from agents_on_modal.dynamic import LocalDirControlPlane
+
+    server = _server()
+    control = LocalDirControlPlane(str(tmp_path))
+    started = []
+    monkeypatch.setattr(server, "VolumeControlPlane", lambda name: control)
+    monkeypatch.setattr(server.DynamicSwarm, "reconnect", classmethod(
+        lambda cls, sid, **k: type("DS", (), {"id": sid, "model": "m"})()))
+    monkeypatch.setattr(server, "_ensure_controller", lambda ds, **k: started.append(ds.id))
+
+    assert server._dynamic_agents_payload("swarm-d", {"model": "m"})["stopped"] is False
+    assert started == ["swarm-d"]  # a live swarm is resumed as before
+    control.put_json("_swarm/stopped.json", {"ts": 1})
+    assert server._dynamic_agents_payload("swarm-d", {"model": "m"})["stopped"] is True
+    assert started == ["swarm-d"]  # ...but a hard-stopped one stays stopped

@@ -31,6 +31,8 @@ Endpoints
     GET  /api/presets                           -> {presets:[{name,label,mode,prompt?,locked}]}
     POST /api/spawn  {mode,harness,model,max_instances?,...} -> {swarm, mode}  (launches; hits Modal)
     POST /api/scale  {model,max_instances}      -> {model, max_containers}  (live endpoint cap)
+    POST /api/stop   {swarm}                    -> {swarm, mode, found, stopped, errors}
+                                                   (hard-kills every live sandbox of the run)
 """
 
 from __future__ import annotations
@@ -62,12 +64,13 @@ from agents_on_modal.config import AomError  # noqa: E402
 from agents_on_modal.dynamic import (  # noqa: E402
     DEFAULT_TIMEOUT,
     RESERVED,
+    STOPPED_FILE,
     DynamicSwarm,
     VolumeControlPlane,
     build_orchestrator_instructions,
     _model_efforts,
 )
-from agents_on_modal.swarm import Swarm  # noqa: E402
+from agents_on_modal.swarm import Swarm, stop_swarm  # noqa: E402
 
 import export  # noqa: E402 - local module beside this file
 import presets as presets_mod  # noqa: E402 - local module beside this file
@@ -132,9 +135,13 @@ def _proxy_optin_note() -> str:
         "shell/tool, or set that ALL_PROXY before launching `agent-browser`."
     )
 
-# swarm_id -> {"thread": Thread, "stop": Event}. Controllers run here, in the dashboard process.
+# swarm_id -> {"thread": Thread, "stop": Event, "controller": Controller}. Controllers run here, in
+# the dashboard process.
 _controllers: dict[str, dict] = {}
 _controllers_lock = threading.Lock()
+#: How long a hard stop waits for this process's controller to finish its tick and halt, before its
+#: second sweep picks up any agent the controller was creating mid-wave.
+STOP_CONTROLLER_WAIT = 30.0
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -155,7 +162,7 @@ def _ensure_controller(ds: DynamicSwarm, *, proxy: str | None = None,
             target=controller.run_forever, kwargs={"stop": stop}, daemon=True,
             name=f"aom-controller-{ds.id}",
         )
-        _controllers[ds.id] = {"thread": thread, "stop": stop}
+        _controllers[ds.id] = {"thread": thread, "stop": stop, "controller": controller}
         thread.start()
 
 
@@ -278,9 +285,11 @@ def _scale(body: dict) -> dict:
 
 def _dynamic_agents_payload(swarm_id: str, meta: dict) -> dict:
     control = VolumeControlPlane(f"aom-shared-{swarm_id}")
-    # resume: make sure a controller is driving this swarm (e.g. after a server restart)
+    stopped = control.exists(f"{RESERVED}/{STOPPED_FILE}")
+    # resume: make sure a controller is driving this swarm (e.g. after a server restart) -- unless
+    # it was hard-stopped, which must stay stopped
     ds = DynamicSwarm.reconnect(swarm_id)
-    if ds.model:
+    if ds.model and not stopped:
         try:
             _ensure_controller(ds)  # proxy is not recoverable after a restart (never on the volume)
         except Exception:  # noqa: BLE001 - surfacing agents still works even if resume fails
@@ -306,7 +315,7 @@ def _dynamic_agents_payload(swarm_id: str, meta: dict) -> dict:
             if wf:
                 workflows.append(wf)
     return {"swarm": swarm_id, "model": meta.get("model", ""), "mode": "dynamic",
-            "agents": agents, "workflows": workflows}
+            "agents": agents, "workflows": workflows, "stopped": stopped}
 
 
 def _agents_payload(swarm_id: str) -> dict:
@@ -402,6 +411,32 @@ def _zip_export(swarm_id: str, all_files: bool) -> tuple:
         handle.close()
         raise
     return handle, size, f"{volume}{'-all' if all_files else ''}.zip", stats
+
+
+def _stop(body: dict) -> dict:
+    """Hard-stop one swarm run: every live sandbox tagged with it is terminated (``stop_swarm``).
+
+    A dynamic swarm's controller in this process is told to halt first, so it creates nothing more,
+    even mid-wave. Once it has finished its tick, a second sweep terminates anything it created
+    meanwhile; the stop marker keeps it, and any later controller, from scheduling again.
+    """
+
+    swarm_id = str(body.get("swarm") or "")
+    if not _SWARM_ID.fullmatch(swarm_id):
+        raise AomError(f"invalid swarm id: {swarm_id!r}")
+    with _controllers_lock:
+        entry = _controllers.get(swarm_id)
+    if entry:
+        entry["controller"].request_halt()
+    result = stop_swarm(swarm_id)
+    if entry:
+        entry["thread"].join(timeout=STOP_CONTROLLER_WAIT)
+        entry["stop"].set()  # in case it is still mid-tick: it must not tick again
+        late = stop_swarm(swarm_id)
+        result["found"] += late["found"]
+        result["stopped"] += late["stopped"]
+        result["errors"] += late["errors"]
+    return result
 
 
 def _presets_payload() -> dict:
@@ -576,6 +611,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(_spawn(body))
             elif parsed.path == "/api/scale":
                 self._send_json(_scale(body))
+            elif parsed.path == "/api/stop":
+                self._send_json(_stop(body))
             else:
                 self._send_json({"error": "not found"}, 404)
         except AomError as error:
