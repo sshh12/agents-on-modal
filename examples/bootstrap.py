@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Zero-setup launch for the swarm dashboard: everything ``server.py`` needs before it imports aom.
+"""Zero-setup launch for the examples: everything one needs before it imports aom.
 
 Stdlib only, so it runs on whatever ``python`` is on PATH. :func:`prepare` is idempotent; each step
 is a no-op once satisfied, so a configured machine pays nothing:
 
-  1. **.env** -- load the repo-root ``.env`` (``HF_TOKEN``, ``AOM_SWARM_PRESET_KEY``, ...) without
-     overriding variables already set in the environment.
+  1. **.env** -- load the repo-root ``.env`` (``HF_TOKEN`` for deploying a model,
+     ``AOM_SWARM_PRESET_KEY``, ...) without overriding variables already set (non-empty) in the
+     environment.
   2. **interpreter** -- if this Python lacks ``modal`` at the version pyproject.toml pins (e.g. an
      older global install), re-launch on the repo's ``.venv``, creating it and ``pip install -e .``-ing
      on first run.
@@ -17,14 +18,15 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[1]
 VENV = REPO / ".venv"
 #: Set on the re-launched child so a venv that still cannot satisfy the deps fails loudly, not in a loop.
-_RELAUNCHED = "AOM_DASHBOARD_RELAUNCHED"
+_RELAUNCHED = "AOM_EXAMPLE_RELAUNCHED"
 
 
 def _say(msg: str) -> None:
@@ -35,7 +37,10 @@ def _say(msg: str) -> None:
 # 1. .env                                                                                       #
 # --------------------------------------------------------------------------------------------- #
 def load_dotenv(path: Path = REPO / ".env") -> list[str]:
-    """Export each ``KEY=value`` in ``path`` that is not already set; return the keys exported."""
+    """Export each ``KEY=value`` in ``path`` that is not already set; return the keys exported.
+
+    A variable set but empty counts as unset, so a blank ``HF_TOKEN`` doesn't hide the file's.
+    """
 
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -52,7 +57,7 @@ def load_dotenv(path: Path = REPO / ".env") -> list[str]:
             continue
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
-        if key not in os.environ:
+        if not os.environ.get(key):
             os.environ[key] = value
             loaded.append(key)
     return loaded
@@ -82,8 +87,12 @@ def _venv_python() -> Path:
     return VENV / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
-def ensure_python() -> None:
-    """Return if this interpreter can run aom; otherwise re-launch on the repo ``.venv`` (no return)."""
+def ensure_python(*, interactive: bool = False) -> None:
+    """Return if this interpreter can run aom; otherwise re-launch on the repo ``.venv`` (no return).
+
+    ``interactive``: the child is a TUI that reads Ctrl+C as input (interrupt the agent, not quit),
+    so this pass-through parent ignores it and just waits, instead of killing a slow-to-exit child.
+    """
 
     if deps_ok():
         return
@@ -101,6 +110,9 @@ def ensure_python() -> None:
     _say(f"re-launching on {python}")
     os.environ[_RELAUNCHED] = "1"
     proc = subprocess.Popen([str(python), *sys.argv])
+    if interactive:  # ignored only after Popen, so the child doesn't inherit SIG_IGN (POSIX)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        raise SystemExit(proc.wait())
     try:
         code = proc.wait()
     except KeyboardInterrupt:  # the child got the same Ctrl+C; let it shut its server down cleanly
@@ -150,12 +162,12 @@ def ensure_proxy_token() -> None:
         raise SystemExit("could not mint a Modal proxy token; run `aom setup` and retry.")
 
 
-def prepare() -> None:
-    """Run every setup step, in order (see the module docstring)."""
+def prepare(*, interactive: bool = False) -> None:
+    """Run every setup step, in order (see the module docstring); ``interactive`` for TUI examples."""
 
     loaded = load_dotenv()
     if loaded:
         _say(f"loaded {', '.join(loaded)} from {REPO / '.env'}")
-    ensure_python()
+    ensure_python(interactive=interactive)
     ensure_modal_login()
     ensure_proxy_token()

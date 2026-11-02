@@ -256,6 +256,12 @@ def deploy(
     from . import Endpoint
 
     cap = _check_max_containers(max_containers)
+    if model.hf_token_env and not os.environ.get(model.hf_token_env):
+        # serve.py would refuse too, but only as a traceback from inside the `modal deploy` subprocess.
+        raise AomError(
+            f"Deploying {model.name} needs a Hugging Face token in ${model.hf_token_env}; set it in "
+            "the environment (the examples load it from the repo .env)."
+        )
     proxy = token or load_token()
     model_json = model.to_json()
     if scaling is not None:

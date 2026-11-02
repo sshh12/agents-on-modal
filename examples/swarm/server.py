@@ -14,7 +14,7 @@ Two modes:
     python examples/swarm/server.py                       # any python; opens the dashboard
     python examples/swarm/server.py --swarm swarm-...     # reopen a specific swarm
 
-Setup is automatic (see ``bootstrap.py``): it loads the repo ``.env``, re-launches on the repo
+Setup is automatic (see ``examples/bootstrap.py``): it loads the repo ``.env``, re-launches on the repo
 ``.venv`` (creating it on first run), and runs the Modal login / proxy-token mint if missing.
 
 Endpoints
@@ -50,8 +50,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/, for the shared bootstrap
 
-import bootstrap  # noqa: E402 - stdlib-only local module beside this file
+import bootstrap  # noqa: E402 - stdlib-only module shared by the examples (examples/bootstrap.py)
 
 if __name__ == "__main__":
     bootstrap.prepare()  # .env, interpreter/.venv, Modal login -- must precede the aom imports below

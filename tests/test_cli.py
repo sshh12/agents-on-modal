@@ -136,8 +136,9 @@ def test_run_attaches_creates_and_streams(patched, capsys):
     out = capsys.readouterr().out
     assert "hello world" in out
     assert "[run done]" in out
-    # attached (not deployed) by default
-    assert patched["deployed"] == []
+    # ensured (deployed only if it isn't) and waited on, asking for the default cap of 1
+    assert patched["deployed"] == [("ensure", {"max_containers": 1})]
+    assert patched["waited"] == [patched["endpoint"]]
     box = patched["box"]
     assert box.started["harness"] == "claude"
     assert box.started["prompt"] == "do it"
@@ -145,11 +146,11 @@ def test_run_attaches_creates_and_streams(patched, capsys):
     assert patched["created"]["opts"]["endpoint"] is patched["endpoint"]
 
 
-def test_run_deploy_flag_deploys_and_waits(patched):
-    rc = main(["run", "--harness", "codex", "--model", "m", "--deploy", "--sandbox", "modal", "p"])
+def test_run_legacy_deploy_flag_still_parses(patched):
+    rc = main(["run", "--harness", "codex", "--model", "m", "--deploy", "--sandbox", "modal",
+               "--max-containers", "3", "p"])
     assert rc == 0
-    # --deploy never redeploys a live endpoint: it ensures it, asking for the default cap of 1
-    assert patched["deployed"] == [("ensure", {"max_containers": 1})]
+    assert patched["deployed"] == [("ensure", {"max_containers": 3})]
     assert patched["waited"] == [patched["endpoint"]]
 
 

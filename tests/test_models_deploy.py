@@ -115,7 +115,18 @@ def seams(monkeypatch):
     monkeypatch.setattr(deploy, "_server_deployed", lambda name: state["deployed"])
     monkeypatch.setattr(deploy, "_live_max_containers", lambda name: state["live_max"])
     monkeypatch.setattr(deploy, "_set_max_containers", lambda name, n: calls.append(("cap", n)))
+    if _model().hf_token_env:  # a gated catalog model: deploy refuses up front without its token
+        monkeypatch.setenv(_model().hf_token_env, "hf-test-token")
     return calls, state
+
+
+def test_deploy_without_the_hf_token_fails_before_modal_deploy(seams, monkeypatch):
+    calls, _ = seams
+    model = Model.from_json({**_model().to_json(), "hf_token_env": "AOM_TEST_HF_TOKEN"})
+    monkeypatch.setenv("AOM_TEST_HF_TOKEN", "")  # set but empty counts as missing
+    with pytest.raises(AomError, match=r"needs a Hugging Face token in \$AOM_TEST_HF_TOKEN"):
+        deploy.deploy(model, max_containers=1, token=TOKEN)
+    assert calls == []  # never reached `modal deploy`
 
 
 def test_deploy_calls_seams_with_right_args(seams):

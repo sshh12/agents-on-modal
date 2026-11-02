@@ -4,7 +4,7 @@
 No container -- the harness runs on the host, in a directory you choose (this repo by default).
 Everything else (the model endpoint, the harness home, config, instructions) is managed for you.
 
-    # deploy the model once (idempotent), then:
+    # deploys the model first if it isn't deployed (a live one is attached to, never restarted)
     python examples/local_session.py --harness claude --model qwen3.8-27b
 
     # anything else goes to the harness: an initial prompt and/or its own flags
@@ -12,14 +12,26 @@ Everything else (the model endpoint, the harness home, config, instructions) is 
     python examples/local_session.py --harness claude --model qwen3.8-27b "fix the failing tests"
     python examples/local_session.py --harness codex --model qwen3.8-27b -- --model x "hi"
 
-Run `aom setup` first so a Modal proxy token is stored.
+Setup is automatic (``examples/bootstrap.py``): it loads the repo ``.env`` (``HF_TOKEN`` for a
+deploy), re-launches on the repo ``.venv`` if this Python can't run aom, and runs the Modal login /
+proxy-token mint if missing -- so plain ``python examples/local_session.py ...`` works.
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
 
-from agents_on_modal import models, sandbox
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root, for agents_on_modal
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # examples/, for the shared bootstrap
+
+import bootstrap  # noqa: E402 - stdlib-only module shared by the examples
+
+if __name__ == "__main__":
+    bootstrap.prepare(interactive=True)  # .env, .venv, Modal login -- before the aom imports below
+
+from agents_on_modal import models, sandbox  # noqa: E402
 
 
 def _harness_args(extra: list[str]) -> list[str]:
@@ -40,24 +52,24 @@ def main() -> int:
     parser.add_argument("--model", default="qwen3.8-27b", help="catalog model name")
     parser.add_argument("--workdir", default=".", help="directory the agent works in (default: cwd)")
     parser.add_argument("--effort", default=None, help="reasoning effort (none..max)")
-    parser.add_argument("--deploy", action="store_true",
-                        help="deploy + prepare the model first if it isn't deployed "
-                             "(default: attach to an existing one)")
+    # A model that isn't deployed is always deployed now; --deploy is kept so old command lines
+    # parse (unrecognised args go to the harness, which would reject it).
+    parser.add_argument("--deploy", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--max-containers", type=int, default=1,
-                        help="with --deploy: the endpoint's GPU container cap to ask for "
-                             "(a live endpoint is only raised to it, never restarted)")
+                        help="the endpoint's GPU container cap to ask for: a first deploy uses it, "
+                             "a live endpoint is only raised to it, never restarted")
     # Anything we don't recognise (an initial prompt, harness flags) is passed to the harness.
     args, extra = parser.parse_known_args()
 
+    # Attach if deployed, deploy (+ prepare weights) if not -- e.g. after `aom models stop`.
     model = models.get(args.model)
-    endpoint = (models.ensure_deployed(model, max_containers=args.max_containers) if args.deploy
-                else models.endpoint(model))
+    endpoint = models.ensure_deployed(model, max_containers=args.max_containers)
 
-    # Always wait for the endpoint to be serving before handing off to the harness. Even on the
-    # attach path (no --deploy) the model may be scaled to zero and cold-starting, so the very
-    # first request would otherwise hit 503 "no upstreams available" and the harness would spin on
-    # its own retries (and give up) while the container boots. wait_ready() polls /health, tolerating
-    # the cold-start 503/404, until the model can actually serve.
+    # Always wait for the endpoint to be serving before handing off to the harness. The model may
+    # be scaled to zero and cold-starting, so the very first request would otherwise hit 503 "no
+    # upstreams available" and the harness would spin on its own retries (and give up) while the
+    # container boots. wait_ready() polls /health, tolerating the cold-start 503/404, until the
+    # model can actually serve.
     print(
         f"[local] waiting for '{args.model}' to be ready "
         "(a cold start can take several minutes)...",

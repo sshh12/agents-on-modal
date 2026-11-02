@@ -102,14 +102,15 @@ def _stream_run(run: Any) -> int:
 # shared helpers                                                                                #
 # --------------------------------------------------------------------------------------------- #
 def _resolve_endpoint(args: argparse.Namespace) -> Any:
-    """Attach to the model (default), or with ``--deploy`` deploy it first if it isn't yet."""
+    """Attach to the model if it is deployed, deploy it if not; wait until it can serve.
+
+    ``ensure_deployed`` never redeploys a live endpoint, so this is safe beside other apps on it.
+    """
 
     model = models.get(args.model)
-    if getattr(args, "deploy", False):
-        endpoint = model_ops.ensure_deployed(model, max_containers=args.max_containers)
-        model_ops.wait_ready(endpoint)
-        return endpoint
-    return model_ops.endpoint(model)
+    endpoint = model_ops.ensure_deployed(model, max_containers=args.max_containers)
+    model_ops.wait_ready(endpoint)
+    return endpoint
 
 
 def _create_sandbox(args: argparse.Namespace, endpoint: Any) -> Any:
@@ -241,10 +242,9 @@ def _add_model_run_args(parser: argparse.ArgumentParser, *, workdir: bool = True
     parser.add_argument("--model", required=True, help="catalog model name")
     parser.add_argument("--proxy", help="upstream proxy URL (socks5h/http, {session} supported)")
     parser.add_argument("--effort", help="reasoning effort (none..max)")
-    parser.add_argument("--deploy", action="store_true",
-                        help="deploy + prepare the model first if it isn't deployed "
-                             "(default: attach to an existing one)")
-    _add_max_containers_arg(parser, scope="with --deploy: ")
+    # A model that isn't deployed is always deployed now; --deploy is kept so old command lines parse.
+    parser.add_argument("--deploy", action="store_true", help=argparse.SUPPRESS)
+    _add_max_containers_arg(parser)
     if workdir:
         parser.add_argument("--workdir", help="working directory for the agent")
 

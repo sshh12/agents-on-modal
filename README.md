@@ -77,7 +77,13 @@ aom run --sandbox modal --harness claude --model qwen3.8-27b --goal --timeout 36
   "make the test suite pass"
 ```
 
-The example scripts in [`examples/`](examples/) show the same three flows as ~50-line programs.
+Each of these deploys the model first if it isn't deployed yet (a live endpoint is attached to as-is,
+never restarted), then waits out any cold start. A deploy needs `HF_TOKEN` in the environment.
+
+The example scripts in [`examples/`](examples/) show the same flows as short programs. Like the
+dashboard below, they set themselves up (`examples/bootstrap.py`: the repo `.env`, the `.venv`, the
+Modal login and proxy token), so plain `python examples/local_session.py --model <name>` works;
+anything they don't recognise, such as an initial prompt, goes to the harness.
 
 ## Route sandbox traffic through a residential proxy
 
