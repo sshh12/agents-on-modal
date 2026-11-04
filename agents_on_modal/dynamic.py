@@ -17,6 +17,7 @@ reserved namespace, ``/shared/_swarm/``, is the control plane:
     _swarm/agents/<agent_id>.json controller-published per-agent status
     _swarm/traces/<agent_id>.jsonl durable per-agent trace (parsed events; survives teardown)
     _swarm/outputs/<agent_id>.json structured outputs for agents given a `schema` (soft contract)
+    _swarm/now.json               the controller's clock {ts, utc} (sandbox clocks can drift)
 
 **Nothing else under ``/shared`` is a lib primitive.** How subagents coordinate -- a message board,
 per-task report files, directory layout -- is entirely up to what the orchestrator writes into the
@@ -36,6 +37,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -55,6 +57,8 @@ LAUNCH_FILE = "launch.json"
 #: Written under RESERVED by a hard stop (``swarm.stop_swarm``). Every controller of the swarm -- in
 #: any process, now or after a restart -- halts on seeing it and never schedules another agent.
 STOPPED_FILE = "stopped.json"
+#: Written under RESERVED by the controller: its own clock (``{ts, utc}``), the trusted time source.
+NOW_FILE = "now.json"
 
 TERMINAL_STATES = ("done", "timeout", "failed", "cancelled")
 
@@ -91,6 +95,10 @@ class AgentSpec:
     schema: dict[str, Any] | None = None
     #: The agent CLI to run it under; ``None`` -> the swarm's (the orchestrator's) harness.
     harness: str | None = None
+    #: One canonical lane token and the absolute report directory built from it. Carried as fields
+    #: (not only inside the prompt) so `status` and a later merge never have to guess the tree.
+    lane: str | None = None
+    report_dir: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         data: dict[str, Any] = {"prompt": self.prompt, "goal": self.goal, "timeout": self.timeout}
@@ -100,6 +108,10 @@ class AgentSpec:
             data["schema"] = self.schema
         if self.harness:
             data["harness"] = self.harness
+        if self.lane:
+            data["lane"] = self.lane
+        if self.report_dir:
+            data["report_dir"] = self.report_dir
         return data
 
 
@@ -202,12 +214,33 @@ def _parse_agent(
         errors.append(f"{where}: unknown harness {harness!r} (known: {', '.join(HARNESSES)})")
         harness = None
 
+    lane = data.get("lane")
+    lane = str(lane).strip() if lane else None
+    if lane and ("/" in lane or any(c.isspace() for c in lane)):
+        errors.append(f"{where}: 'lane' must be one token (no '/' or whitespace), got {lane!r}")
+    report_dir = data.get("report_dir")
+    if report_dir is not None:
+        report_dir = str(report_dir).rstrip("/")
+        parts = report_dir.split("/")
+        if not report_dir.startswith("/shared/") or ".." in parts:
+            errors.append(f"{where}: 'report_dir' must be an absolute path under /shared/, "
+                          f"got {report_dir!r}")
+        elif len(parts) > 2 and parts[2] == RESERVED:
+            errors.append(f"{where}: 'report_dir' must not be under /shared/{RESERVED}/ "
+                          "(the control plane)")
+        elif lane and lane not in report_dir:
+            warnings.append(
+                f"{where}: lane {lane!r} does not appear in report_dir {report_dir!r}; a merge "
+                "that globs lane names will miss it"
+            )
+
     for key in data:
-        if key not in ("prompt", "goal", "timeout", "effort", "schema", "harness"):
+        if key not in ("prompt", "goal", "timeout", "effort", "schema", "harness", "lane",
+                       "report_dir"):
             warnings.append(f"{where}: unknown field {key!r} ignored")
 
     return AgentSpec(prompt=prompt, goal=goal, timeout=timeout, effort=effort, schema=schema,
-                     harness=harness)
+                     harness=harness, lane=lane, report_dir=report_dir)
 
 
 def parse_plan(
@@ -368,6 +401,18 @@ class ControlPlane(ABC):
     def exists(self, relpath: str) -> bool:
         return self.read_text(relpath) is not None
 
+    def read_shared_json(self, abspath: str) -> Any | None:
+        """JSON at an absolute in-sandbox path under ``/shared`` (e.g. a lane's ``result.json``),
+        for a control plane rooted at the shared volume -- the controller's, whose paths all start
+        with ``_swarm/``. ``None`` for anything outside ``/shared`` or not parseable."""
+
+        if not abspath.startswith("/shared/"):
+            return None
+        rel = abspath[len("/shared/"):].strip("/")
+        if not rel or ".." in rel.split("/"):
+            return None
+        return self.get_json(rel)
+
 
 class LocalDirControlPlane(ControlPlane):
     """Plain filesystem. Used in-sandbox (base ``/shared/_swarm``) and in tests. Stdlib only."""
@@ -417,15 +462,18 @@ class VolumeControlPlane(ControlPlane):
     """Reads/writes the control plane on a Modal Volume v2 from *outside* Modal (the controller).
     Runtime only: imports ``modal`` lazily. Never exercised by the offline tests."""
 
-    def __init__(self, volume_name: str) -> None:
+    def __init__(self, volume_name: str, *, create: bool = True) -> None:
         self.volume_name = volume_name
+        #: False: never create the volume (reads of a missing one come back empty, writes raise).
+        self.create = create
         self._vol: Any = None
 
     def _volume(self) -> Any:
         if self._vol is None:
             import modal
 
-            self._vol = modal.Volume.from_name(self.volume_name, version=2, create_if_missing=True)
+            self._vol = modal.Volume.from_name(self.volume_name, version=2,
+                                               create_if_missing=self.create)
         return self._vol
 
     def put_text(self, relpath: str, text: str) -> None:
@@ -476,10 +524,15 @@ class VolumeControlPlane(ControlPlane):
 _SCHEMA_INSTRUCTION = (
     "\n\n---\nREQUIRED OUTPUT: as soon as you have the result -- before any final review, summary "
     "or status bookkeeping -- write it as a single JSON document that conforms to this JSON schema "
-    "to the file `{path}` (create parent directories if needed). It is part of the task, not an "
-    "afterthought: an agent that runs out of time before writing it has not delivered.\n"
+    "to the file `{path}` (create parent directories if needed).{copy} It is part of the task, not "
+    "an afterthought: an agent that runs out of time before writing it has not delivered.\n"
     "```json\n{schema}\n```\n"
 )
+#: Appended to the schema instruction when the agent has a ``report_dir``: the copy keeps the result
+#: beside its evidence, and the controller falls back to it when the primary path is missing.
+_SCHEMA_COPY = " Then write the identical JSON to `{copy_path}` as well."
+#: The lane-tree copy's file name under ``report_dir``.
+RESULT_FILE = "result.json"
 
 
 def validate_against_schema(value: Any, schema: dict[str, Any]) -> list[str]:
@@ -536,6 +589,14 @@ class _AgentRun:
     offset: int = 0
     error: str | None = None
     last_reload: float = 0.0
+    #: When a status read last succeeded, and the consecutive failures since. A terminal status.json
+    #: is the LAST thing an exiting run can be read at; after that every read fails, and leaving the
+    #: record "running" stranded whole stages behind `wait --all`.
+    last_status_ok: float = field(default_factory=time.time)
+    refresh_errors: int = 0
+    #: Terminated by a `stop`: stays "cancelled" even if an in-flight refresh (requests are now
+    #: ingested while refreshes run) reads the pre-stop "running" afterwards.
+    stopped: bool = False
     #: Terminal and fully published, so later ticks skip it. Set on the refresh AFTER the first one
     #: that read a terminal state, so trace lines the runner writes after flipping status still land.
     settled: bool = False
@@ -619,6 +680,7 @@ class Controller:
         #: the control plane; ``halted`` once this controller's agents are terminated (``_halt``).
         self._halt_requested = False
         self.halted = False
+        self._now_published = 0.0
 
     # -- lifecycle ---------------------------------------------------------------------------- #
     def run_forever(self, interval: float = 3.0, stop: Any = None) -> None:
@@ -663,6 +725,33 @@ class Controller:
             )
             self._wrote_meta = True
 
+        # Sandbox VM clocks can be hours off from the host. Publish the controller's clock so agents
+        # stamp campaign files (and `aom-swarm status` ages records) from one trusted source. Only as
+        # often as the orchestrator's mount reloads -- nobody can see a fresher one.
+        if time.time() - self._now_published >= ORCHESTRATOR_RELOAD_INTERVAL:
+            self._now_published = time.time()
+            self.control.put_json(f"{RESERVED}/{NOW_FILE}", {
+                "ts": self._now_published,
+                "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self._now_published)),
+            })
+
+        self._ingest_requests()
+
+        for wf in list(self._workflows.values()):
+            self._advance(wf)
+            self._publish_workflow(wf)
+
+        self._reload_orchestrator()  # so its `aom-swarm` sees the acks + state written (throttled)
+        self._tail_orchestrator()
+        self._supervise_orchestrator()
+
+    # -- request handling --------------------------------------------------------------------- #
+    def _ingest_requests(self) -> bool:
+        """Dispatch every new request and deliver the acks. Runs at the top of each tick AND while a
+        wave's creates/refreshes are in flight (see :meth:`_map`): a request that landed mid-tick
+        used to wait out the whole 100-agent tick, so acks took 90-105 s and every retry of a
+        "timed out" submit double-ran the wave."""
+
         acked = False
         for name in self.control.listdir(f"{RESERVED}/requests"):
             if not name.endswith(".json"):
@@ -683,19 +772,22 @@ class Controller:
                 acked = True
 
         if acked:
-            # Deliver acks NOW, before this tick spawns a wave: reloading only at the end of the
-            # tick put a 100-agent spawn between the ack and its delivery (84.6 s of a 90 s wait).
+            # Deliver acks NOW: the orchestrator's mount only shows them after a reload.
             self._reload_orchestrator(force=True)
+        return acked
 
-        for wf in list(self._workflows.values()):
-            self._advance(wf)
-            self._publish_workflow(wf)
+    def _ingest_between(self) -> None:
+        """:meth:`_ingest_requests` for :meth:`_map`'s in-flight callback: never raises."""
 
-        self._reload_orchestrator()  # so its `aom-swarm` sees the acks + state written (throttled)
-        self._tail_orchestrator()
-        self._supervise_orchestrator()
+        try:
+            self._ingest_requests()
+        except Exception as error:  # noqa: BLE001 - the tick's own ingest records real failures
+            try:
+                self.control.put_json(f"{RESERVED}/controller_error.json",
+                                      {"ts": time.time(), "error": f"mid-tick ingest: {error}"})
+            except Exception:  # noqa: BLE001
+                pass
 
-    # -- request handling --------------------------------------------------------------------- #
     def _ack(self, reqid: str, *, ok: bool, errors=None, warnings=None, result=None) -> None:
         self.control.put_json(
             f"{RESERVED}/ack/{reqid}.json",
@@ -750,7 +842,10 @@ class Controller:
             self._ack(reqid, ok=False, errors=errors, warnings=warnings)
             return
         assert plan is not None
-        name = self._unique_name(str(payload.get("name") or reqid))
+        requested = str(payload.get("name") or reqid)
+        name = self._unique_name(requested)
+        if name != requested:
+            warnings.append(f"workflow name {requested!r} was already used; this one is {name!r}")
         self._workflows[name] = _WorkflowRuntime(name=name, plan=plan)
         self._ack(
             reqid,
@@ -770,7 +865,11 @@ class Controller:
             self._ack(reqid, ok=False, errors=errors, warnings=warnings)
             return
         assert plan is not None
-        name = self._unique_name(str(payload.get("workflow") or "spawn"))
+        explicit = payload.get("workflow")
+        requested = str(explicit or "spawn")
+        name = self._unique_name(requested)
+        if explicit and name != requested:
+            warnings.append(f"workflow name {requested!r} was already used; this one is {name!r}")
         self._workflows[name] = _WorkflowRuntime(name=name, plan=plan)
         self._ack(reqid, ok=True, warnings=warnings, result={"workflow": name})
 
@@ -786,6 +885,11 @@ class Controller:
             for stage_runs in wf.runs.values():
                 for ar in stage_runs.values():
                     if ar.id == target:
+                        if ar.state in TERMINAL_STATES:
+                            # Keep its real outcome: a stop must not rewrite "done" as "cancelled".
+                            self._ack(reqid, ok=True, result={"agent": target, "status": ar.state},
+                                      warnings=[f"agent {target} had already finished ({ar.state})"])
+                            return
                         self._terminate(ar)
                         self._ack(reqid, ok=True, result={"agent": target, "status": "stopped"})
                         return
@@ -807,30 +911,48 @@ class Controller:
         # Refresh every running agent's state first (and validate schema on completion), THEN decide
         # what is finished -- otherwise completion would always lag a tick behind reality.
         live = [ar for stage_runs in wf.runs.values() for ar in stage_runs.values() if not ar.settled]
-        errors = [error for _, _, error in self._map(self._refresh, live) if error]
+        errors = [error for _, _, error in self._map(self._refresh, live,
+                                                     between=self._ingest_between) if error]
         finished_by_stage = [self._finished_indices(wf, si) for si in range(len(wf.plan.stages))]
-        if not wf.paused:
+        if not wf.paused:  # re-read: a `stop` may have been ingested during the refreshes
             active = active_stage_index(wf.plan, finished_by_stage)
             if active is not None:  # None: workflow complete
                 stage = wf.plan.stages[active]
                 stage_runs = wf.runs.setdefault(active, {})
                 todo = stage_next_indices(stage, set(stage_runs), finished_by_stage[active])
-                for idx, ar, error in self._map(lambda i: self._spawn_agent(wf, active, i), todo):
+                for idx, ar, error in self._map(lambda i: self._spawn_agent(wf, active, i), todo,
+                                                between=self._ingest_between):
                     if error:  # left unstarted: the next tick retries it
                         errors.append(error)
-                    else:
+                    elif ar is not None:  # None: paused mid-wave; the resume starts it
                         stage_runs[idx] = ar
         if errors:
             raise errors[0]  # run_forever records it; everything that succeeded is already kept
 
-    def _map(self, fn: Any, items: list) -> list[tuple[Any, Any, BaseException | None]]:
+    #: While a :meth:`_map` batch is in flight, run its ``between`` callback this often (seconds).
+    INFLIGHT_POLL = 5.0
+
+    def _map(self, fn: Any, items: list, *,
+             between: Any = None) -> list[tuple[Any, Any, BaseException | None]]:
         """``fn`` over ``items`` on up to :data:`CONTROLLER_CONCURRENCY` threads, in order:
-        ``[(item, result, error)]`` -- one failure never discards the others' results."""
+        ``[(item, result, error)]`` -- one failure never discards the others' results.
+
+        ``between`` (no args) runs on the calling thread every :attr:`INFLIGHT_POLL` seconds until
+        the batch finishes, so a long batch (a 100-agent create) does not hold up the requests and
+        acks behind it."""
 
         if not items:
             return []
         with ThreadPoolExecutor(max_workers=min(CONTROLLER_CONCURRENCY, len(items))) as pool:
             futures = [(item, pool.submit(fn, item)) for item in items]
+            pending = {future for _, future in futures}
+            try:
+                while between is not None and pending:
+                    _, pending = futures_wait(pending, timeout=self.INFLIGHT_POLL)
+                    if pending:
+                        between()
+            except Exception:  # noqa: BLE001 - never lose the batch: a create that succeeded but
+                pass  # whose result is dropped is a sandbox nobody tracks (or stops)
         out = []
         for item, future in futures:
             error = future.exception()
@@ -844,9 +966,11 @@ class Controller:
                 done.add(idx)
         return done
 
-    def _spawn_agent(self, wf: _WorkflowRuntime, stage_index: int, idx: int) -> _AgentRun:
+    def _spawn_agent(self, wf: _WorkflowRuntime, stage_index: int, idx: int) -> _AgentRun | None:
         if self._halt_requested:  # a hard stop landed mid-wave: create nothing more
             raise AomError(f"swarm {self.swarm_id} was stopped")
+        if wf.paused or wf.cancelled:  # `stop WORKFLOW` acked mid-wave: start no more of it
+            return None
         stage = wf.plan.stages[stage_index]
         spec = stage.agents[idx]
         box = self._sb.create(
@@ -861,7 +985,10 @@ class Controller:
             prompt = self.proxy_note + "\n\n---\n\n" + prompt
         if spec.schema is not None:
             out = f"/shared/{RESERVED}/outputs/{box.id}.json"
-            prompt += _SCHEMA_INSTRUCTION.format(path=out, schema=json.dumps(spec.schema, indent=2))
+            copy = (_SCHEMA_COPY.format(copy_path=f"{spec.report_dir}/{RESULT_FILE}")
+                    if spec.report_dir else "")
+            prompt += _SCHEMA_INSTRUCTION.format(path=out, copy=copy,
+                                                 schema=json.dumps(spec.schema, indent=2))
         run = box.start(
             spec.harness or self.harness,
             self.endpoint,
@@ -881,17 +1008,43 @@ class Controller:
         self._refresh(ar)
         return ar
 
+    #: A status read may blip; once reads have failed this long AND this many times in a row while
+    #: the box still polls alive, the run cannot report again (its process exited and the read-back
+    #: is gone), so settle it -- a finished lane left "running" hangs `aom-swarm wait` and the stage
+    #: behind it. Both bounds: one failed read after a slow tick (a 100-agent spawn tick can run past
+    #: a minute) is not "unreadable for a minute", and settling a live lane would start the next
+    #: stage under it.
+    STATUS_UNREADABLE_SETTLE = 120.0
+    STATUS_UNREADABLE_READS = 3
+
     def _refresh(self, ar: _AgentRun) -> None:
         try:
-            ar.state = str(ar.run.status().get("state", ar.state))
+            state = str(ar.run.status().get("state", ar.state))
+            ar.state = "cancelled" if ar.stopped and state not in TERMINAL_STATES else state
+            ar.last_status_ok = time.time()
+            ar.refresh_errors = 0
         except Exception:  # noqa: BLE001 - mid-flight read; keep the last known state...
-            # ...unless the sandbox itself is gone: then the run can never report again, and
-            # leaving it "running" would hang `aom-swarm wait` and the stage forever.
-            if ar.state not in TERMINAL_STATES and not _box_alive(ar.box):
-                ar.state = "failed"
-                ar.error = "sandbox exited before the run finished (timeout, idle timeout, or OOM)"
+            ar.refresh_errors += 1
+            # ...unless the sandbox itself is gone, or the status has been unreadable long enough
+            # that it cannot report again: then the run is over, whatever the last read said.
+            if ar.stopped:
+                ar.state = "cancelled"
+            elif ar.state not in TERMINAL_STATES:
+                unreadable_for = time.time() - ar.last_status_ok
+                if not _box_alive(ar.box):
+                    ar.state = "failed"
+                    ar.error = ("sandbox exited before the run finished "
+                                "(timeout, idle timeout, or OOM)")
+                elif (unreadable_for >= self.STATUS_UNREADABLE_SETTLE
+                      and ar.refresh_errors >= self.STATUS_UNREADABLE_READS):
+                    ar.state = "failed"
+                    ar.error = (f"status unreadable for {unreadable_for:.0f}s "
+                                f"({ar.refresh_errors} reads in a row); settled as failed")
         self._publish_trace(ar)
-        if ar.state in TERMINAL_STATES and ar.spec.schema is not None and ar.schema_ok is None:
+        # Checked on the first terminal refresh and, if still missing, once more on the settling
+        # one: the agent's last write can trail its exit on the volume by a few seconds.
+        if (ar.state in TERMINAL_STATES and ar.spec.schema is not None
+                and ar.schema_ok is not True and not ar.settled):
             self._check_schema(ar)
         self._publish_agent(ar)
         if ar.state in TERMINAL_STATES:
@@ -901,13 +1054,28 @@ class Controller:
             _reload_volumes(ar.box)  # let it see what its siblings wrote to /shared
 
     def _check_schema(self, ar: _AgentRun) -> None:
-        produced = self.control.get_json(f"{RESERVED}/outputs/{ar.id}.json")
+        primary = f"{RESERVED}/outputs/{ar.id}.json"
+        produced = self.control.get_json(primary)
+        if produced is None and ar.spec.report_dir:
+            # Agents that miss the injected path often still wrote the copy in their lane tree
+            # (the path the prompt names, or one level down under their own id). Promote it to the
+            # canonical path so the orchestrator reads every result from one place.
+            for candidate in (f"{ar.spec.report_dir}/{RESULT_FILE}",
+                              f"{ar.spec.report_dir}/{ar.id}/{RESULT_FILE}"):
+                produced = self.control.read_shared_json(candidate)
+                if produced is not None:
+                    try:
+                        self.control.put_json(primary, produced)
+                    except Exception:  # noqa: BLE001 - validation below still uses it
+                        pass
+                    break
         if produced is None:
             ar.schema_ok = False
             return
         ar.schema_ok = not validate_against_schema(produced, ar.spec.schema or {})
 
     def _terminate(self, ar: _AgentRun) -> None:
+        ar.stopped = True
         try:
             ar.box.stop()
         except Exception:  # noqa: BLE001 - best effort
@@ -1101,6 +1269,9 @@ class Controller:
                 "goal": ar.spec.goal,
                 "timeout": ar.spec.timeout,
                 "effort": ar.spec.effort,
+                "lane": ar.spec.lane,
+                "report_dir": ar.spec.report_dir,
+                "updated_at": ar.last_status_ok,
                 "schema": ar.spec.schema is not None,
                 "schema_ok": ar.schema_ok,
                 "error": ar.error,
@@ -1136,6 +1307,7 @@ class Controller:
                     "name": stage.name,
                     "max_concurrent": stage.max_concurrent,
                     "status": sstatus,
+                    "planned": len(stage.agents),
                     "agents": [
                         {
                             "idx": idx,
@@ -1145,6 +1317,9 @@ class Controller:
                             "goal": ar.spec.goal,
                             "timeout": ar.spec.timeout,
                             "effort": ar.spec.effort,
+                            "lane": ar.spec.lane,
+                            "report_dir": ar.spec.report_dir,
+                            "updated_at": ar.last_status_ok,
                             "schema_ok": ar.schema_ok,
                         }
                         for idx, ar in sorted(runs.items())
@@ -1423,9 +1598,15 @@ def resume_orchestrator(
         default_timeout=default_timeout, allowed_efforts=_model_efforts(model),
     )
     prior = meta.get("orchestrator_id")
+    # The supervisor's corrections are the newest intent; a replacement must start from them.
+    supervisor = (control.read_text("NOTE-supervisor.md") or "").strip()
+    if len(supervisor) > 6000:
+        supervisor = "...(older notes cut; read /shared/NOTE-supervisor.md)\n" + supervisor[-6000:]
     task = (
         f"{instructions}\n\n---\n\n# Resuming an in-flight mission\n\n"
         + (f"{note}\n\n" if note else "")
+        + (f"Supervisor notes so far (they outrank the plan):\n\n{supervisor}\n\n"
+           if supervisor else "")
         + "You are a REPLACEMENT orchestrator: the previous orchestrator for this swarm exited. The "
         "shared workspace under `/shared` is intact — read `PLAN.md` and any notes there FIRST to "
         "recover the mission's intent and conventions. Do NOT restart work that is already finished. "
@@ -1530,18 +1711,33 @@ are only expensive when the box is already full or idle-waiting on each other �
 concurrent pool over a narrow one, unless the task itself says otherwise.
 
 ## Shared workspace
-Every agent — you and all subagents — shares a directory at `/shared` (a network volume). The
-subdirectory `/shared/_swarm/` is reserved for the `aom-swarm` control plane; **do not write there
-yourself.** Everything else under `/shared` is yours to organize however you like. *You* decide how
-subagents coordinate — e.g. a `reports/` folder where each writes its own markdown, one file per
-agent that you merge later, a conventions file you write before spawning — and you must spell that
-out in the prompt you give each subagent (they only know what you tell them).
+`/work` and `$HOME` are local to each agent's own sandbox and start empty; `/shared` (a network
+volume) is the only directory every agent sees. Anything another agent must use — a venv, a built
+binary, a dataset — goes under `/shared` together with a script that sets it up. `/shared/_swarm/`
+is the `aom-swarm` control plane: you may read it, never write there. Everything else is yours to
+organize — e.g. one `/shared/reports/<lane>/` directory per subagent — and you must spell the
+layout out in each subagent's prompt (they only know what you tell them).
 
-**One writer per file.** Agents writing *different* files under `/shared` all land fine, but when
-several agents append to or edit the *same* file at once, they overwrite each other (last writer
-wins — 100 agents appending to one board file kept 1 line), and a file another agent just wrote can
-take a while to show up. So never have subagents share a file: give each its own path (e.g.
-`/shared/board/<agent>.md`) and combine them yourself after `aom-swarm wait`.
+**One writer per file.** Agents writing *different* files under `/shared` all land fine, but two
+agents appending to or editing the *same* file overwrite each other (last writer wins — 100 agents
+appending to one board file kept 1 line). Give each its own path and combine them yourself after
+`aom-swarm wait`. The mount is eventually consistent: a file another agent just wrote can take a
+minute or two to show up (a missing report is lag, not a missing agent), and after rewriting a whole
+file, re-read it and check its size/mtime before relying on it.
+
+Subagents are separate sandboxes: your harness's own sub-agent and messaging tools do not reach
+them. To steer running subagents, write `/shared/NOTE-<lane>.md` and tell each one in its prompt to
+read its note at start and at every checkpoint; to end one, `aom-swarm stop` it.
+
+## Timing and clocks
+- **Latency is not failure.** `submit`/`spawn` wait up to ~100 s for the controller's ack, and under
+  load an ack can arrive later than that. A request that timed out is very likely accepted: it is
+  listed under `PENDING` in `aom-swarm status` until its ack lands. Never resubmit it — run
+  `aom-swarm wait`. (The CLI refuses a second `submit` under a name that is pending or running.)
+- A subagent that just finished can show `running` for a few more seconds; its report on disk is
+  what counts.
+- Sandbox clocks can be far off real time. For timestamps, read `utc` (or `ts`) from
+  `/shared/_swarm/now.json` — the controller's clock — instead of running `date`.
 
 ## The `aom-swarm` CLI
 Run it in your shell. (If `aom-swarm` is not found, use `python3 -m agents_on_modal.swarmctl`.)
@@ -1549,17 +1745,25 @@ It is the only control command here: the host-side `aom` CLI (models, deploys) i
 a sandbox.
 
 - `aom-swarm submit --file plan.json [--name NAME]` — run a whole plan (waves + pools). Validates
-  the plan and prints errors; fix them and resubmit. You can submit several plans.
-- `aom-swarm spawn --prompt "..." [--goal] --timeout N [--effort E] [--schema s.json] [--workflow W]`
-  — spawn one subagent ad hoc.
-- `aom-swarm status [--workflow W] [--json]` — see every workflow, stage and subagent's state.
+  the plan and prints errors; fix them and resubmit. You can submit several plans, each under its
+  own name; to run a plan again on purpose, give it a new name (e.g. `wave1-retry`).
+- `aom-swarm spawn --prompt "..." [--goal] --timeout N [--effort E] [--lane L] [--report-dir D]
+  [--schema s.json | --no-schema] [--workflow W]` — spawn one subagent ad hoc. When
+  `/shared/schema.json` exists it is attached by default; pass `--no-schema` for a setup or helper
+  agent. Name the workflow after the lane (e.g. `--workflow w1-topic-a-retry`) so it is easy to find.
+- `aom-swarm status [--workflow W] [--json]` — workflows, stages and subagents (with their lane, and
+  `STUCK` when the controller has had no status from one for 5 min), plus requests still pending an
+  ack. Use `--workflow W` to look at one workflow.
 - `aom-swarm trace AGENT_ID [--tail N]` — read a subagent's recent activity.
 - `aom-swarm wait [--all|--any] [--workflow W]` — block until subagents finish. Use this to
   sequence work: submit a wave, `wait --all`, read results from `/shared`, then spawn the next wave
-  or a final synthesis agent. One call blocks up to ~100 s (it stays under your shell's command
-  timeout) and then says how many agents are done; just run it again until it prints `ok`. Do NOT
-  poll `status` in a loop or use `sleep` to wait — `aom-swarm wait` is the ONLY correct way to wait.
-- `aom-swarm stop TARGET` — pause a workflow (by name) or terminate one subagent (by id).
+  or a final synthesis agent. One call blocks up to ~100 s and then says how many agents are done;
+  just run it again until it prints `ok`. Every return also prints whatever is new in
+  `/shared/NOTE*` files; a *supervisor* note there (from the human running the swarm) outranks your
+  plan. Do NOT poll `status` in a loop or use `sleep` — `aom-swarm wait` is the ONLY correct way to
+  wait.
+- `aom-swarm stop TARGET` — by workflow name: pause it (no new agents start; running ones continue);
+  by agent id: terminate that subagent. It prints what the target covers before acting.
 - `aom-swarm resume --workflow W` — un-pause a workflow.
 
 ## Plan format (`submit`)
@@ -1568,8 +1772,9 @@ a sandbox.
   "name": "research",
   "stages": [
     {{"name": "wave1", "max_concurrent": 6, "agents": [
-        {{"prompt": "…full instructions incl. where to write…", "goal": true,
-          "timeout": 1800, "effort": "medium"}}
+        {{"lane": "w1-topic-a", "report_dir": "/shared/reports/w1-topic-a",
+          "prompt": "…full instructions, incl. writing to /shared/reports/w1-topic-a…",
+          "goal": true, "timeout": 1800, "effort": "medium"}}
     ]}},
     {{"name": "summary", "agents": [
         {{"prompt": "read the reports the others wrote and produce a summary at …",
@@ -1583,15 +1788,27 @@ a sandbox.
   finishes — this is how you make a bounded pool (set `max_concurrent` to e.g. 2).
 - Per agent: `prompt` (required), `goal` (true = run under /goal until it declares the goal met),
   `timeout` (seconds — **always set one**; default {timeout}), `effort` (one of: {efforts} — the
-  model maps any level to its nearest supported), and optional `schema` (a JSON Schema, inline or
-  as a path to a JSON file — one shared `/shared/schema.json` can serve a whole wave; the subagent
-  is asked to also emit matching JSON, which is validated — a soft contract, not a hard guarantee),
-  and optional `harness` (`claude` or `codex`; default: the one you run on).
+  model maps any level to its nearest supported); optional `lane` (a short name for the subagent —
+  no spaces or `/` — shown in `status`), `report_dir` (the absolute `/shared/...` directory it
+  writes to; put the same path in its prompt), `schema` (a JSON Schema, inline or as a path to a
+  JSON file — one `/shared/schema.json` can serve a whole wave; the subagent is asked to also emit
+  matching JSON, which is validated — a soft contract, not a hard guarantee; with a `report_dir` it
+  also writes a copy to `<report_dir>/result.json`), and `harness` (`claude` or `codex`; default:
+  the one you run on).
+- Use `goal: true` with a long timeout for open-ended work that must keep going until it is done;
+  plain runs with short timeouts for bounded lookups, checks and merges. A number you give a
+  subagent ("find 20 sources") is a minimum it may exceed — say so in its prompt.
 
 ## How to work
 1. Do any research you need yourself (browser, web search) to design the workflow.
-2. Write `plan.json` and `aom-swarm submit` it (or `spawn`/`wait` reactively).
+2. Write `plan.json` and `aom-swarm submit` it — a whole wave goes in one submitted stage; `spawn`
+   is for a single reactive subagent (a retry, a setup step), never for a whole wave.
 3. `aom-swarm wait` for stages, inspect `/shared`, and continue — add stages, spawn a final
-   synthesis agent, etc. The job is not done until the subagents are done and you have produced
-   whatever final artifact the task asks for.
+   synthesis agent, etc. Each `wait` return is a checkpoint: act on any new note it printed and
+   merge the reports that have landed. The job is not done until the subagents are done and you
+   have produced whatever final artifact the task asks for.
+
+Keep your own context for coordinating: after the first wave, any hands-on exploration that would
+take more than a handful of tool calls should be a subagent that writes its findings to a file, and
+you read only its summary.
 """

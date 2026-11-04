@@ -22,7 +22,8 @@ Endpoints
     GET  /                                      -> index.html
     GET  /api/config                            -> {swarm}
     GET  /api/agents?swarm=<id>                 -> {swarm, model, mode, agents:[...], workflows:[...]}
-    GET  /api/events?agent=&run=&offset=        -> {events, offset, state, done}
+    GET  /api/events?agent=&run=&offset=[&poffset=] -> {events, offset, state, done, source}
+                                                   (persisted: also poffset, reset)
     GET  /api/files?swarm=&path=/               -> {paths:[...]}            (live /shared listing)
     GET  /api/file?swarm=&path=...              -> {path, text, truncated}  (one shared file)
     GET  /api/zip?swarm=[&all=1]                -> application/zip  (/shared, zipped on Modal's side)
@@ -46,6 +47,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -300,34 +302,83 @@ def _dynamic_agents_payload(swarm_id: str, meta: dict) -> dict:
         agents.append({"id": meta["orchestrator_id"], "run_id": meta.get("orchestrator_run_id"),
                        "idx": None, "role": "orchestrator", "workflow": None, "stage": None,
                        "state": _orchestrator_state(meta)})
-    for name in control.listdir(f"{RESERVED}/agents"):
-        if not name.endswith(".json"):
-            continue
-        a = control.get_json(f"{RESERVED}/agents/{name}")
+    # One Modal read per file: in parallel, or ~100 agent records alone took 30-90 s.
+    agent_files = [n for n in control.listdir(f"{RESERVED}/agents") if n.endswith(".json")]
+    workflow_files = [n for n in control.listdir(f"{RESERVED}/workflows") if n.endswith(".json")]
+    paths = ([f"{RESERVED}/agents/{n}" for n in agent_files]
+             + [f"{RESERVED}/workflows/{n}" for n in workflow_files])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=AGENTS_READ_CONCURRENCY) as pool:
+        docs = list(pool.map(control.get_json, paths)) if paths else []
+    for a in docs[:len(agent_files)]:
         if a and a.get("id"):
             agents.append({"id": a["id"], "run_id": a.get("run_id"), "idx": a.get("idx"),
                            "role": "subagent", "workflow": a.get("workflow"),
                            "stage": a.get("stage"), "state": a.get("state", "starting")})
-    workflows = []
-    for name in control.listdir(f"{RESERVED}/workflows"):
-        if name.endswith(".json"):
-            wf = control.get_json(f"{RESERVED}/workflows/{name}")
-            if wf:
-                workflows.append(wf)
+    workflows = [wf for wf in docs[len(agent_files):] if wf]
     return {"swarm": swarm_id, "model": meta.get("model", ""), "mode": "dynamic",
             "agents": agents, "workflows": workflows, "stopped": stopped}
+
+
+#: Concurrent volume reads when building the agents view.
+AGENTS_READ_CONCURRENCY = 16
+#: The agents view is memoized for a few seconds and built at most once at a time per swarm: while
+#: one request rebuilds it, others get the previous payload (or wait for the first build) instead
+#: of each starting its own -- the UI polls every 2 s, and overlapping 30-90 s builds of a
+#: ~100-agent swarm piled up until nothing answered.
+_AGENTS_CACHE: dict[str, tuple[float, dict]] = {}
+_AGENTS_BUILDING: dict[str, threading.Event] = {}
+_AGENTS_CACHE_LOCK = threading.Lock()
+AGENTS_CACHE_TTL = 3.0
+#: How long a request with nothing cached waits for another request's build before building itself.
+AGENTS_BUILD_WAIT = 120.0
+
+
+def _build_agents_payload(swarm_id: str) -> dict:
+    meta = _read_meta(swarm_id)
+    return _dynamic_agents_payload(swarm_id, meta) if meta else _naive_agents_payload(swarm_id)
 
 
 def _agents_payload(swarm_id: str) -> dict:
     if not swarm_id:
         return {"swarm": "", "model": "", "mode": "naive", "agents": [], "workflows": []}
-    meta = _read_meta(swarm_id)
-    if meta:
-        return _dynamic_agents_payload(swarm_id, meta)
-    return _naive_agents_payload(swarm_id)
+    with _AGENTS_CACHE_LOCK:
+        hit = _AGENTS_CACHE.get(swarm_id)
+        if hit and time.time() - hit[0] < AGENTS_CACHE_TTL:
+            return hit[1]
+        building = _AGENTS_BUILDING.get(swarm_id)
+        owner = building is None
+        if owner:
+            building = _AGENTS_BUILDING[swarm_id] = threading.Event()
+    if not owner:
+        if hit:
+            return hit[1]  # stale while the in-flight build refreshes it
+        building.wait(AGENTS_BUILD_WAIT)
+        with _AGENTS_CACHE_LOCK:
+            hit = _AGENTS_CACHE.get(swarm_id)
+        if hit:
+            return hit[1]
+        return _build_agents_payload(swarm_id)  # the other build failed: try ourselves
+    try:
+        payload = _build_agents_payload(swarm_id)
+        with _AGENTS_CACHE_LOCK:
+            _AGENTS_CACHE[swarm_id] = (time.time(), payload)
+        return payload
+    finally:
+        with _AGENTS_CACHE_LOCK:
+            _AGENTS_BUILDING.pop(swarm_id, None)
+        building.set()
 
 
-def _events_payload(agent_id: str, run_id: str, offset: int, swarm_id: str = "") -> dict:
+def _invalidate_agents(swarm_id: str) -> None:
+    with _AGENTS_CACHE_LOCK:
+        _AGENTS_CACHE.pop(swarm_id, None)
+
+
+def _events_payload(agent_id: str, run_id: str, offset: int, swarm_id: str = "",
+                    poffset: int | None = None) -> dict:
+    """``offset`` is the live cursor (bytes of the sandbox's raw trace) and ``poffset`` the persisted
+    one (bytes of the controller's parsed JSONL) -- two different files, so never one cursor."""
+
     # Live-first: read the running sandbox's trace (byte-offset, incremental).
     try:
         box = sandbox.get("modal", agent_id)
@@ -341,13 +392,20 @@ def _events_payload(agent_id: str, run_id: str, offset: int, swarm_id: str = "")
         if not swarm_id:
             raise
         # The controller persists every agent's full trace (parsed events) to the volume, so a
-        # completed/torn-down agent still renders. Returns the whole trace each call (persisted).
+        # completed/torn-down agent still renders.
         control = VolumeControlPlane(f"aom-shared-{swarm_id}")
         text = control.read_text(f"{RESERVED}/traces/{agent_id}.jsonl")
         if text is None:
             raise  # nothing live and nothing persisted -> surface the live error; the UI retries
+        # Incremental on its own cursor, so a 5,000-event trace of a running agent whose live read
+        # keeps blipping is not re-shipped every poll. ``reset``: the client must REPLACE what it
+        # shows -- a first persisted read, or the file shrank (the controller caps it from the
+        # front), so the old cursor no longer points at a line boundary.
+        raw = text.encode("utf-8")
+        reset = poffset is None or poffset > len(raw)
+        start = 0 if reset else poffset
         events = []
-        for line in text.splitlines():
+        for line in raw[start:].splitlines():
             try:
                 events.append(json.loads(line))
             except ValueError:
@@ -357,8 +415,8 @@ def _events_payload(agent_id: str, run_id: str, offset: int, swarm_id: str = "")
         # A running subagent whose live read merely blipped keeps done=False so the UI retries live;
         # a terminal subagent or the orchestrator (no agent record once gone) is done.
         done = state in TERMINAL or record is None
-        return {"events": events, "offset": len(events), "state": state, "done": done,
-                "source": "persisted"}
+        return {"events": events, "offset": offset, "poffset": len(raw), "reset": reset,
+                "state": state, "done": done, "source": "persisted"}
 
 
 def _files_payload(swarm_id: str, path: str) -> dict:
@@ -429,6 +487,7 @@ def _stop(body: dict) -> dict:
     if entry:
         entry["controller"].request_halt()
     result = stop_swarm(swarm_id)
+    _invalidate_agents(swarm_id)  # the next poll shows the stop
     if entry:
         entry["thread"].join(timeout=STOP_CONTROLLER_WAIT)
         entry["stop"].set()  # in case it is still mid-tick: it must not tick again
@@ -573,8 +632,10 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/agents":
                 self._send_json(_agents_payload(one("swarm", os.environ.get("AOM_SWARM", ""))))
             elif parsed.path == "/api/events":
+                poffset = one("poffset", "")
                 self._send_json(_events_payload(one("agent"), one("run"), int(one("offset", "0") or 0),
-                                                one("swarm", os.environ.get("AOM_SWARM", ""))))
+                                                one("swarm", os.environ.get("AOM_SWARM", "")),
+                                                int(poffset) if poffset.isdigit() else None))
             elif parsed.path == "/api/files":
                 self._send_json(_files_payload(one("swarm", os.environ.get("AOM_SWARM", "")), one("path", "/")))
             elif parsed.path == "/api/file":

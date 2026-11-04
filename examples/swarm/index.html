@@ -341,21 +341,32 @@ async function pollSelected() {
   const id = selected, runId = runIds.get(id);
   if (!runId) return;
   let t = traces.get(id);
-  if (!t) { t = { events: [], offset: 0, done: false, runId, source: "" }; traces.set(id, t); }
+  if (!t) { t = { events: [], offset: 0, poffset: null, done: false, runId, source: "" }; traces.set(id, t); }
   try {
+    // Two cursors: `offset` into the live sandbox trace, `poffset` into the controller's persisted
+    // copy. They index different files, so neither is ever sent as the other.
     const data = await getJSON("/api/events?swarm=" + encodeURIComponent(swarmId)
       + "&agent=" + encodeURIComponent(id)
-      + "&run=" + encodeURIComponent(runId) + "&offset=" + t.offset);
+      + "&run=" + encodeURIComponent(runId) + "&offset=" + t.offset
+      + (t.poffset != null ? "&poffset=" + t.poffset : ""));
     t.offset = data.offset; t.done = data.done;
     const pre = $("dtrace");
     if (data.source === "persisted") {
-      // The live sandbox is gone; the server returned the whole durable trace. Replace once
-      // (idempotent across ticks) rather than appending, and only re-render when it changed.
-      if (t.source !== "persisted" || (data.events || []).length !== t.events.length) {
-        t.events = data.events || [];
+      // The live sandbox is unreachable: the durable trace. `reset` = the whole trace (first read,
+      // or the file was capped) -> replace; otherwise only new events -> append.
+      t.poffset = data.poffset;
+      const fresh = data.events || [];
+      if (data.reset) {
+        t.events = fresh;
         if (selected === id) {
           pre.innerHTML = "";
           for (const ev of t.events) { const n = renderEvent(ev); if (n) pre.appendChild(n); }
+          pre.scrollTop = pre.scrollHeight;
+        }
+      } else if (fresh.length) {
+        t.events.push(...fresh);
+        if (selected === id) {
+          for (const ev of fresh) { const n = renderEvent(ev); if (n) pre.appendChild(n); }
           pre.scrollTop = pre.scrollHeight;
         }
       }

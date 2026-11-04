@@ -392,6 +392,8 @@ def test_controller_tails_orchestrator_trace(tmp_path):
 # --------------------------------------------------------------------------------------------- #
 def _run_cli(argv, swarm_dir, monkeypatch):
     monkeypatch.setenv("AOM_SWARM_DIR", str(swarm_dir))
+    # The notes cursor is sandbox-local state; keep it inside the test's tree.
+    monkeypatch.setenv("AOM_SWARM_NOTES_SEEN", str(Path(swarm_dir).parent / "_cli" / "notes.json"))
     monkeypatch.setattr(swarmctl.time, "sleep", lambda *_: None)
     out = io.StringIO()
     code = swarmctl.main(argv, out=out)
@@ -700,9 +702,9 @@ def test_cli_wait_blocks_under_the_shell_timeout_and_reports_progress(tmp_path, 
     assert args.timeout < 120
     swarm_dir = tmp_path / "_swarm"
     cp = LocalDirControlPlane(str(swarm_dir))
-    cp.put_json("workflows/wf.json", {"name": "wf", "status": "running", "stages": []})
-    cp.put_json("agents/a1.json", {"id": "a1", "workflow": "wf", "state": "done"})
-    cp.put_json("agents/a2.json", {"id": "a2", "workflow": "wf", "state": "running"})
+    # The controller lists every started agent in its workflow file (wait reads only those).
+    cp.put_json("workflows/wf.json", {"name": "wf", "status": "running", "stages": [
+        {"name": "s", "agents": [{"id": "a1", "state": "done"}, {"id": "a2", "state": "running"}]}]})
     code, text = _run_cli(["wait", "--timeout", "0"], swarm_dir, monkeypatch)
     assert code == 2 and "1/2 agents finished" in text and "run `aom-swarm wait` again" in text
 
@@ -784,3 +786,365 @@ def test_request_halt_stops_a_wave_mid_spawn_and_ends_run_forever(tmp_path):
     t.start()
     t.join(timeout=5)
     assert not t.is_alive() and c.halted and sb.created == []
+
+
+# --------------------------------------------------------------------------------------------- #
+# feedback fixes: ack receipt, name dedupe, pending status, scoped stop, notes, settle, results  #
+# --------------------------------------------------------------------------------------------- #
+def test_ack_timeout_default_fits_the_shell_timeout():
+    # Like `wait`: a call the harness's 120 s shell timeout kills never prints "do not resubmit".
+    args = swarmctl.build_parser().parse_args(["submit", "--file", "x"])
+    assert 60 <= args.ack_timeout < 120
+
+
+def test_ack_timeout_points_at_the_request_receipt(tmp_path, monkeypatch):
+    monkeypatch.setattr(swarmctl, "_reqid", lambda: "req-fixed")
+    plan_file = tmp_path / "plan.json"
+    plan_file.write_text(json.dumps({"stages": [{"agents": [{"prompt": "x"}]}]}), encoding="utf-8")
+    code, text = _run_cli(
+        ["submit", "--file", str(plan_file), "--name", "wf", "--ack-timeout", "0.1"],
+        tmp_path / "_swarm", monkeypatch,
+    )
+    assert code == 2
+    assert "requests/req-fixed.json" in text and "very likely already accepted" in text
+    assert "Do NOT resubmit" in text and "workflow wf" in text
+
+
+def test_cli_submit_refuses_a_name_that_is_already_running(tmp_path, monkeypatch):
+    monkeypatch.setattr(swarmctl, "_reqid", lambda: "req-new")
+    swarm_dir = tmp_path / "_swarm"
+    cp = LocalDirControlPlane(str(swarm_dir))
+    cp.put_json("workflows/wf.json", {"name": "wf", "status": "running", "stages": []})
+    plan_file = tmp_path / "plan.json"
+    plan_file.write_text(json.dumps({"stages": [{"agents": [{"prompt": "x"}]}]}), encoding="utf-8")
+    code, text = _run_cli(["submit", "--file", str(plan_file), "--name", "wf"], swarm_dir, monkeypatch)
+    assert code == 1 and "already exists" in text and "--name wf-2" in text
+    assert cp.listdir("requests") == []  # nothing was sent
+
+
+def test_cli_submit_refuses_a_resubmit_of_a_pending_name_from_the_plan_file(tmp_path, monkeypatch):
+    # "i1 was submitted five times": the name may come from the plan JSON, not only --name.
+    swarm_dir = tmp_path / "_swarm"
+    cp = LocalDirControlPlane(str(swarm_dir))
+    cp.put_json("requests/req-old.json", {"id": "req-old", "ts": time.time() - 30, "verb": "submit",
+                                          "payload": {"name": "i1", "stages": []}})
+    plan_file = tmp_path / "plan.json"
+    plan_file.write_text(json.dumps({"name": "i1", "stages": [{"agents": [{"prompt": "x"}]}]}),
+                         encoding="utf-8")
+    code, text = _run_cli(["submit", "--file", str(plan_file)], swarm_dir, monkeypatch)
+    assert code == 1 and "already pending (req-old" in text and "aom-swarm wait" in text
+    assert cp.listdir("requests") == ["req-old.json"]
+    # Once acked and handled it is no longer pending -- but the workflow now exists, still refused.
+    cp.put_json("ack/req-old.json", {"id": "req-old", "ok": True})
+    cp.put_json("workflows/i1.json", {"name": "i1", "status": "running", "stages": []})
+    code, text = _run_cli(["submit", "--file", str(plan_file)], swarm_dir, monkeypatch)
+    assert code == 1 and "already exists" in text
+
+
+def test_cli_spawn_refuses_an_identical_pending_spawn_but_allows_a_retry(tmp_path, monkeypatch):
+    monkeypatch.setattr(swarmctl, "_reqid", lambda: "req-n")
+    swarm_dir = tmp_path / "_swarm"
+    cp = LocalDirControlPlane(str(swarm_dir))
+    cp.put_json("requests/req-p.json", {"id": "req-p", "ts": time.time(), "verb": "spawn",
+                                        "payload": {"workflow": "L1", "agent": {"prompt": "do L1"}}})
+    code, text = _run_cli(["spawn", "--prompt", "do L1", "--timeout", "60", "--workflow", "L1"],
+                          swarm_dir, monkeypatch)
+    assert code == 1 and "identical spawn" in text
+    cp.put_json("ack/req-n.json", {"id": "req-n", "ok": True, "result": {"workflow": "L1-2"}})
+    code, text = _run_cli(["spawn", "--prompt", "redo L1 differently", "--timeout", "60",
+                           "--workflow", "L1"], swarm_dir, monkeypatch)
+    assert code == 0 and "L1-2" in text
+
+
+def test_cli_spawn_attaches_the_default_schema_unless_told_not_to(tmp_path, monkeypatch):
+    monkeypatch.setattr(swarmctl, "_reqid", lambda: "req-d")
+    swarm_dir = tmp_path / "_swarm"
+    cp = LocalDirControlPlane(str(swarm_dir))
+    (tmp_path / "schema.json").write_text(json.dumps({"type": "object"}), encoding="utf-8")
+    cp.put_json("ack/req-d.json", {"id": "req-d", "ok": True})
+    code, text = _run_cli(["spawn", "--prompt", "x", "--timeout", "60", "--lane", "L1",
+                           "--report-dir", "/shared/reports/L1"], swarm_dir, monkeypatch)
+    sent = cp.get_json("requests/req-d.json")["payload"]["agent"]
+    assert code == 0 and "campaign default" in text and sent["schema"] == {"type": "object"}
+    assert sent["lane"] == "L1" and sent["report_dir"] == "/shared/reports/L1"
+    (swarm_dir / "requests" / "req-d.json").unlink()
+    code, text = _run_cli(["spawn", "--prompt", "setup", "--timeout", "60", "--no-schema"],
+                          swarm_dir, monkeypatch)
+    assert code == 0 and "schema" not in cp.get_json("requests/req-d.json")["payload"]["agent"]
+
+
+def test_status_renders_pending_requests(tmp_path, monkeypatch):
+    swarm_dir = tmp_path / "_swarm"
+    cp = LocalDirControlPlane(str(swarm_dir))
+    cp.put_json("requests/req-p.json", {
+        "id": "req-p", "ts": time.time(), "verb": "submit",
+        "payload": {"name": "i1", "stages": [{"agents": [{"prompt": "a"}, {"prompt": "b"}]}]}})
+    # A request the controller already claimed is not pending, even before its ack shows.
+    cp.put_json("requests/req-h.json", {"id": "req-h", "ts": time.time(), "verb": "submit",
+                                        "payload": {"name": "i0", "stages": []}})
+    cp.put_json("handled/req-h.json", {"id": "req-h"})
+    code, text = _run_cli(["status"], swarm_dir, monkeypatch)
+    assert code == 0 and "PENDING submit i1" in text and "2 agent(s)" in text
+    assert "Do not resubmit" in text and "i0" not in text
+
+
+def test_status_flags_stuck_agents_on_the_controllers_clock_not_the_sandboxs(tmp_path, monkeypatch):
+    # The sandbox clock can be hours off: age a controller-stamped field against now.json only.
+    swarm_dir = tmp_path / "_swarm"
+    cp = LocalDirControlPlane(str(swarm_dir))
+    controller_now = time.time() - 6 * 3600  # this "sandbox" runs six hours ahead
+    cp.put_json("now.json", {"ts": controller_now})
+    cp.put_json("workflows/wf.json", {"name": "wf", "status": "running", "stages": [
+        {"name": "s", "planned": 3, "agents": [
+            {"idx": 0, "id": "fresh", "state": "running", "updated_at": controller_now - 10},
+            {"idx": 1, "id": "stale", "state": "running", "updated_at": controller_now - 900,
+             "lane": "L2"}]}]})
+    code, text = _run_cli(["status"], swarm_dir, monkeypatch)
+    lines = {ln.split()[1]: ln for ln in text.splitlines() if ln.strip().startswith("[")}
+    assert "STUCK" not in lines["fresh"] and "STUCK 15m" in lines["stale"]
+    assert "lane=L2" in lines["stale"] and "2/3 agent(s) started" in text
+
+
+def test_stop_prints_its_scope(tmp_path, monkeypatch):
+    monkeypatch.setattr(swarmctl, "_reqid", lambda: "req-s")
+    swarm_dir = tmp_path / "_swarm"
+    cp = LocalDirControlPlane(str(swarm_dir))
+    cp.put_json("workflows/i0.json", {"name": "i0", "status": "running", "stages": [
+        {"name": "s", "agents": [{"id": f"aom-{i}", "state": "done" if i < 2 else "running"}
+                                 for i in range(3)]}]})
+    cp.put_json("ack/req-s.json", {"id": "req-s", "ok": True})
+    code, text = _run_cli(["stop", "i0"], swarm_dir, monkeypatch)
+    assert code == 0 and "pausing workflow i0: 3 agent(s) started, 1 running" in text
+    code, text = _run_cli(["stop", "aom-0"], swarm_dir, monkeypatch)
+    assert code == 0 and "stopping agent aom-0 (workflow i0, done)" in text
+    assert "already finished" in text
+
+
+def test_wait_prints_new_supervisor_note_lines_once(tmp_path, monkeypatch):
+    swarm_dir = tmp_path / "_swarm"
+    note = tmp_path / "NOTE-supervisor.md"
+    note.write_text("# notes\n\ni1 was submitted five times; stop resubmitting.\n", encoding="utf-8")
+    code, text = _run_cli(["wait", "--timeout", "0"], swarm_dir, monkeypatch)
+    assert code == 2 and "stop resubmitting" in text
+    code2, text2 = _run_cli(["wait", "--timeout", "0"], swarm_dir, monkeypatch)
+    assert code2 == 2 and "stop resubmitting" not in text2
+
+
+def test_refresh_settles_a_run_whose_status_never_reads_again(tmp_path, monkeypatch):
+    c, control, sb = _controller(tmp_path)
+    _submit(control, {"name": "wf", "stages": [{"agents": [{"prompt": "x"}]}]})
+    c.tick()
+    ar = next(iter(c._workflows["wf"].runs[0].values()))
+
+    def boom():
+        raise RuntimeError("sandbox gone")
+
+    ar.run.status = boom
+    ar.last_status_ok = time.time() - 600
+    # One failed read after a long gap (a slow 100-agent tick) is a blip, not a dead run: settling
+    # it would start the next stage under a live lane.
+    c.tick()
+    assert ar.state == "running" and ar.refresh_errors == 1
+    c.tick()
+    c.tick()
+    assert ar.state == "failed" and "unreadable" in ar.error
+
+
+def test_parse_plan_accepts_lane_and_lints_a_mismatched_report_dir():
+    plan, errors, warnings = parse_plan({"stages": [{"agents": [{
+        "prompt": "x", "lane": "L1", "report_dir": "/shared/reports/i1/other"}]}]})
+    assert errors == [] and plan.stages[0].agents[0].lane == "L1"
+    assert any("does not appear in report_dir" in w for w in warnings)
+    _, errors2, _ = parse_plan({"stages": [{"agents": [{
+        "prompt": "x", "report_dir": "reports/i1/L1"}]}]})
+    assert any("under /shared/" in e for e in errors2)
+    # Any lane tree under /shared is fine; the control plane, traversal and multi-token lanes are not.
+    _, ok, _ = parse_plan({"stages": [{"agents": [{"prompt": "x", "report_dir": "/shared/out/L1"}]}]})
+    assert ok == []
+    for bad in ({"report_dir": "/shared/_swarm/L1"}, {"report_dir": "/shared/r/../../etc"},
+                {"lane": "two words"}):
+        _, errs, _ = parse_plan({"stages": [{"agents": [{"prompt": "x", **bad}]}]})
+        assert errs, bad
+
+
+def test_cli_supervisor_appends_to_the_note(tmp_path, monkeypatch):
+    cp = LocalDirControlPlane(str(tmp_path / "vol"))
+    made = []
+    monkeypatch.setattr(dynamic, "VolumeControlPlane",
+                        lambda name, **k: made.append((name, k)) or cp)
+    note_file = tmp_path / "n.md"
+    note_file.write_text("stop resubmitting i1", encoding="utf-8")
+    argv = ["supervisor", "--swarm", "sw", "--file", str(note_file)]
+    # A mistyped swarm id must not create a volume and "deliver" the note into it.
+    code, text = _run_cli(argv, tmp_path / "_swarm", monkeypatch)
+    assert code == 1 and "no swarm 'sw'" in text and made[-1] == ("aom-shared-sw", {"create": False})
+    cp.put_json("_swarm/meta.json", {"swarm_id": "sw"})
+    code, text = _run_cli(argv, tmp_path / "_swarm", monkeypatch)
+    assert code == 0 and "ok: appended" in text
+    note = cp.read_text("NOTE-supervisor.md")
+    assert "stop resubmitting i1" in note and "Supervisor notes" in note
+
+
+def test_wait_labels_notes_and_handles_rewrites_and_large_notes(tmp_path, monkeypatch):
+    swarm_dir = tmp_path / "_swarm"
+    (tmp_path / "NOTE-L1.md").write_text("lane L1: skip the mirror\n", encoding="utf-8")
+    _, text = _run_cli(["wait", "--timeout", "0"], swarm_dir, monkeypatch)
+    assert "note NOTE-L1.md" in text and "outranks" not in text  # only the supervisor's does
+    (tmp_path / "NOTE-L1.md").write_text("short\n", encoding="utf-8")  # rewritten, now smaller
+    _, text = _run_cli(["wait", "--timeout", "0"], swarm_dir, monkeypatch)
+    assert "(rewritten)" in text and "short" in text
+    with open(tmp_path / "NOTE-L1.md", "a", encoding="utf-8") as f:
+        f.write("é" * (swarmctl.NOTE_PRINT_CAP + 50))
+    _, text = _run_cli(["wait", "--timeout", "0"], swarm_dir, monkeypatch)
+    assert "more chars: read" in text and "short" not in text
+    # The cursor is sandbox-local, never under the control dir.
+    assert not (swarm_dir / "notes_seen.json").exists()
+
+
+def test_controller_acks_a_request_that_lands_while_a_wave_is_being_created(tmp_path, monkeypatch):
+    # Requests were read only between ticks, so one written during a 100-agent create waited out
+    # the whole tick (90-105 s acks; every "timed out" retry double-ran the wave).
+    gate = threading.Event()
+
+    class SlowSandboxes(FakeSandboxes):
+        def create(self, name, **opts):
+            gate.wait(5)
+            return super().create(name, **opts)
+
+    c, control, sb = _controller(tmp_path, SlowSandboxes())
+    monkeypatch.setattr(Controller, "INFLIGHT_POLL", 0.05)
+    _submit(control, {"name": "big", "stages": [{"agents": [{"prompt": f"a{i}"} for i in range(4)]}]})
+    t = threading.Thread(target=c.tick)
+    t.start()
+    deadline = time.time() + 5
+    while not control.exists("_swarm/ack/r.json") and time.time() < deadline:
+        time.sleep(0.01)
+    _submit(control, {"name": "second", "stages": [{"agents": [{"prompt": "b"}]}]}, reqid="r2")
+    while not control.exists("_swarm/ack/r2.json") and time.time() < deadline:
+        time.sleep(0.01)
+    acked_mid_wave = control.exists("_swarm/ack/r2.json") and t.is_alive()
+    gate.set()
+    t.join(5)
+    assert acked_mid_wave and len(sb.created) == 4
+
+
+def test_stop_acked_mid_wave_starts_no_more_of_that_workflow(tmp_path, monkeypatch):
+    gate = threading.Event()
+
+    class SlowSandboxes(FakeSandboxes):
+        def create(self, name, **opts):
+            gate.wait(5)
+            return super().create(name, **opts)
+
+    c, control, sb = _controller(tmp_path, SlowSandboxes())
+    monkeypatch.setattr(Controller, "INFLIGHT_POLL", 0.05)
+    monkeypatch.setattr(dynamic, "CONTROLLER_CONCURRENCY", 1)
+    _submit(control, {"name": "big", "stages": [{"agents": [{"prompt": f"a{i}"} for i in range(5)]}]})
+    t = threading.Thread(target=c.tick)
+    t.start()
+    while not control.exists("_swarm/ack/r.json"):
+        time.sleep(0.01)
+    control.put_json("_swarm/requests/r-stop.json", {"id": "r-stop", "verb": "stop",
+                                                     "payload": {"target": "big"}})
+    while not control.exists("_swarm/ack/r-stop.json"):
+        time.sleep(0.01)
+    gate.set()
+    t.join(5)
+    assert c._workflows["big"].paused and len(sb.created) <= 2
+
+
+def test_stopping_a_finished_agent_keeps_its_outcome(tmp_path):
+    c, control, sb = _controller(tmp_path)
+    _submit(control, {"name": "wf", "stages": [{"agents": [{"prompt": "x"}]}]})
+    c.tick()
+    ar = next(iter(c._workflows["wf"].runs[0].values()))
+    ar.run.state = "done"
+    c.tick()
+    control.put_json("_swarm/requests/r-stop.json", {"id": "r-stop", "verb": "stop",
+                                                     "payload": {"target": ar.id}})
+    c.tick()
+    ack = control.get_json("_swarm/ack/r-stop.json")
+    assert ack["ok"] and ack["result"]["status"] == "done" and ar.state == "done"
+    assert control.get_json(f"_swarm/agents/{ar.id}.json")["state"] == "done"
+
+
+def test_a_stopped_agent_stays_cancelled_even_if_an_in_flight_refresh_reads_running(tmp_path):
+    c, control, sb = _controller(tmp_path)
+    _submit(control, {"name": "wf", "stages": [{"agents": [{"prompt": "x"}]}]})
+    c.tick()
+    ar = next(iter(c._workflows["wf"].runs[0].values()))
+    c._terminate(ar)
+    c._refresh(ar)  # the fake still reports "running", as a read issued before the stop would
+    assert ar.state == "cancelled"
+
+
+def test_schema_fallback_reads_report_dir_result_and_promotes_it(tmp_path):
+    c, control, sb = _controller(tmp_path)
+    schema = {"type": "object", "required": ["summary"]}
+    _submit(control, {"name": "wf", "stages": [{
+        "agents": [{"prompt": "x", "schema": schema, "lane": "L1",
+                    "report_dir": "/shared/reports/i1/L1"}]}]})
+    c.tick()
+    box = sb.created[0]
+    assert "/shared/reports/i1/L1/result.json" in box.started["prompt"]
+    ar = next(iter(c._workflows["wf"].runs[0].values()))
+    control.put_json("reports/i1/L1/result.json", {"summary": "ok"})
+    ar.run.state = "done"
+    c.tick()
+    assert ar.schema_ok is True
+    assert control.get_json(f"_swarm/outputs/{ar.id}.json") == {"summary": "ok"}
+
+
+def test_schema_is_rechecked_once_on_the_settling_refresh(tmp_path):
+    # The agent's last write can trail its exit on the volume: a miss on the first terminal read
+    # gets one more look before the run settles.
+    c, control, sb = _controller(tmp_path)
+    _submit(control, {"name": "wf", "stages": [{
+        "agents": [{"prompt": "x", "schema": {"type": "object"}}]}]})
+    c.tick()
+    ar = next(iter(c._workflows["wf"].runs[0].values()))
+    ar.run.state = "done"
+    c.tick()
+    assert ar.schema_ok is False and not ar.settled
+    control.put_json(f"_swarm/outputs/{ar.id}.json", {"late": True})
+    c.tick()
+    assert ar.schema_ok is True and ar.settled
+
+
+def test_read_shared_json_maps_sandbox_paths_onto_the_volume_root(tmp_path):
+    # The controller's control plane is rooted at the volume (= /shared): "/shared/x" -> "x".
+    cp = LocalDirControlPlane(str(tmp_path))
+    cp.put_json("reports/L1/result.json", {"ok": 1})
+    assert cp.read_shared_json("/shared/reports/L1/result.json") == {"ok": 1}
+    assert cp.read_shared_json("/etc/passwd") is None
+    assert cp.read_shared_json("/shared/../etc/passwd") is None
+
+
+def test_controller_publishes_its_clock_at_most_every_reload_interval(tmp_path, monkeypatch):
+    c, control, sb = _controller(tmp_path)
+    writes = []
+    real = control.put_json
+    monkeypatch.setattr(control, "put_json",
+                        lambda rel, obj: (writes.append(rel), real(rel, obj))[1])
+    c.tick()
+    c.tick()
+    assert writes.count("_swarm/now.json") == 1
+    assert abs(control.get_json("_swarm/now.json")["ts"] - time.time()) < 60
+
+
+def test_a_failing_in_flight_callback_never_drops_created_agents(tmp_path, monkeypatch):
+    # Dropping a batch's results after the creates succeeded leaks sandboxes nobody tracks: the
+    # next tick creates the wave again (seen live: 120 orphans from a 12-agent wave).
+    c, control, sb = _controller(tmp_path)
+    monkeypatch.setattr(Controller, "INFLIGHT_POLL", 0.001)
+
+    def boom():
+        raise RuntimeError("in-flight callback failed")
+
+    results = c._map(lambda i: (time.sleep(0.05), i)[1], [1, 2, 3], between=boom)
+    assert [r for _, r, _ in results] == [1, 2, 3]
+    _submit(control, {"name": "wf", "stages": [{"agents": [{"prompt": f"a{i}"} for i in range(3)]}]})
+    monkeypatch.setattr(c, "_ingest_between", boom)
+    c.tick()
+    c.tick()
+    assert len(sb.created) == 3 and len(c._workflows["wf"].runs[0]) == 3

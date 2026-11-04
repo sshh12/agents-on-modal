@@ -425,3 +425,57 @@ def test_polling_a_stopped_dynamic_swarm_never_restarts_its_controller(tmp_path,
     control.put_json("_swarm/stopped.json", {"ts": 1})
     assert server._dynamic_agents_payload("swarm-d", {"model": "m"})["stopped"] is True
     assert started == ["swarm-d"]  # ...but a hard-stopped one stays stopped
+
+
+def test_persisted_trace_has_its_own_cursor_and_says_when_to_replace(tmp_path, monkeypatch):
+    # The live cursor indexes the sandbox's raw trace, the persisted one the controller's JSONL:
+    # reusing one for the other showed a fragment (or nothing) once a watched agent finished.
+    import json
+
+    from agents_on_modal.dynamic import LocalDirControlPlane
+
+    server = _server()
+    control = LocalDirControlPlane(str(tmp_path))
+    monkeypatch.setattr(server, "VolumeControlPlane", lambda name, **k: control)
+
+    def gone(*a, **k):
+        raise RuntimeError("sandbox gone")
+
+    monkeypatch.setattr(server.sandbox, "get", gone)
+    lines = [json.dumps({"kind": "text", "data": {"text": f"e{i}"}}) for i in range(3)]
+    control.put_text("_swarm/traces/aom-1.jsonl", "\n".join(lines) + "\n")
+    control.put_json("_swarm/agents/aom-1.json", {"id": "aom-1", "state": "running"})
+
+    first = server._events_payload("aom-1", "r", 123456, "swarm-x")  # a big live offset
+    assert first["reset"] and len(first["events"]) == 3 and first["offset"] == 123456
+    control.put_text("_swarm/traces/aom-1.jsonl", "\n".join(lines + [lines[0]]) + "\n")
+    more = server._events_payload("aom-1", "r", 123456, "swarm-x", poffset=first["poffset"])
+    assert not more["reset"] and len(more["events"]) == 1
+    capped = server._events_payload("aom-1", "r", 0, "swarm-x", poffset=10 ** 9)
+    assert capped["reset"] and len(capped["events"]) == 4
+
+
+def test_agents_view_is_built_once_however_many_polls_overlap(monkeypatch):
+    import threading
+    import time
+
+    server = _server()
+    calls = []
+
+    def slow_build(swarm_id):
+        calls.append(swarm_id)
+        time.sleep(0.3)
+        return {"swarm": swarm_id, "n": len(calls)}
+
+    monkeypatch.setattr(server, "_build_agents_payload", slow_build)
+    server._invalidate_agents("swarm-c")
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(server._agents_payload("swarm-c")))
+               for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5)
+    assert calls == ["swarm-c"] and len(results) == 6 and all(r["n"] == 1 for r in results)
+    server._invalidate_agents("swarm-c")  # a stop invalidates: the next poll rebuilds
+    assert server._agents_payload("swarm-c")["n"] == 2

@@ -158,6 +158,15 @@ def build_instructions(
             "one file overwrite each other (last writer wins). Write your own file instead, even "
             "when told to append to a shared one (e.g. `board/<your sandbox id>.md` for `board.md`)."
         )
+        lines.append(
+            "- `$HOME` and the cwd are local to this sandbox and empty in every new one; anything "
+            "another agent must consume belongs under the shared workspace, with a bootstrap script."
+        )
+        lines.append(
+            "- Shared writes are eventually consistent both ways: after a whole-file rewrite, "
+            "re-read the file and check its size/mtime before relying on it; a missing file is not "
+            "a missing agent."
+        )
     else:
         lines.append(
             f"- Workspace (the user sees it live): `{workdir}` (your cwd). Put "
